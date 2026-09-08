@@ -171,7 +171,7 @@ static const char INDEX_HTML[] PROGMEM =
         "<div id='ovr' class='overlay'><div class='box' id='ovr_msg'>Restarting…</div></div>"
         "<div class='page'>"
         "<div class='card'><div class='hero'><div><div class='brand'><div class='title' id='t_title'>M5Stack Atom Echo</div><span class='badge' id='fwv'></span></div><div class='subtitle'>URL: <a id='rtsp' class='mono' href='#' target='_blank'></a></div></div>"
-        "<div class='lang'><a href='https://github.com/stedrow/birdnetgo-m5stack-atom-echo-rtsp-mic' target='_blank' class='gh'>GitHub</a>Lang: <select id='langSel'><option value='en'>English</option><option value='cs'>Čeština</option></select></div></div></div>"
+        "<div class='lang'><a href='https://github.com/foliveira/birdnetgo-m5stack-atom-echo-rtsp-mic' target='_blank' class='gh'>GitHub</a>Lang: <select id='langSel'><option value='en'>English</option><option value='cs'>Čeština</option></select></div></div></div>"
         "<div class='row'>"
         "<div class='card'><h2 id='t_status'>Status</h2><table>"
         "<tr><td class='k' id='t_ip'>IP Address</td><td class='v' id='ip'></td></tr>"
