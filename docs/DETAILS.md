@@ -1,5 +1,7 @@
 # Architecture & Troubleshooting Guide
 
+This is a fork of [stedrow/birdnetgo-m5stack-atom-echo-rtsp-mic](https://github.com/stedrow/birdnetgo-m5stack-atom-echo-rtsp-mic). The Atom Echo port, PDM microphone support, Web UI and thermal protection described below come from that project; v3.0.0 rewrote the streaming pipeline on top of it.
+
 ## Hardware
 
 - **Board**: M5Stack Atom Echo (ESP32-PICO-D4)
@@ -108,6 +110,8 @@ Since 3.0.0 stability no longer depends on this setting: the send queue always h
 The server now answers `461 Unsupported Transport` to UDP requests so clients fall back to TCP at once. If a client still fails, force TCP (`ffplay -rtsp_transport tcp`).
 
 ## Version History
+
+v2.3.0 and earlier are [@stedrow](https://github.com/stedrow)'s releases of the upstream project, listed here because the firmware still builds on that work. v3.0.0 onwards are this fork.
 
 ### v3.0.0
 Major version: the streaming core is rewritten. Settings and WiFi credentials are preserved; see "Upgrading from 2.x" in the README.
