@@ -8,6 +8,8 @@ A high-quality RTSP audio streaming server for the **M5Stack Atom Echo**, stream
 
 **Buy**: [M5Stack Store](https://shop.m5stack.com/products/atom-echo-smart-speaker-dev-kit) | [Amazon](https://www.amazon.com/M5Stack-Atom-Echo-Smart-Speaker/dp/B0C7QSVPB2)
 
+This repository is a fork of [stedrow/birdnetgo-m5stack-atom-echo-rtsp-mic](https://github.com/stedrow/birdnetgo-m5stack-atom-echo-rtsp-mic), which did the Atom Echo port, the Web UI, the browser flasher and the release automation. Version 3.0.0 rewrites the streaming core on top of that work. Thank you, [@stedrow](https://github.com/stedrow).
+
 ## Features
 
 - **Decoupled audio pipeline** — an always-on capture task (core 1) fills a 1.5 s frame queue; a per-session sender task (core 0) drains it with non-blocking socket writes. WiFi stalls no longer drop samples, and RTP frames are never cut mid-way.
@@ -95,7 +97,7 @@ lib_deps =
 
 ## Acknowledgments
 
-This project is largely based on [birdnetgo-esp32-rtsp-mic](https://github.com/Sukecz/birdnetgo-esp32-rtsp-mic) by [@Sukecz](https://github.com/Sukecz) — thank you for the excellent foundation!
-
+- [stedrow/birdnetgo-m5stack-atom-echo-rtsp-mic](https://github.com/stedrow/birdnetgo-m5stack-atom-echo-rtsp-mic) by [@stedrow](https://github.com/stedrow), the project this repository is forked from: the M5Stack Atom Echo port, PDM microphone support, Web UI, thermal protection, browser flasher and release workflow all come from there. Thank you for the excellent work.
+- [birdnetgo-esp32-rtsp-mic](https://github.com/Sukecz/birdnetgo-esp32-rtsp-mic) by [@Sukecz](https://github.com/Sukecz), the original ESP32 RTSP microphone that stedrow's port is based on.
 - M5Stack for the Atom Echo hardware
 - [BirdNET-Go](https://github.com/tphakala/birdnet-go) community
