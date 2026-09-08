@@ -10,12 +10,15 @@ A high-quality RTSP audio streaming server for the **M5Stack Atom Echo**, stream
 
 ## Features
 
-- **Dual-core architecture** — Core 1 handles full audio pipeline, Core 0 handles Web UI and RTSP negotiation
+- **Decoupled audio pipeline** — an always-on capture task (core 1) fills a 1.5 s frame queue; a per-session sender task (core 0) drains it with non-blocking socket writes. WiFi stalls no longer drop samples, and RTP frames are never cut mid-way.
+- **Honest RTP timeline** — sequence and timestamp advance for every captured frame, so a rare drop reaches BirdNET-Go as a gap instead of a click.
+- **Stream Health** — live queue depth, dropped frames, I2S DMA overruns and longest send stall in the Web UI.
 - **mDNS discovery** — `atomecho.local`, no IP needed
 - **Web UI** — configure settings, view signal levels, logs, and diagnostics
-- **AGC** — automatic gain control for varying bird distances
+- **AGC** — automatic gain control with per-sample gain ramping (no zipper noise)
 - **High-pass filter** — 2nd-order Butterworth (default 300Hz) removes wind/traffic
-- **Thermal protection** — configurable auto-shutdown on overheating
+- **Thermal protection** — configurable auto-shutdown, trips only after 3 consecutive minutes over the limit
+- **WiFi power save option** — modem sleep between beacons, the largest thermal lever on this board (needs an AP with DTIM period 1; auto-suspended if the stream drops frames)
 - **LED indicator** — Off / Static / Level modes
 - **WiFiManager** — captive portal for initial WiFi setup
 - **Persistent settings** — saved to flash
@@ -46,12 +49,19 @@ ffplay -rtsp_transport tcp rtsp://atomecho.local:8554/audio
 | Setting | Default | Notes |
 |---------|---------|-------|
 | Sample Rate | 16000 Hz | Optimal for PDM on Atom Echo |
-| Gain | 3.0x | Good for outdoor use |
+| Gain | 3.0x | Good for outdoor use; changes apply live |
 | AGC | OFF | Enable for varying bird distances |
 | High-Pass | ON, 300 Hz | Removes rumble, keeps bird calls |
-| Buffer | 1024 samples | 64ms latency, stable streaming |
-| CPU | 160 MHz | Sufficient, reduces heat |
+| Buffer | 1024 samples | 64 ms per packet; the send queue holds ~1.5 s regardless |
+| CPU | 80 MHz | Enough for the 16 kHz pipeline; runs coolest. 160 MHz if Stream Health shows drops |
+| WiFi Power Save | OFF | Turn ON to cut heat once the stream is stable; works only with AP DTIM period 1, otherwise it suspends itself after 10 dropped frames |
 | I2S Shift | 0 bits | Fixed for PDM — do not change |
+
+## Upgrading from 2.x
+
+Flash 3.0.0 over any 2.x install; WiFi credentials and settings are kept. Stored settings win over the new defaults, so an upgraded device keeps CPU 160 MHz until you press **Defaults** or pick 80 MHz in the Web UI. A stored 120 MHz value (never a valid clock) is replaced by 80 MHz automatically.
+
+The ESP32's internal temperature sensor is uncalibrated and typically reads 10–20 °C above the die. Treat the thermal readout as relative.
 
 ## LED Status
 
@@ -81,7 +91,7 @@ lib_deps =
 
 ## Documentation
 
-- [Architecture & Troubleshooting Guide](docs/DETAILS.md) — dual-core design, audio tuning, troubleshooting, version history
+- [Architecture & Troubleshooting Guide](docs/DETAILS.md) — pipeline architecture, audio tuning, troubleshooting, version history
 
 ## Acknowledgments
 
