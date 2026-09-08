@@ -73,7 +73,7 @@ portMUX_TYPE logMux = portMUX_INITIALIZER_UNLOCKED;  // guards the fixed-size lo
 portMUX_TYPE hpfMux = portMUX_INITIALIZER_UNLOCKED;  // guards HPF coefficient hand-off
 
 // ================== SETTINGS (ESP32 RTSP Mic for BirdNET-Go) ==================
-#define FW_VERSION "2.3.0"
+#define FW_VERSION "3.0.0"
 // Expose FW version as a global C string for WebUI/API
 const char* FW_VERSION_STR = FW_VERSION;
 
