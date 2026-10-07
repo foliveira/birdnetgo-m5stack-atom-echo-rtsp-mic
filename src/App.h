@@ -91,6 +91,7 @@ enum class RebootKind { Plain, RestoreDefaults, ForgetWifi };
 void scheduleReboot(RebootKind kind, uint32_t delayMs, const char* why);   // why: a string literal
 bool requestStreamStop(const char* reason);
 void noteFirmwareUpdateInstalled();   // right before restarting into a firmware update
+void keepLoopAlive();   // long work inside one loop() pass: the loop watchdog restarts after 60 s
 // Live listening (GET /api/listen): 0 once a listener task owns the connection, else an HTTP
 // status with the reason in *why.
 int startListening(WiFiClient client, const char** why);

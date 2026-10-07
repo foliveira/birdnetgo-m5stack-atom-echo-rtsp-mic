@@ -1338,7 +1338,8 @@ bool requestStreamStop(const char* reason) {
 // once the capture task has also finished a block without it.
 
 #define LISTEN_BUFFER_MS 250             // audio buffered for the listener
-#define LISTEN_HEAP_MARGIN (32 * 1024)   // free heap that must remain after the buffer is allocated
+#define LISTEN_HEAP_MARGIN (32 * 1024)   // free heap that must remain once listening has started
+#define LISTEN_TASK_STACK 4096
 #define LISTEN_STALL_LIMIT_MS 5000       // listener accepted no data for this long -> drop it
 
 static struct {
@@ -1453,8 +1454,11 @@ int startListening(WiFiClient client, const char** why) {
     const size_t blockBytes = (size_t)pipelineSamples * 2;
     size_t bytes = (size_t)rate * 2 * LISTEN_BUFFER_MS / 1000;
     if (bytes < 2 * blockBytes) bytes = 2 * blockBytes;
+    // Listening also takes the task (stack and control block) and the capture task's copy of one
+    // block; the margin must remain after all of them.
     StreamBufferHandle_t buf = NULL;
-    if (heap_caps_get_free_size(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL) >= bytes + LISTEN_HEAP_MARGIN) {
+    const size_t need = bytes + LISTEN_TASK_STACK + 512 + blockBytes + LISTEN_HEAP_MARGIN;
+    if (heap_caps_get_free_size(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL) >= need) {
         buf = xStreamBufferCreate(bytes, 1);
     }
     if (!buf) { *why = "not enough free memory"; return 503; }
@@ -1473,7 +1477,7 @@ int startListening(WiFiClient client, const char** why) {
     listener.endReason = "";
     listener.startedMs = millis();
     listener.ip = listener.client.remoteIP().toString();
-    if (xTaskCreatePinnedToCore(listenTask, "Listen", 4096, NULL, 5, &listener.task, 0) != pdPASS) {
+    if (xTaskCreatePinnedToCore(listenTask, "Listen", LISTEN_TASK_STACK, NULL, 5, &listener.task, 0) != pdPASS) {
         listener.task = NULL;
         listener.client = WiFiClient();   // WebServer still holds the connection and answers with the error
         listener.buf = NULL;
@@ -1694,6 +1698,33 @@ static void checkButton() {
     }
 }
 
+// ================== LOOP WATCHDOG ==================
+// loop() serves the Web UI and RTSP negotiation and runs every recovery check, so a pass that never
+// ends leaves the device unreachable until a power cycle. The core's WebServer can cause one: it
+// reads a multipart request body that lacks the parts it expects forever, even after the client
+// has gone. An esp_timer callback (core 0) restarts the device once a pass has taken
+// LOOP_STUCK_MS. Long work inside a single pass (a firmware upload) calls keepLoopAlive().
+#define LOOP_STUCK_MS 60000
+static volatile uint32_t loopAliveMs = 0;
+
+void keepLoopAlive() {
+    loopAliveMs = millis();
+}
+
+static void checkLoopAlive(void*) {
+    const uint32_t alive = loopAliveMs;   // read before millis(), as with lastCaptureOkMs
+    if (millis() - alive > LOOP_STUCK_MS) restartWithNote("recovery: loop() stuck for 60 s");
+}
+
+static void startLoopWatchdog() {
+    keepLoopAlive();
+    const esp_timer_create_args_t args = {checkLoopAlive, NULL, ESP_TIMER_TASK, "loopWatch", false};
+    esp_timer_handle_t timer;
+    if (esp_timer_create(&args, &timer) != ESP_OK || esp_timer_start_periodic(timer, 5000000) != ESP_OK) {
+        simplePrintln("WARNING: loop watchdog not started");
+    }
+}
+
 // Firmware updates run on probation. The core calls this before setup(); returning true keeps a
 // freshly written image in the "pending verify" state instead of accepting it at once, so if it
 // restarts (crash, watchdog, a failed WiFi join ending in the portal's restart) before
@@ -1847,9 +1878,11 @@ void setup() {
     }
     simplePrintln("Web UI: http://" + WiFi.localIP().toString() + "/");
     Serial.printf("Free heap after init: %u KB\n", ESP.getFreeHeap() / 1024);
+    startLoopWatchdog();
 }
 
 void loop() {
+    keepLoopAlive();
     webui_handleClient();
     wifiImprovPoll(deviceName, FW_VERSION);
 

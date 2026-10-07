@@ -27,7 +27,7 @@ Three actors, two FreeRTOS queues:
 
 - **Capture task** (core 1, priority 20, runs from boot): `i2s_read` → DC blocker → high-pass filter → ramped gain/AGC → complete RTP frame (`$` interleave header + RTP header + big-endian L16) written into a pre-allocated `TxFrame` → pointer pushed to `readyQ`. It always meters the signal, so the Web UI level works without a client, and it is the only LED writer. It does not print: a full UART buffer would block it.
 - **Sender task** (core 0, priority 8, created per RTSP session): pops frames from `readyQ`, sends them on the raw lwIP socket with `send(MSG_DONTWAIT)` + `select()`, returns them to `freeQ`. It always finishes a frame it has started, so the interleaved framing cannot desynchronise. It answers in-stream RTSP requests at frame boundaries and skips interleaved RTCP. If the socket accepts no bytes for 10 s the client is considered gone.
-- **Arduino `loop()`** (core 1, priority 1; it shares core 1 with capture): RTSP negotiation, Web UI, WiFi supervision, diagnostics. It is the only user of the `WiFiClient` object and closes it only after the sender has confirmed exit through a semaphore.
+- **Arduino `loop()`** (core 1, priority 1; it shares core 1 with capture): RTSP negotiation, Web UI, WiFi supervision, diagnostics. It is the only user of the `WiFiClient` object and closes it only after the sender has confirmed exit through a semaphore. A watchdog (an `esp_timer` callback on core 0) restarts the device when one pass of `loop()` has taken 60 s: the core's WebServer reads a multipart request body that lacks the parts it expects forever, even after the client has gone.
 
 Buffering: the I2S DMA ring is 8 × 512 samples, of which 7 (112 ms at 32 kHz) can wait for the capture task. The frame pool in front of the socket aims at 3 s of audio, because a single lwIP retransmission timeout is at least 1.5 s. Frames are allocated one at a time until 80 KB of heap is left or the pool reaches 128 KB (63 frames of 1024 samples, 2 s at 32 kHz). The boot log's `Frame pool:` line gives the frame count and how many milliseconds of audio it holds. When the pool is exhausted the capture task recycles the oldest queued frame and counts a drop; RTP sequence and timestamp still advance, so the receiver sees a gap rather than a time-compressed splice.
 
@@ -61,13 +61,13 @@ A capture watchdog in `loop()` reinstalls the I2S driver when the capture task h
 - SETUP advertises a 60 s session timeout, so clients send a keepalive about every 30 s. A session that is receiving audio is never ended for a missing keepalive. A client that connects and sends nothing for 60 s before PLAY is disconnected.
 
 ### Live listening
-`GET /api/listen` hands its HTTP connection to a listener task (core 0, priority 5, below the RTP sender) that sends the audio as an endless WAV file. The capture task copies each processed block, byte-swapped to little-endian, into a FreeRTOS stream buffer of 250 ms (at least two blocks); the listener task forwards it with non-blocking writes. The listener takes nothing from the RTSP frame pool, so it does not disturb a BirdNET-Go session; when the listener falls behind, blocks are skipped for it alone. One listener at a time. It needs the buffer plus 32 KB of free heap, and ends when the sample rate or frame size changes (its WAV header would be wrong), when thermal protection trips, or when the listener accepts no data for 5 s.
+`GET /api/listen` hands its HTTP connection to a listener task (core 0, priority 5, below the RTP sender) that sends the audio as an endless WAV file. The capture task copies each processed block, byte-swapped to little-endian, into a FreeRTOS stream buffer of 250 ms (at least two blocks); the listener task forwards it with non-blocking writes. The listener takes nothing from the RTSP frame pool, so it does not disturb a BirdNET-Go session; when the listener falls behind, blocks are skipped for it alone. One listener at a time. It starts only if 32 KB of heap remain free after its buffer, its task and the capture task's copy of one block, and ends when the sample rate or frame size changes (its WAV header would be wrong), when thermal protection trips, or when the listener accepts no data for 5 s.
 
 ### Power and Heat
 Controllable consumers, largest first: the WiFi receiver with power save off (~80 to 100 mA), CPU 160 vs 80 MHz (~10 mA), transmit power (a few mA at this duty cycle), the LED (<2 mA at the brightness used). The internal temperature sensor is uncalibrated and reads high; thermal protection therefore requires three consecutive readings, one per minute, at or over the limit.
 
 ### Restart reasons and crash reports
-The Device card and the boot log show why the device last restarted: power on, reset pin, brownout, crash, watchdog, or the note the firmware left before restarting itself (`scheduled reboot`, `Web UI reboot`, `defaults restored from the Web UI`, `firmware update`, `WiFi network forgotten from the Web UI`, `WiFi network forgotten (button)`, `recovery: WiFi down for 10 min`, `recovery: sender task stuck`, `joined a network from the setup portal`, `joined a network sent over USB`, `setup portal: stored network is back`, `setup portal idle for 3 minutes`).
+The Device card and the boot log show why the device last restarted: power on, reset pin, brownout, crash, watchdog, or the note the firmware left before restarting itself (`scheduled reboot`, `Web UI reboot`, `defaults restored from the Web UI`, `firmware update`, `WiFi network forgotten from the Web UI`, `WiFi network forgotten (button)`, `recovery: WiFi down for 10 min`, `recovery: sender task stuck`, `recovery: loop() stuck for 60 s`, `joined a network from the setup portal`, `joined a network sent over USB`, `setup portal: stored network is back`, `setup portal idle for 3 minutes`).
 
 After a crash or watchdog reset the panic handler has written a core dump to flash. The boot log then has a line like this, and the firmware erases the dump once it has logged it, so an old dump is never reported for a later reset:
 ```
@@ -126,9 +126,11 @@ One page (`web/index.html`, gzipped into the firmware at build time) that polls 
 
 ## HTTP API
 
-POST bodies are form-encoded. Replies are JSON unless noted. There is no authentication. Two checks keep web pages from other sites out:
-- Every request must be addressed (`Host` header) to the device's IPv4 address, its name, `<name>.local`, or its name under `.lan`, `.home`, `.home.arpa`, `.internal`, `.localdomain` or `.fritz.box`, with any port. Anything else gets `403`. This defeats DNS rebinding, where a page points a name of its own at the device's address.
+POST bodies are form-encoded. Replies are JSON unless noted. There is no authentication. Two checks stop web pages from other sites from changing settings or reading replies:
+- Every request must be addressed (`Host` header) to the device's IPv4 address, its name, `<name>.local`, or its name under `.lan`, `.home`, `.home.arpa`, `.internal`, `.localdomain` or `.fritz.box`, with any port. Anything else gets `403`, from tools such as Prometheus too. This defeats DNS rebinding, where a page points a name of its own at the device's address.
 - POST requests whose `Origin` header names another site get `403`.
+
+A page from another site can still make a browser send a GET to the device's address, for example `<audio src>` on `/api/listen`. It cannot read the reply, but a stream started that way holds the listening slot until the page closes it.
 
 ### `GET /api/state`
 ```json
@@ -163,7 +165,7 @@ curl -d gain=4 -d agc=0 http://atomecho.local/api/settings
 `name=` one of `restart_audio`, `server_on`, `server_off`, `clear_thermal`, `reboot`, `defaults`, `forget_wifi`. `server_on` answers `409` while the thermal latch is set (use `clear_thermal`). `reboot`, `defaults` and `forget_wifi` restart the device half a second after replying.
 
 ### `POST /api/update`
-Multipart upload (`multipart/form-data`) of a `firmware.bin` (any field name). Replies `{"ok": true}` and restarts into the new firmware, or `400` with the Update library's error (for example `Wrong Magic Byte` for a file that is not an ESP32 image), or `no firmware file in the request` for any other body. The RTSP session is stopped before writing. If the upload connection drops, the partial update is discarded.
+Multipart upload (`multipart/form-data`) of a `firmware.bin` (any field name). Replies `{"ok": true}` and restarts into the new firmware, or `400` with the Update library's error (for example `Wrong Magic Byte` for a file that is not an ESP32 image), or `no firmware file in the request` for any other body. The RTSP session is stopped before writing. If the upload connection drops before the whole file has arrived, the partial update is discarded; if it drops after the image has been verified, the device restarts into it.
 
 ### `GET /api/listen`
 Live audio as a WAV file that does not end (16-bit mono PCM at the current sample rate; the header announces about 9 hours). Play it with `<audio src>` or save it: `curl -o garden.wav http://atomecho.local/api/listen` records until you stop curl. One listener at a time: a request from another address gets `409`, while a new request from the address that is listening replaces its stream (a reloaded page). `503` when memory is short, capture is not running or the thermal latch is set. A request for a byte range that does not start at 0 gets `416`: browsers ask for one to resume a dropped stream, and a live stream cannot be resumed part-way.
@@ -258,6 +260,7 @@ Settings and WiFi credentials are preserved; see "Updating" in the README.
 - Listen to the microphone in the Web UI with a live spectrogram, beside the RTSP stream (`/api/listen`)
 - Firmware update from the Web UI (`/api/update`) with automatic rollback when the new version restarts within its first minute
 - Prometheus metrics at `/metrics`
+- A watchdog restarts the device when `loop()` hangs for 60 s; the core's WebServer can hang it with a malformed multipart request
 - WiFi setup from the browser flasher over USB (Improv Wi-Fi), right after installing
 - WiFiManager, M5Atom and FastLED removed: built-in setup portal, LED driven by the core's `neopixelWrite`. The firmware went from not fitting the app partition with current libraries (1.48 MB) to 0.95 MB.
 - Joins the strongest access point for the network name; RTSP sessions survive short WiFi drops; restart after 10 minutes without WiFi; the setup portal retries the stored network every 30 s

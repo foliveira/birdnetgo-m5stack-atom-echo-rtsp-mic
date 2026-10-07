@@ -316,16 +316,36 @@ async function latchedScenario(base) {
   await page.close();
 }
 
+// The device answers only to its current name, so a page opened by the old name has to move on
+// after a rename. The mock is named "localhost" here, a name the browser resolves.
+async function renameScenario(port) {
+  await fetch(`http://127.0.0.1:${port}/api/settings`, { method: 'POST', body: new URLSearchParams({ name: 'localhost' }) });
+  const page = await openPage();
+  await load(page, `http://localhost:${port}/`);
+  await setValue(page, 'name', 'garden');
+  await page.evaluate(`${formOf('name')}.requestSubmit()`);
+  let url = '';
+  for (const end = Date.now() + 4000; Date.now() < end; await sleep(50)) {
+    // While the browser switches to the new site the page answers "not attached": ask again.
+    const h = await page.send('Page.getNavigationHistory').catch(() => null);
+    if (h) url = h.entries[h.currentIndex].url;
+    if (url.includes('garden')) break;
+  }
+  check(url === `http://garden.local:${port}/`, 'a page opened by the old name continues at the new one', url);
+  await page.close();
+}
+
 try {
   await fetch(CDP + '/json/version');
 } catch (e) {
   console.log('No Chrome DevTools endpoint at ' + CDP + ' (see the comment at the top of this file).');
   process.exit(2);
 }
-const mocks = [await startMock(18080, 'streaming'), await startMock(18081, 'latched')];
+const mocks = [await startMock(18080, 'streaming'), await startMock(18081, 'latched'), await startMock(18082, 'idle')];
 try {
   await streamingScenario('http://127.0.0.1:18080/');
   await latchedScenario('http://127.0.0.1:18081/');
+  await renameScenario(18082);
 } catch (e) {
   failures++;
   console.log('FAIL: ' + e.message);

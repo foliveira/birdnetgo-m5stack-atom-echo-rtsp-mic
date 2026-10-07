@@ -109,11 +109,11 @@ scrape_configs:
     static_configs:
       - targets: ['192.168.1.50']   # the device's address
 ```
-The metric list is in [docs/DETAILS.md](docs/DETAILS.md#metrics).
+Use the device's IP address or `<name>.local` as the target: requests addressed to other names are refused (see Security). The metric list is in [docs/DETAILS.md](docs/DETAILS.md#metrics).
 
 ## Security
 
-The Web UI and API have no password. Anyone who can reach the device can change its settings, reboot it, listen to it or install firmware, so keep it on a network you trust. Requests that a browser sends from another site's page are refused, and so is every request addressed to a name other than the device's IP address, its name, `<name>.local`, or its name under a local-only domain (`.lan`, `.home`, `.home.arpa`, `.internal`, `.localdomain`, `.fritz.box`). That stops a web page from reaching the device through DNS rebinding; open the device by one of those names.
+The Web UI and API have no password. Anyone who can reach the device can change its settings, reboot it, listen to it or install firmware, so keep it on a network you trust. Changes that a browser sends from another site's page are refused, and so is every request addressed to a name other than the device's IP address, its name, `<name>.local`, or its name under a local-only domain (`.lan`, `.home`, `.home.arpa`, `.internal`, `.localdomain`, `.fritz.box`). That stops web pages from changing the device or reading from it, including through DNS rebinding; open the device by one of those names.
 
 ## Building
 

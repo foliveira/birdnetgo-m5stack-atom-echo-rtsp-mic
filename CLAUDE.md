@@ -45,6 +45,7 @@ See `README.md` for project documentation and usage, and `docs/DETAILS.md` for t
 - Replies are built in fixed buffers (`JsonOut`, `PromOut`); no `String` concatenation of whole replies.
 
 ### Restarts and firmware updates
+- One pass of `loop()` must finish within 60 s: the loop watchdog (`checkLoopAlive`, an esp_timer callback) restarts the device otherwise. Work that legitimately takes longer inside one pass calls `keepLoopAlive()`; the firmware upload does for every chunk.
 - HTTP handlers never restart directly: `scheduleReboot(kind, delayMs, note)` lets the reply go out first. Elsewhere use `restartWithNote(note)`. The note is the restart reason on the next boot: a string literal under 40 characters.
 - After a Web UI update the new firmware runs on probation (`verifyRollbackLater()` returns true) until `confirmFirmware()` accepts it after 60 s of uptime with WiFi. Any restart before that rolls back to the previous firmware, including the setup portal's restarts. Keep setup and the first minute free of deliberate restarts.
 
