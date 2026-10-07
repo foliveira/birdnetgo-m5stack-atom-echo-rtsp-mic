@@ -1,6 +1,6 @@
-# M5Stack Atom Echo — RTSP Microphone for BirdNET-Go
+# M5Stack Atom Echo RTSP Microphone for BirdNET-Go
 
-A high-quality RTSP audio streaming server for the **M5Stack Atom Echo**, streaming live audio to [BirdNET-Go](https://github.com/tphakala/birdnet-go) or any RTSP-compatible client.
+Firmware that turns an **M5Stack Atom Echo** into a network microphone: it streams the built-in microphone as an RTSP feed for [BirdNET-Go](https://github.com/tphakala/birdnet-go) or any RTSP client.
 
 <p align="left">
   <img src="https://shop.m5stack.com/cdn/shop/files/3_e4ea519e-765f-4f30-aad1-7855ff9f8744_1200x1200.jpg" alt="M5Stack Atom Echo" width="300">
@@ -8,22 +8,22 @@ A high-quality RTSP audio streaming server for the **M5Stack Atom Echo**, stream
 
 **Buy**: [M5Stack Store](https://shop.m5stack.com/products/atom-echo-smart-speaker-dev-kit) | [Amazon](https://www.amazon.com/M5Stack-Atom-Echo-Smart-Speaker/dp/B0C7QSVPB2)
 
-This repository is a fork of [stedrow/birdnetgo-m5stack-atom-echo-rtsp-mic](https://github.com/stedrow/birdnetgo-m5stack-atom-echo-rtsp-mic), which did the Atom Echo port, the Web UI, the browser flasher and the release automation. Version 3.0.0 rewrites the streaming core on top of that work. Thank you, [@stedrow](https://github.com/stedrow).
+This repository is a fork of [stedrow/birdnetgo-m5stack-atom-echo-rtsp-mic](https://github.com/stedrow/birdnetgo-m5stack-atom-echo-rtsp-mic), which did the Atom Echo port, the Web UI, the browser flasher and the release automation. Version 3.0.0 rewrote the streaming core on top of that work and 3.1.0 replaced the Web UI and the WiFi setup. Thank you, [@stedrow](https://github.com/stedrow).
 
 ## Features
 
-- **Decoupled audio pipeline** — an always-on capture task (core 1) fills a 1.5 s frame queue; a per-session sender task (core 0) drains it with non-blocking socket writes. WiFi stalls no longer drop samples, and RTP frames are never cut mid-way.
-- **Honest RTP timeline** — sequence and timestamp advance for every captured frame, so a rare drop reaches BirdNET-Go as a gap instead of a click.
-- **Stream Health** — live queue depth, dropped frames, I2S DMA overruns and longest send stall in the Web UI.
-- **mDNS discovery** — `atomecho.local`, no IP needed
-- **Web UI** — configure settings, view signal levels, logs, and diagnostics
-- **AGC** — automatic gain control with per-sample gain ramping (no zipper noise)
-- **High-pass filter** — 2nd-order Butterworth (default 300Hz) removes wind/traffic
-- **Thermal protection** — configurable auto-shutdown, trips only after 3 consecutive minutes over the limit
-- **WiFi power save option** — modem sleep between beacons, the largest thermal lever on this board (needs an AP with DTIM period 1; auto-suspended if the stream drops frames)
-- **LED indicator** — Off / Static / Level modes
-- **WiFiManager** — captive portal for initial WiFi setup
-- **Persistent settings** — saved to flash
+- Capture and network send run in separate tasks joined by a send queue of up to 3 s of audio, so WiFi stalls shorter than the queue lose nothing. RTP frames are always sent whole.
+- RTP sequence numbers and timestamps advance for every captured frame, so a frame that does get dropped reaches BirdNET-Go as a gap instead of a click.
+- 32 kHz by default, which carries the whole 0 to 15 kHz band BirdNET analyses. A DC blocker, a 2nd-order high-pass filter (300 Hz by default), manual gain applied live with a per-sample ramp, and optional automatic gain control.
+- Web UI: signal level, stream and WiFi diagnostics, settings with validation, the log, and firmware updates. One 9 KB page, English only.
+- Firmware updates over WiFi. A new version that restarts within its first minute is rolled back to the previous one.
+- Prometheus metrics at `/metrics`: frames sent and dropped, stalls, WiFi drops, RSSI, temperature, signal level.
+- WiFi setup through a built-in captive portal; joins the strongest access point for the network name (mesh systems, repeaters).
+- Reports why the device last restarted, including the task and backtrace after a crash, why WiFi last dropped, and a microphone that stopped delivering signal.
+- Recovers by itself: restarts the audio driver if capture stalls, restarts the device after 10 minutes without WiFi.
+- Thermal protection that trips only after 3 consecutive minutes over the limit, and a WiFi power save option.
+- Configurable device name for mDNS (`atomecho.local` by default) and DHCP, so several microphones can share a network.
+- No libraries beyond the Arduino core.
 
 ## Quick Start
 
@@ -31,69 +31,102 @@ This repository is a fork of [stedrow/birdnetgo-m5stack-atom-echo-rtsp-mic](http
 ```bash
 pio run --target upload
 ```
+Or use the browser flasher in `flash/` (published with GitHub Pages), which installs a release over USB from Chrome or Edge.
 
 ### 2. Connect to WiFi
-On first boot, connect to the `ESP32-RTSP-Mic-AP` access point and configure your WiFi. The LED turns **blue** when ready.
+On first boot the LED turns cyan and the device opens an open WiFi network named `ESP32-RTSP-Mic-AP`. Join it with a phone or laptop; the setup page opens by itself (or browse to `http://192.168.4.1/`). Pick your network and enter its password. The device joins it and restarts. Only 2.4 GHz networks work.
+
+The LED turns blue once the device is on your network and ready.
 
 ### 3. Stream
 ```bash
-vlc rtsp://atomecho.local:8554/audio
-# or
 ffplay -rtsp_transport tcp rtsp://atomecho.local:8554/audio
+# or
+vlc rtsp://atomecho.local:8554/audio
 ```
 
-**BirdNET-Go**: set audio source to `rtsp://atomecho.local:8554/audio`
+**BirdNET-Go**: set the audio source to `rtsp://atomecho.local:8554/audio`
 
 **Web UI**: `http://atomecho.local/`
+
+If your computer does not resolve `.local` names, use the IP address from your router or from the serial log.
 
 ## Recommended Settings
 
 | Setting | Default | Notes |
 |---------|---------|-------|
-| Sample Rate | 16000 Hz | Optimal for PDM on Atom Echo |
-| Gain | 3.0x | Good for outdoor use; changes apply live |
-| AGC | OFF | Enable for varying bird distances |
-| High-Pass | ON, 300 Hz | Removes rumble, keeps bird calls |
-| Buffer | 1024 samples | 64 ms per packet; the send queue holds ~1.5 s regardless |
-| CPU | 80 MHz | Enough for the 16 kHz pipeline; runs coolest. 160 MHz if Stream Health shows drops |
-| WiFi Power Save | OFF | Turn ON to cut heat once the stream is stable; works only with AP DTIM period 1, otherwise it suspends itself after 10 dropped frames |
-| I2S Shift | 0 bits | Fixed for PDM — do not change |
+| Sample rate | 32 kHz | Carries everything up to 16 kHz. At 16 kHz the stream stops at 8 kHz and loses the high songs of kinglets, crests and many warblers |
+| Gain | 3.0x | Applied live. Aim for 30 to 70 % peak level in the Signal level card |
+| Automatic gain control | Off | Turn on when birds call from very different distances |
+| High-pass filter | On, 300 Hz | Removes wind and traffic rumble; lower it for large owls or bitterns |
+| Frame size | 1024 samples | 32 ms per packet at 32 kHz |
+| CPU clock | 80 MHz | Handles 48 kHz and runs coolest |
+| WiFi power save | Off | Cuts heat, but keeps up only with 16 kHz and an access point with DTIM period 1. Switches itself off if the stream drops frames |
 
-## Upgrading from 2.x
+## LED
 
-Flash 3.0.0 over any 2.x install; WiFi credentials and settings are kept. Stored settings win over the new defaults, so an upgraded device keeps CPU 160 MHz until you press **Defaults** or pick 80 MHz in the Web UI. A stored 120 MHz value (never a valid clock) is replaced by 80 MHz automatically.
-
-The ESP32's internal temperature sensor is uncalibrated and typically reads 10–20 °C above the die. Treat the thermal readout as relative.
-
-## LED Status
-
-| Color | Meaning |
-|-------|---------|
-| Yellow | Starting up |
-| Blue | Ready, waiting for connection |
+| Colour | Meaning |
+|--------|---------|
+| Yellow | Starting up, or the WiFi link is down |
+| Cyan | WiFi setup portal running, or the button is being held |
+| Blue | Ready, no client streaming |
 | Green | Streaming |
-| Orange | Signal hot, >70% (level mode) |
-| Red | Clipping or thermal protection |
+| Red | Thermal protection stopped the stream (or clipping, in signal level mode) |
+| Orange, dim green, dim purple | Signal level mode: hot, low, very quiet |
+
+Yellow and the thermal red show even with the LED set to Off.
+
+## Button
+
+Hold the front button for 5 s to forget the WiFi network and restart into the setup portal, for example to move the device to another network. The LED turns cyan after 1 s; let go before 5 s to cancel. The Web UI's "Change WiFi network" button does the same.
+
+## Updating
+
+### From 3.0.x or 2.x
+Versions before 3.1.0 cannot install firmware over WiFi, so install 3.1.0 once over USB. WiFi credentials and settings are kept.
+
+- Stored settings win over the new defaults. A device that ran 16 kHz keeps it; choose 32 kHz in the Audio card (or press Restore defaults) to get the band above 8 kHz. A stored 8 kHz is replaced by 32 kHz, because 8 kHz clocks the microphone below its specified range.
+- The HTTP API changed. The old `/api/*` endpoints are gone; see [the API reference](docs/DETAILS.md#http-api).
+- The auto recovery setting is gone; a capture watchdog replaces it.
+- Yellow LED now also means the WiFi link is down.
+
+### From 3.1.0 on
+Download `firmware.bin` from the [releases page](https://github.com/foliveira/birdnetgo-m5stack-atom-echo-rtsp-mic/releases) and install it in the Web UI's Firmware update card, or from a shell:
+```bash
+curl -F firmware=@firmware.bin http://atomecho.local/api/update
+```
+The device checks the whole image before switching to it. The new version then has to keep WiFi for a minute; if it restarts before that (a crash, or a WiFi join that fails), the device goes back to the previous version.
+
+## Monitoring
+
+`/metrics` serves Prometheus text format. A scrape job:
+```yaml
+scrape_configs:
+  - job_name: atomecho
+    static_configs:
+      - targets: ['192.168.1.50']   # the device's address
+```
+The metric list is in [docs/DETAILS.md](docs/DETAILS.md#metrics).
+
+## Security
+
+The Web UI and API have no password. Anyone who can reach the device can change its settings, reboot it or install firmware, so keep it on a network you trust. Requests that a browser sends from another site's page are refused.
 
 ## Building
 
 ```bash
 pio run                      # Build
-pio run --target upload      # Flash
+pio run --target upload      # Flash over USB
 pio device monitor -b 115200 # Serial monitor
+sh test/host/run.sh          # Unit tests of the DSP, RTSP parsing, JSON and metrics writers (needs a C++ compiler)
+node test/webui/check_keys.mjs  # Checks that the page, the firmware and the mock device use the same API keys
 ```
 
-### Dependencies
-```ini
-lib_deps =
-    tzapu/WiFiManager @ ^2.0.17
-    m5stack/M5Atom @ ^0.1.3
-    fastled/FastLED @ ^3.10.3
-```
+`web/index.html` is the Web UI; the build gzips it into the firmware. To work on it without a device, run `node test/webui/mock_server.mjs` and open `http://localhost:8080/`.
 
 ## Documentation
 
-- [Architecture & Troubleshooting Guide](docs/DETAILS.md) — pipeline architecture, audio tuning, troubleshooting, version history
+- [Architecture and troubleshooting guide](docs/DETAILS.md): pipeline, WiFi behaviour, HTTP API, metrics, audio tuning, troubleshooting, version history.
 
 ## Acknowledgments
 

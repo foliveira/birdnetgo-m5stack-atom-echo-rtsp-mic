@@ -67,6 +67,8 @@ jobs:
           mkdir -p release
 
           cp .pio/build/m5stack-atom/firmware.bin   release/firmware.bin
+          # For decoding crash backtraces (the device logs them after a crash); not flashed.
+          cp .pio/build/m5stack-atom/firmware.elf   release/firmware.elf
           cp .pio/build/m5stack-atom/bootloader.bin release/bootloader.bin
           cp .pio/build/m5stack-atom/partitions.bin release/partitions.bin
 
