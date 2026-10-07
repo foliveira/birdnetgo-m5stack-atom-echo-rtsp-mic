@@ -7,7 +7,6 @@
 #include <errno.h>
 #include <lwip/sockets.h>
 #include <esp_heap_caps.h>
-#include <M5Atom.h>
 #include "WebUI.h"
 
 // ================== PIPELINE ARCHITECTURE ==================
@@ -101,6 +100,7 @@ const char* FW_VERSION_STR = FW_VERSION;
 #define I2S_LRCLK_PIN   33  // Word Select / Left-Right Clock
 #define I2S_DATA_IN_PIN 23  // Microphone Data In
 #define I2S_DATA_OUT_PIN 22 // Speaker Data Out (not used for mic-only)
+#define LED_PIN         27  // SK6812 RGB LED
 
 // -- Servers
 WiFiServer rtspServer(8554);
@@ -855,18 +855,29 @@ static inline uint32_t drainI2sEvents() {
     return lost;
 }
 
-static CRGB ledColorFor(bool streaming, bool clipped, float pct) {
+// LED colours as 0xRRGGBB, already scaled to the brightness the M5Atom/FastLED setup used
+// (20/255), so the LED looks and draws the same as before.
+static inline uint32_t rgb(uint8_t r, uint8_t g, uint8_t b) {
+    return ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+}
+#define LED_STARTUP rgb(10, 10, 0)    // yellow
+
+static void ledShow(uint32_t c) {
+    neopixelWrite(LED_PIN, (uint8_t)(c >> 16), (uint8_t)(c >> 8), (uint8_t)c);   // core RMT driver
+}
+
+static uint32_t ledColorFor(bool streaming, bool clipped, float pct) {
     if (!streaming) {
-        if (overheatLatched) return CRGB(128, 0, 0);                 // red: thermal latch
-        return (ledMode > 0) ? CRGB(0, 0, 128) : CRGB(0, 0, 0);      // blue: ready
+        if (overheatLatched) return rgb(10, 0, 0);                    // red: thermal latch
+        return (ledMode > 0) ? rgb(0, 0, 10) : 0;                     // blue: ready
     }
-    if (ledMode == 0) return CRGB(0, 0, 0);
-    if (ledMode == 1) return CRGB(0, 128, 0);                         // static green: streaming
-    if (clipped)      return CRGB(255, 0, 0);                         // red: clipping
-    if (pct > 0.7f)   return CRGB(255, 165, 0);                       // orange: hot signal
-    if (pct > 0.3f)   return CRGB(0, 255, 0);                         // bright green: good level
-    if (pct > 0.05f)  return CRGB(0, 64, 0);                          // dim green: low signal
-    return CRGB(32, 0, 32);                                           // dim purple: very quiet
+    if (ledMode == 0) return 0;
+    if (ledMode == 1) return rgb(0, 10, 0);                           // static green: streaming
+    if (clipped)      return rgb(20, 0, 0);                           // red: clipping
+    if (pct > 0.7f)   return rgb(20, 13, 0);                          // orange: hot signal
+    if (pct > 0.3f)   return rgb(0, 20, 0);                           // bright green: good level
+    if (pct > 0.05f)  return rgb(0, 5, 0);                            // dim green: low signal
+    return rgb(2, 0, 2);                                              // dim purple: very quiet
 }
 
 static void captureTask(void* arg) {
@@ -881,7 +892,7 @@ static void captureTask(void* arg) {
     float localAgcMult = 1.0f;
     float appliedGain = -1.0f;             // gain at the end of the previous block (ramp start)
 
-    CRGB lastLed = CRGB(1, 2, 3);          // impossible value forces the first draw
+    uint32_t lastLed = 0xFFFFFFFF;         // impossible value forces the first draw
     unsigned long lastLedUpdate = 0;
     unsigned long lastStatsLog = millis();
 
@@ -1048,9 +1059,9 @@ static void captureTask(void* arg) {
         // --- LED (~10 Hz, only redrawn when the colour changes) ---
         if (now - lastLedUpdate > 100) {
             lastLedUpdate = now;
-            CRGB c = ledColorFor(streaming, clipped, peakAbs / 32767.0f);
+            uint32_t c = ledColorFor(streaming, clipped, peakAbs / 32767.0f);
             if (c != lastLed) {
-                M5.dis.drawpix(0, c);
+                ledShow(c);
                 lastLed = c;
             }
         }
@@ -1530,22 +1541,16 @@ void setup() {
     // TX ring buffer so serial prints return immediately instead of blocking on the 128-byte FIFO
     // (must precede Serial.begin, which M5.begin performs).
     Serial.setTxBufferSize(1024);
-    M5.begin(true, false, false);
-    // Atom Echo has one LED; the library default clocks out a 25-LED matrix on every show().
-    M5.dis.begin(1);
-    M5.dis.setTaskName("LEDs");
-    M5.dis.setTaskPriority(2);
-    M5.dis.setCore(1);
-    M5.dis.start();
+    Serial.begin(115200);
 
-    delay(200);
+    // The first write also sets up the RMT channel, here on the loop task (core 1); the capture
+    // task takes over the LED once it runs.
+    ledShow(LED_STARTUP);
+
     Serial.println("\n\n=== ESP32 RTSP Mic Starting ===");
     Serial.println("Board: M5Stack Atom Echo");
 
     senderExitSem = xSemaphoreCreateBinary();
-
-    // Set LED to indicate startup (the capture task takes over the LED once it runs)
-    M5.dis.drawpix(0, CRGB(128, 128, 0));  // Yellow for startup
 
     randomSeed((uint32_t)micros() ^ (uint32_t)(ESP.getEfuseMac() & 0xFFFFFFFF));
 
@@ -1662,9 +1667,6 @@ void setup() {
 }
 
 void loop() {
-    // Update M5Atom (for button handling)
-    M5.update();
-
     webui_handleClient();
 
     if (millis() - lastTempCheck > 60000) { // 1 min
