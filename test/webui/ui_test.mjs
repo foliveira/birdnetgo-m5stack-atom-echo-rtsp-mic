@@ -7,6 +7,7 @@
 //   2. node test/webui/ui_test.mjs [screenshot-dir]
 // Needs Node 22 or later (global WebSocket). Exits non-zero if a check fails.
 import { spawn } from 'node:child_process';
+import { request } from 'node:http';
 import { mkdirSync, writeFileSync } from 'node:fs';
 
 const CDP = process.env.CDP || 'http://127.0.0.1:9222';
@@ -19,6 +20,20 @@ function check(cond, what, detail) {
   if (cond) return;
   failures++;
   console.log('FAIL: ' + what + (detail === undefined ? '' : ' (got ' + JSON.stringify(detail) + ')'));
+}
+
+// GET /api/listen from a given local address (any 127.x.y.z works on Linux), so the device sees
+// a client other than the browser. Resolves once the status is known; close() hangs up.
+function listenFrom(base, localAddress) {
+  return new Promise((resolve, reject) => {
+    const u = new URL('api/listen', base);
+    const req = request({ host: u.hostname, port: u.port, path: u.pathname, localAddress }, (res) => {
+      res.resume();
+      resolve({ status: res.statusCode, close: () => req.destroy() });
+    });
+    req.on('error', reject);
+    req.end();
+  });
 }
 
 async function startMock(port, scenario) {
@@ -53,8 +68,9 @@ async function openPage() {
     const l = (msg) => { if (msg.method === method) { listeners.splice(listeners.indexOf(l), 1); resolve(msg.params); } };
     listeners.push(l);
   });
-  const evaluate = async (expression) => {
-    const r = await send('Runtime.evaluate', { expression, awaitPromise: true, returnByValue: true });
+  // userGesture: run as if the user had clicked, which media playback requires.
+  const evaluate = async (expression, userGesture = false) => {
+    const r = await send('Runtime.evaluate', { expression, awaitPromise: true, returnByValue: true, userGesture });
     if (r.exceptionDetails) throw new Error(expression + ': ' + (r.exceptionDetails.exception?.description || r.exceptionDetails.text));
     return r.result.value;
   };
@@ -92,7 +108,8 @@ async function load(page, url, width = 1280, height = 900, mobile = false) {
 async function waitFor(page, expr, what, timeoutMs = 4000) {
   const end = Date.now() + timeoutMs;
   while (Date.now() < end) {
-    if (await page.evaluate('!!(' + expr + ')')) return true;
+    // A reload in progress has no document yet: keep polling.
+    if (await page.evaluate('!!(' + expr + ')').catch(() => false)) return true;
     await sleep(50);
   }
   check(false, 'timed out waiting for ' + what);
@@ -211,6 +228,38 @@ async function streamingScenario(base) {
   check(logText.includes('Web UI: RTSP server stopped'), 'log has the server action', logText.slice(-200));
   const lines = logText.trim().split('\n');
   check(new Set(lines).size === lines.length, 'no duplicated log lines', lines.length);
+
+  // Listening: the page plays the device's WAV stream and draws a spectrogram from it.
+  check(await text(page, 'listener') === 'nobody', 'nobody listening at first', await text(page, 'listener'));
+  await page.evaluate("document.getElementById('listenBtn').click()", true);
+  await waitFor(page, "document.getElementById('listener').textContent === '127.0.0.1'", 'device reports the listener', 5000);
+  check(await text(page, 'listenBtn') === 'Stop', 'Listen turns into Stop', await text(page, 'listenBtn'));
+  await waitFor(page, `(() => {
+    const c = document.getElementById('spectrum'), d = c.getContext('2d').getImageData(c.width - 60, 0, 60, c.height).data;
+    for (let i = 0; i < d.length; i += 4) if (d[i] > 0) return true;
+    return false;
+  })()`, 'spectrogram drawn from the stream', 8000);
+  const second = await listenFrom(base, '127.0.0.2');
+  check(second.status === 409, 'a listener from another address is refused', second.status);
+  second.close();
+  await screenshot(page, 'listening');
+  await page.evaluate("document.getElementById('listenBtn').click()");
+  await waitFor(page, "document.getElementById('listener').textContent === 'nobody'", 'listener gone after Stop', 5000);
+  check(await text(page, 'listenBtn') === 'Listen', 'Stop turns back into Listen', await text(page, 'listenBtn'));
+  const other = await listenFrom(base, '127.0.0.2');
+  check(other.status === 200, 'another client can listen once the page stopped', other.status);
+  await waitFor(page, "document.getElementById('listenBtn').disabled", 'Listen disabled while someone else listens');
+  check((await text(page, 'listenMsg')) === 'In use by 127.0.0.2', 'says who listens', await text(page, 'listenMsg'));
+  other.close();
+  await waitFor(page, "!document.getElementById('listenBtn').disabled", 'Listen enabled again', 5000);
+  // A new request from the address that listens replaces its stream (a reloaded page).
+  await page.evaluate("document.getElementById('listenBtn').click()", true);
+  await waitFor(page, "document.getElementById('listener').textContent === '127.0.0.1'", 'page listening again', 5000);
+  const again = await listenFrom(base, '127.0.0.1');
+  check(again.status === 200, 'the same address replaces its stream', again.status);
+  await waitFor(page, "document.getElementById('listenBtn').textContent === 'Listen'", 'page notices its stream was replaced', 5000);
+  again.close();
+  await waitFor(page, "document.getElementById('listener').textContent === 'nobody'", 'nobody listening at the end', 5000);
 
   // Dark scheme and a phone-sized screen.
   await page.send('Emulation.setEmulatedMedia', { features: [{ name: 'prefers-color-scheme', value: 'dark' }] });

@@ -2,6 +2,7 @@
 #include "AudioDsp.h"
 #include "check.h"
 
+#include <string.h>
 #include <vector>
 
 static const float PI_F = 3.14159265358979f;
@@ -143,6 +144,23 @@ static void testAgcIndependentOfBlockSize() {
     CHECK_EQ(m, 10.0f);
 }
 
+static void testWavHeader() {
+    uint8_t h[44];
+    wavHeader(h, 32000, 0x7FFF0000u);
+    CHECK(memcmp(h, "RIFF", 4) == 0 && memcmp(h + 8, "WAVEfmt ", 8) == 0 && memcmp(h + 36, "data", 4) == 0);
+    const auto u32 = [&](int at) { return (uint32_t)h[at] | (uint32_t)h[at + 1] << 8 | (uint32_t)h[at + 2] << 16 | (uint32_t)h[at + 3] << 24; };
+    const auto u16 = [&](int at) { return (uint32_t)h[at] | (uint32_t)h[at + 1] << 8; };
+    CHECK_EQ(u32(4), 0x7FFF0000u + 36);
+    CHECK_EQ(u32(16), 16u);
+    CHECK_EQ(u16(20), 1u);
+    CHECK_EQ(u16(22), 1u);
+    CHECK_EQ(u32(24), 32000u);
+    CHECK_EQ(u32(28), 64000u);
+    CHECK_EQ(u16(32), 2u);
+    CHECK_EQ(u16(34), 16u);
+    CHECK_EQ(u32(40), 0x7FFF0000u);
+}
+
 int main() {
     testHighpassResponse();
     testDcRemoved();
@@ -151,5 +169,6 @@ int main() {
     testClipping();
     testFlatInput();
     testAgcIndependentOfBlockSize();
+    testWavHeader();
     return checkSummary("test_dsp");
 }

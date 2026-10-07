@@ -18,6 +18,7 @@
 //   POST /api/action     name=restart_audio|server_on|server_off|clear_thermal|reboot|defaults|forget_wifi
 //   POST /api/update     multipart upload of a firmware .bin; the device restarts into it
 //   GET  /api/logs?since=N  log lines after line N as text; X-Log-Seq holds the newest line number
+//   GET  /api/listen     live audio as an endless WAV file (one listener at a time)
 //   GET  /metrics        Prometheus text format; counters are totals since boot
 
 static WebServer web(80);
@@ -130,7 +131,7 @@ static void sendState() {
     j.f("temp_max_c", maxTemperature > 0.0f ? maxTemperature : NAN, 1);
     j.b("server", rtspServerEnabled).b("streaming", streaming).s("client", currentRtspClient());
     j.u("session_s", streaming ? (millis() - lastRtspPlayMs) / 1000 : 0).s("end_reason", streamEndReason);
-    j.u("connects", rtspConnectCount).u("plays", rtspPlayCount);
+    j.u("connects", rtspConnectCount).u("plays", rtspPlayCount).s("listener", currentListener());
     j.u("rate", rate).f("frame_ms", currentBufferSize * 1000.0 / rate, 2);
     j.u("sent", audioPacketsSent).u("dropped", framesDroppedQueueFull);
     j.u("overruns", i2sOverruns).u("read_errors", i2sReadErrors);
@@ -512,6 +513,24 @@ static void httpUpdateDone() {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Live listening. On success the sketch's listener task answers on this connection and keeps it;
+// WebServer drops its own reference when the handler returns.
+
+static void httpListen() {
+    // A live stream cannot be resumed part-way. Browsers ask for a range after a dropped
+    // connection; refusing it stops the player instead of letting it carry on with the old WAV
+    // header (or half a sample out of step).
+    const String range = web.header("Range");
+    if (range.length() && !range.startsWith("bytes=0-")) {
+        sendError(416, "a live stream cannot be resumed");
+        return;
+    }
+    const char* why = "";
+    const int code = startListening(web.client(), &why);
+    if (code) sendError(code, why);
+}
+
+// ---------------------------------------------------------------------------------------------
 
 static void httpIndex() {
     web.sendHeader("Content-Encoding", "gzip");
@@ -520,11 +539,12 @@ static void httpIndex() {
 }
 
 void webui_begin() {
-    static const char* headers[] = {"Origin", "Content-Type"};
-    web.collectHeaders(headers, 2);
+    static const char* headers[] = {"Origin", "Content-Type", "Range"};
+    web.collectHeaders(headers, 3);
     web.on("/", HTTP_GET, deviceHostOnly(httpIndex));
     web.on("/api/state", HTTP_GET, deviceHostOnly(sendState));
     web.on("/api/logs", HTTP_GET, deviceHostOnly(httpLogs));
+    web.on("/api/listen", HTTP_GET, deviceHostOnly(httpListen));
     web.on("/metrics", HTTP_GET, deviceHostOnly(httpMetrics));
     web.on("/api/settings", HTTP_POST, httpSettings);
     web.on("/api/action", HTTP_POST, httpAction);

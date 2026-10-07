@@ -91,3 +91,23 @@ inline float agcUpdate(float mult, float rms, float blockSeconds) {
     if (mult > 10.0f) mult = 10.0f;
     return mult;
 }
+
+// 44-byte header of a WAV file of 16-bit mono PCM at `rate` holding `dataBytes` of samples
+// (little-endian, as WAV requires).
+inline void wavHeader(uint8_t* h, uint32_t rate, uint32_t dataBytes) {
+    const auto put32 = [h](int at, uint32_t v) {
+        h[at] = (uint8_t)v; h[at + 1] = (uint8_t)(v >> 8); h[at + 2] = (uint8_t)(v >> 16); h[at + 3] = (uint8_t)(v >> 24);
+    };
+    const auto put16 = [h](int at, uint16_t v) { h[at] = (uint8_t)v; h[at + 1] = (uint8_t)(v >> 8); };
+    const char* tags = "RIFFWAVEfmt data";
+    for (int i = 0; i < 4; i++) { h[i] = tags[i]; h[8 + i] = tags[4 + i]; h[12 + i] = tags[8 + i]; h[36 + i] = tags[12 + i]; }
+    put32(4, 36 + dataBytes);   // RIFF chunk: everything after this field
+    put32(16, 16);              // fmt chunk size
+    put16(20, 1);               // PCM
+    put16(22, 1);               // mono
+    put32(24, rate);
+    put32(28, rate * 2);        // bytes per second
+    put16(32, 2);               // bytes per sample frame
+    put16(34, 16);              // bits per sample
+    put32(40, dataBytes);
+}

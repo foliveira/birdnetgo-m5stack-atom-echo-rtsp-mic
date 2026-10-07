@@ -4,6 +4,8 @@
 // instead of linking against the wrong type.
 #include <Arduino.h>
 
+class WiFiClient;
+
 extern const char* FW_VERSION_STR;
 
 // --- Settings (stored in NVS by saveAudioSettings) ---
@@ -89,3 +91,7 @@ enum class RebootKind { Plain, RestoreDefaults, ForgetWifi };
 void scheduleReboot(RebootKind kind, uint32_t delayMs, const char* why);   // why: a string literal
 bool requestStreamStop(const char* reason);
 void noteFirmwareUpdateInstalled();   // right before restarting into a firmware update
+// Live listening (GET /api/listen): 0 once a listener task owns the connection, else an HTTP
+// status with the reason in *why.
+int startListening(WiFiClient client, const char** why);
+const char* currentListener();          // the listener's address, "" when nobody listens

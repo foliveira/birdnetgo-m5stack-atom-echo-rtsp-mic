@@ -27,6 +27,7 @@ See `README.md` for project documentation and usage, and `docs/DETAILS.md` for t
 - Sample rate / frame size changes go through `restartI2S()`: it ends the session, parks the capture task (`pauseCapture()`), reinstalls I2S, reallocates the frame pool, resumes, and puts the previous values back if the pool does not fit. Gain/HPF/AGC/LED changes need no restart (read live by the capture task; HPF coefficients hand off under `hpfMux`).
 - The frame pool is allocated frame by frame (the heap's largest block is far smaller than its total): target `TARGET_QUEUE_MS` (3 s), cap 128 KB, stop when 80 KB of heap is left.
 - The capture task is the only LED writer after `setup()`. The LED is driven with the core's `neopixelWrite()`.
+- Live listening (`/api/listen`) is a separate path: the capture task copies blocks into `listenFeed` (a FreeRTOS stream buffer, one writer, one reader) and a listener task on core 0 owns that HTTP socket while it runs. `loop()` keeps the `WiFiClient`, closes it only after the task has set `exited`, and deletes the buffer only after `captureBlocks` has moved on since the feed was cut. Listening never touches the frame pool or the RTSP socket.
 
 ### Cross-Core Safety
 - Use FreeRTOS queues for inter-core data transfer (`freeQ`/`readyQ` carry frame pointers); never hand-rolled ring buffers.

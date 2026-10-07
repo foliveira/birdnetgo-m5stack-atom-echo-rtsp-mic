@@ -10,6 +10,7 @@
 #include <esp_netif.h>
 #include <esp_ota_ops.h>
 #include <esp_timer.h>
+#include <freertos/stream_buffer.h>
 #include "App.h"
 #include "AudioDsp.h"
 #include "RestartInfo.h"
@@ -350,6 +351,8 @@ void recordOverheatTrip(float temp) {
     persistOverheatNote();
 }
 
+static void stopListening(const char* why);   // LIVE LISTENING
+
 // Temperature monitoring + thermal protection.
 // The ESP32 (classic) die sensor is uncalibrated and typically reads 10-20 C above the real die
 // temperature, so a single reading is not trusted: the limit must be met on
@@ -384,6 +387,7 @@ void checkTemperature() {
             overLimitCount = 0;
             recordOverheatTrip(temp);
             setRtspServer(false);
+            stopListening("thermal protection");
         } else {
             simplePrintln("Temperature " + String(temp, 1) + " °C at/above limit (" +
                           String(overLimitCount) + "/" + String(OVERHEAT_CONSECUTIVE_READINGS) + ")");
@@ -820,6 +824,12 @@ static void ledShow(uint32_t c) {
 
 volatile bool buttonHeld = false;   // held long enough to show that a WiFi reset is coming
 
+// Live listening (see LIVE LISTENING below): the stream buffer the capture task copies processed
+// audio into while someone listens, NULL otherwise, and a count of finished capture blocks that
+// tells loop() when the capture task is done with a buffer it no longer feeds.
+static StreamBufferHandle_t volatile listenFeed = NULL;
+static volatile uint32_t captureBlocks = 0;
+
 // Faults (thermal latch, no WiFi) show even with the LED set to off: then it is the only sign.
 static uint32_t ledColorFor(bool streaming, bool clipped, float pct) {
     if (buttonHeld)      return LED_SETUP;                            // cyan: release now or the WiFi setup opens
@@ -849,11 +859,13 @@ static void captureTask(void* arg) {
 
     uint32_t lastLed = 0xFFFFFFFF;         // impossible value forces the first draw
     unsigned long lastLedUpdate = 0;
+    uint8_t* listenBlock = NULL;           // one block, little-endian, while someone listens
 
     for (;;) {
         // --- pause protocol: the loop task reinstalls I2S / reallocates the pool while we are parked ---
         if (capturePauseRequested) {
             if (captureBuf) { free(captureBuf); captureBuf = NULL; capSamples = 0; }
+            if (listenBlock) { free(listenBlock); listenBlock = NULL; }   // block size may change
             capturePaused = true;
             __asm__ __volatile__("memw" ::: "memory");
             while (capturePauseRequested) {
@@ -939,11 +951,32 @@ static void captureTask(void* arg) {
             }
         }
 
-        // --- DSP (AudioDsp.h), written big-endian straight into the frame ---
+        // Read once per block; loop() frees a buffer it stopped feeding only after captureBlocks
+        // has moved on, i.e. after this block is done with it.
+        const StreamBufferHandle_t feed = listenFeed;
+        const size_t blockBytes = (size_t)capSamples * sizeof(int16_t);
+        if (feed && !listenBlock) listenBlock = (uint8_t*)malloc(blockBytes);
+        if (!feed && listenBlock) { free(listenBlock); listenBlock = NULL; }
+
+        // --- DSP (AudioDsp.h), written big-endian straight into the frame (or, with no RTSP
+        //     session, into the listening block) ---
+        uint8_t* pcm = frame ? frame->data + FRAME_HDR_BYTES : (feed ? listenBlock : NULL);
         const BlockStats st = processBlock(captureBuf, capSamples, dc, hpfOn ? &localHpf : NULL,
-                                           appliedGain, targetGain,
-                                           frame ? frame->data + FRAME_HDR_BYTES : NULL);
+                                           appliedGain, targetGain, pcm);
         appliedGain = targetGain;
+
+        // --- live listening: the same audio, little-endian (WAV), whole blocks only so the
+        //     listener never gets half a sample; a block that does not fit is skipped ---
+        if (feed && listenBlock && pcm) {
+            for (size_t i = 0; i < blockBytes; i += 2) {
+                const uint8_t hi = pcm[i], lo = pcm[i + 1];
+                listenBlock[i] = lo;
+                listenBlock[i + 1] = hi;
+            }
+            if (xStreamBufferSpacesAvailable(feed) >= blockBytes) {
+                xStreamBufferSend(feed, listenBlock, blockBytes, 0);
+            }
+        }
 
         if (agcOn) {
             const float rms = sqrtf(st.sumSquares / (float)capSamples) / 32767.0f;
@@ -1005,6 +1038,7 @@ static void captureTask(void* arg) {
                 lastLed = c;
             }
         }
+        captureBlocks++;
     }
 }
 
@@ -1293,6 +1327,170 @@ bool requestStreamStop(const char* reason) {
     return true;
 }
 
+// ================== LIVE LISTENING (Web UI, core 0) ==================
+// GET /api/listen hands its HTTP connection to a listener task that sends the audio as an endless
+// WAV file. The capture task copies every processed block into listener.buf (little-endian) and
+// the task forwards it with non-blocking writes. Nothing comes from the RTSP frame pool, so
+// listening does not disturb a BirdNET-Go session, and when the listener falls behind only its
+// own blocks are skipped. One listener at a time.
+// Ownership: loop() creates the buffer and keeps the WiFiClient; the task is the only user of the
+// socket while it runs; loop() closes the socket after the task has exited and frees the buffer
+// once the capture task has also finished a block without it.
+
+#define LISTEN_BUFFER_MS 250             // audio buffered for the listener
+#define LISTEN_HEAP_MARGIN (32 * 1024)   // free heap that must remain after the buffer is allocated
+#define LISTEN_STALL_LIMIT_MS 5000       // listener accepted no data for this long -> drop it
+
+static struct {
+    StreamBufferHandle_t buf = NULL;
+    TaskHandle_t task = NULL;
+    WiFiClient client;                   // keeps the socket open once WebServer drops its copy
+    int fd = -1;
+    uint8_t head[160];                   // HTTP response head + WAV header, sent by the task first
+    size_t headLen = 0;
+    volatile bool stop = false;          // loop() asks the task to end
+    volatile bool exited = false;        // the task's last action
+    const char* volatile endReason = "";
+    uint32_t cutAtBlock = 0;             // captureBlocks when the feed was cut
+    unsigned long startedMs = 0;
+    String ip;
+} listener;
+
+static bool listenSendAll(int fd, const uint8_t* p, size_t n, const char** reason) {
+    size_t off = 0;
+    unsigned long stallStart = 0;
+    while (off < n) {
+        if (listener.stop) return false;
+        const int w = send(fd, p + off, n - off, MSG_DONTWAIT);
+        if (w > 0) { off += (size_t)w; stallStart = 0; continue; }
+        if (w < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != ENOMEM) {
+            *reason = "listener closed the connection";
+            return false;
+        }
+        const unsigned long now = millis();
+        if (!stallStart) stallStart = now;
+        else if (now - stallStart > LISTEN_STALL_LIMIT_MS) { *reason = "listener stalled"; return false; }
+        fd_set ws; FD_ZERO(&ws); FD_SET(fd, &ws);
+        struct timeval tv = { 0, 50000 };
+        select(fd + 1, NULL, &ws, NULL, &tv);
+    }
+    return true;
+}
+
+static void listenTask(void* arg) {
+    uint8_t chunk[1024];                 // on the task's stack: memory only while someone listens
+    const int fd = listener.fd;
+    const char* reason = "stopped";
+    unsigned long lastPoll = 0;
+    if (listenSendAll(fd, listener.head, listener.headLen, &reason)) {
+        while (!listener.stop) {
+            if (millis() - lastPoll >= 200) {   // notice a closed connection even while no audio flows
+                lastPoll = millis();
+                char rx[32];
+                const int r = recv(fd, rx, sizeof(rx), MSG_DONTWAIT);
+                if (r == 0) { reason = "listener closed the connection"; break; }
+                if (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK) { reason = "socket error"; break; }
+            }
+            const size_t n = xStreamBufferReceive(listener.buf, chunk, sizeof(chunk), pdMS_TO_TICKS(100));
+            if (n && !listenSendAll(fd, chunk, n, &reason)) break;
+        }
+    }
+    if (!listener.stop) listener.endReason = reason;   // else loop() already gave the reason
+    __asm__ __volatile__("memw" ::: "memory");
+    listener.exited = true;
+    vTaskDelete(NULL);
+}
+
+// Stop copying audio for the listener. The buffer stays allocated until the capture task has
+// finished a block (serviceListener).
+static void cutListenFeed() {
+    if (listenFeed == NULL) return;
+    listenFeed = NULL;
+    __asm__ __volatile__("memw" ::: "memory");
+    listener.cutAtBlock = captureBlocks;
+}
+
+// Ask the listener to end, e.g. before the sample rate changes under its WAV header.
+static void stopListening(const char* why) {
+    if (!listener.task || listener.stop) return;
+    cutListenFeed();
+    listener.endReason = why;
+    __asm__ __volatile__("memw" ::: "memory");
+    listener.stop = true;
+}
+
+// Loop task, every pass: clean up after the listener task.
+static void serviceListener() {
+    if (listener.task && listener.exited) {   // gone: no longer touches the socket or the buffer
+        listener.task = NULL;
+        cutListenFeed();
+        listener.client = WiFiClient();   // last reference: closes the socket
+        listener.fd = -1;
+        simplePrintln("Listening ended (" + String(listener.endReason) + ") for " + listener.ip + " after " +
+                      String((millis() - listener.startedMs) / 1000) + " s");
+    }
+    if (!listener.task && listener.buf && listenFeed == NULL &&
+        (captureBlocks != listener.cutAtBlock || capturePaused || !captureTaskHandle)) {
+        vStreamBufferDelete(listener.buf);
+        listener.buf = NULL;
+    }
+}
+
+// Loop task, inside the /api/listen handler. Returns 0 once the listener task owns the
+// connection (it answers 200 and streams), else an HTTP status with the reason in *why.
+int startListening(WiFiClient client, const char** why) {
+    // The same address asking again (a reloaded page, or Stop and Listen in quick succession)
+    // replaces its stream. Give a listener that is ending up to a second to clear.
+    if (listener.task && listener.ip == client.remoteIP().toString()) stopListening("replaced by a new request");
+    for (int i = 0; i < 100 && listener.buf && (!listener.task || listener.stop || listener.exited); i++) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+        serviceListener();
+    }
+    if (listener.task || listener.buf) { *why = "someone is already listening"; return 409; }
+    if (overheatLatched) { *why = "thermal protection is latched"; return 503; }
+    const uint32_t rate = appliedSampleRate;
+    if (!captureTaskHandle || rate == 0 || capturePauseRequested) { *why = "audio capture is not running"; return 503; }
+    const size_t blockBytes = (size_t)pipelineSamples * 2;
+    size_t bytes = (size_t)rate * 2 * LISTEN_BUFFER_MS / 1000;
+    if (bytes < 2 * blockBytes) bytes = 2 * blockBytes;
+    StreamBufferHandle_t buf = NULL;
+    if (heap_caps_get_free_size(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL) >= bytes + LISTEN_HEAP_MARGIN) {
+        buf = xStreamBufferCreate(bytes, 1);
+    }
+    if (!buf) { *why = "not enough free memory"; return 503; }
+
+    // An endless WAV file: the header announces ~9 hours, more than anyone listens.
+    int n = snprintf((char*)listener.head, sizeof(listener.head),
+                     "HTTP/1.1 200 OK\r\nContent-Type: audio/wav\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n");
+    wavHeader(listener.head + n, rate, 0x7FFF0000u);
+    listener.headLen = (size_t)n + 44;
+    listener.client = client;
+    listener.client.setNoDelay(false);   // let Nagle fill segments; latency does not matter here
+    listener.fd = listener.client.fd();
+    listener.buf = buf;
+    listener.stop = false;
+    listener.exited = false;
+    listener.endReason = "";
+    listener.startedMs = millis();
+    listener.ip = listener.client.remoteIP().toString();
+    if (xTaskCreatePinnedToCore(listenTask, "Listen", 4096, NULL, 5, &listener.task, 0) != pdPASS) {
+        listener.task = NULL;
+        listener.client = WiFiClient();   // WebServer still holds the connection and answers with the error
+        listener.buf = NULL;
+        vStreamBufferDelete(buf);
+        *why = "cannot start the listener";
+        return 503;
+    }
+    __asm__ __volatile__("memw" ::: "memory");
+    listenFeed = buf;
+    simplePrintln("Listening started for " + listener.ip);
+    return 0;
+}
+
+const char* currentListener() {
+    return listener.task ? listener.ip.c_str() : "";
+}
+
 // Reconfigure the audio front end (sample rate / buffer size). Ends any active session; the
 // client reconnects and gets the new parameters through DESCRIBE.
 // Put the last working rate/buffer back into the settings (and flash) after a failed change.
@@ -1311,6 +1509,7 @@ void restartI2S() {
     const uint16_t prevBuf = appliedBufferSize;
     simplePrintln("Reconfiguring audio: " + String(currentSampleRate) + " Hz, " +
                   String(currentBufferSize) + " samples/packet");
+    stopListening("audio reconfiguration");   // its WAV header has the old rate
     if (!requestStreamStop("audio reconfiguration")) {
         revertAudioConfig(prevRate, prevBuf, "sender task busy");   // pool/queues must not change under a live sender
         return;
@@ -1686,6 +1885,7 @@ void loop() {
     checkScheduledReset();
     checkButton();
     confirmFirmware();
+    serviceListener();
 
     // The capture task (higher priority, same core) stamps these at any moment. Read them before
     // millis(): the other order can pair a newer stamp with an older "now", and the unsigned

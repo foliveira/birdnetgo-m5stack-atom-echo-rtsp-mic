@@ -59,6 +59,9 @@ A capture watchdog in `loop()` reinstalls the I2S driver when the capture task h
 - PLAY without a SETUP on the same connection gets `455 Method Not Valid in This State`. PLAY gets `503 Service Unavailable` when the frame pool could not be allocated or the previous session is still closing.
 - SETUP advertises a 60 s session timeout, so clients send a keepalive about every 30 s. A session that is receiving audio is never ended for a missing keepalive. A client that connects and sends nothing for 60 s before PLAY is disconnected.
 
+### Live listening
+`GET /api/listen` hands its HTTP connection to a listener task (core 0, priority 5, below the RTP sender) that sends the audio as an endless WAV file. The capture task copies each processed block, byte-swapped to little-endian, into a FreeRTOS stream buffer of 250 ms (at least two blocks); the listener task forwards it with non-blocking writes. The listener takes nothing from the RTSP frame pool, so it does not disturb a BirdNET-Go session; when the listener falls behind, blocks are skipped for it alone. One listener at a time. It needs the buffer plus 32 KB of free heap, and ends when the sample rate or frame size changes (its WAV header would be wrong), when thermal protection trips, or when the listener accepts no data for 5 s.
+
 ### Power and Heat
 Controllable consumers, largest first: the WiFi receiver with power save off (~80 to 100 mA), CPU 160 vs 80 MHz (~10 mA), transmit power (a few mA at this duty cycle), the LED (<2 mA at the brightness used). The internal temperature sensor is uncalibrated and reads high; thermal protection therefore requires three consecutive readings, one per minute, at or over the limit.
 
@@ -112,8 +115,8 @@ Stream stability does not depend on this setting: the send queue holds the same 
 
 One page (`web/index.html`, gzipped into the firmware at build time) that polls `/api/state` once a second while it is visible.
 
-- **Signal level**: peak meter, clipping count, AGC factor, and a warning when the microphone delivers constant samples for 10 s (a working microphone always shows some noise).
-- **Stream**: client, session length or why the last one ended, format, send queue depth, dropped frames, I2S overruns, longest stall, frames sent, connections.
+- **Signal level**: peak meter, clipping count, AGC factor, and a warning when the microphone delivers constant samples for 10 s (a working microphone always shows some noise). **Listen** plays the stream in the browser and draws a spectrogram (newest on the right, up to half the sample rate), so the effect of gain and the high-pass filter, and whether high calls come through, can be checked by ear and by eye. Listening adds a second audio stream on the WiFi link while it runs.
+- **Stream**: client, session length or why the last one ended, format, send queue depth, dropped frames, I2S overruns, longest stall, frames sent, connections, who is listening.
 - **Device**: uptime, last restart reason, WiFi network and RSSI, access point (BSSID, channel), WiFi drops with the last reason, address and mDNS name, power save state, free memory, CPU clock, temperature, thermal guard.
 - **Audio**, **Network and power**, **Protection and maintenance**: settings forms with Save and Undo. Polling never overwrites a field being edited; every field is validated before any is applied.
 - **Actions**: restart audio, stop or start the RTSP server, reboot, restore defaults (keeps the WiFi network), change WiFi network.
@@ -147,7 +150,7 @@ POST bodies are form-encoded. Replies are JSON unless noted. There is no authent
 | `sched`, `sched_h` | scheduled reboot on/off, every 1 to 168 hours |
 | `name` | device name: 1 to 31 lowercase letters, digits or hyphens, no hyphen at either end |
 
-`live` holds the status the page shows: `uptime`, `restart_reason`, `ip`, `ssid`, `rssi`, `bssid`, `channel`, `wifi_drops`, `wifi_last_drop`, `wifi_last_drop_s`, `ps_suspended`, `heap_kb`, `heap_min_kb`, `cpu_mhz`, `temp_c`, `temp_max_c`, `server`, `streaming`, `client`, `session_s`, `end_reason`, `connects`, `plays`, `rate`, `frame_ms`, `sent`, `dropped`, `overruns`, `read_errors`, `queue`, `queue_peak`, `queue_cap`, `stall_max_ms`, `stalls`, `peak_pct`, `hold_pct`, `clips`, `agc_x`, `mic_flat`, `oh_latched`, `oh_sensor_fault`, `oh_note`, `log_seq`. Stream counters restart with every session. Unknown values are `null`.
+`live` holds the status the page shows: `uptime`, `restart_reason`, `ip`, `ssid`, `rssi`, `bssid`, `channel`, `wifi_drops`, `wifi_last_drop`, `wifi_last_drop_s`, `ps_suspended`, `heap_kb`, `heap_min_kb`, `cpu_mhz`, `temp_c`, `temp_max_c`, `server`, `streaming`, `client`, `session_s`, `end_reason`, `connects`, `plays`, `listener` (address of whoever listens, empty when nobody), `rate`, `frame_ms`, `sent`, `dropped`, `overruns`, `read_errors`, `queue`, `queue_peak`, `queue_cap`, `stall_max_ms`, `stalls`, `peak_pct`, `hold_pct`, `clips`, `agc_x`, `mic_flat`, `oh_latched`, `oh_sensor_fault`, `oh_note`, `log_seq`. Stream counters restart with every session. Unknown values are `null`.
 
 ### `POST /api/settings`
 Any subset of the `cfg` keys. Booleans take `1`/`0`, `on`/`off` or `true`/`false`. All keys are validated before any is applied; the reply is the new state, or `400 {"error": "gain: must be 0.1 to 100"}`. Changing `rate` or `buffer` restarts the audio pipeline and ends the session; if the new frame pool does not fit in memory the previous values are restored and the reply is `500`.
@@ -160,6 +163,9 @@ curl -d gain=4 -d agc=0 http://atomecho.local/api/settings
 
 ### `POST /api/update`
 Multipart upload (`multipart/form-data`) of a `firmware.bin` (any field name). Replies `{"ok": true}` and restarts into the new firmware, or `400` with the Update library's error (for example `Wrong Magic Byte` for a file that is not an ESP32 image), or `no firmware file in the request` for any other body. The RTSP session is stopped before writing. If the upload connection drops, the partial update is discarded.
+
+### `GET /api/listen`
+Live audio as a WAV file that does not end (16-bit mono PCM at the current sample rate; the header announces about 9 hours). Play it with `<audio src>` or save it: `curl -o garden.wav http://atomecho.local/api/listen` records until you stop curl. One listener at a time: a request from another address gets `409`, while a new request from the address that is listening replaces its stream (a reloaded page). `503` when memory is short, capture is not running or the thermal latch is set. A request for a byte range that does not start at 0 gets `416`: browsers ask for one to resume a dropped stream, and a live stream cannot be resumed part-way.
 
 ### `GET /api/logs?since=N`
 Plain text: the log lines after line number `N` (at most the last 48). The `X-Log-Seq` header holds the number of the newest line; pass it as `since` next time.
@@ -247,7 +253,8 @@ v2.3.0 and earlier are [@stedrow](https://github.com/stedrow)'s releases of the 
 
 ### v3.1.0
 Settings and WiFi credentials are preserved; see "Updating" in the README.
-- Web UI rewritten: English only, one gzipped 9 KB page, a single JSON state endpoint polled once a second, settings validated before they are applied, cross-site POSTs and foreign host names (DNS rebinding) refused. The old `/api/*` endpoints are removed.
+- Web UI rewritten: English only, one gzipped 10 KB page, a single JSON state endpoint polled once a second, settings validated before they are applied, cross-site POSTs and foreign host names (DNS rebinding) refused. The old `/api/*` endpoints are removed.
+- Listen to the microphone in the Web UI with a live spectrogram, beside the RTSP stream (`/api/listen`)
 - Firmware update from the Web UI (`/api/update`) with automatic rollback when the new version restarts within its first minute
 - Prometheus metrics at `/metrics`
 - WiFiManager, M5Atom and FastLED removed: built-in setup portal, LED driven by the core's `neopixelWrite`. The firmware went from not fitting the app partition with current libraries (1.48 MB) to 0.95 MB.

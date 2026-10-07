@@ -51,6 +51,9 @@ pre{margin:10px 0 0;max-height:50vh;overflow:auto;white-space:pre-wrap;word-brea
 #offline{position:fixed;left:50%;top:10px;transform:translateX(-50%);background:var(--bad);color:#fff;padding:6px 14px;border-radius:99px;font-size:13px;display:none;z-index:5}
 #overlay{position:fixed;inset:0;background:rgba(0,0,0,.55);display:none;align-items:center;justify-content:center;z-index:9}
 #overlay div{background:var(--card);border-radius:10px;padding:18px 24px}
+.spec{position:relative;margin-top:10px}
+.spec canvas{display:block;width:100%;height:160px;background:#000;border-radius:6px}
+.spec .axis{position:absolute;top:0;bottom:0;left:6px;display:flex;flex-direction:column;justify-content:space-between;padding:2px 0;font-size:11px;color:#fff;opacity:.8;pointer-events:none}
 </style>
 </head>
 <body>
@@ -71,6 +74,9 @@ pre{margin:10px 0 0;max-height:50vh;overflow:auto;white-space:pre-wrap;word-brea
   <div class="lvl"><span id="lvlText">–</span><span id="clipText"></span><span id="agcText"></span></div>
   <div class="bad" id="micFlat" hidden>No signal from the microphone: its samples have not changed for 10 s. A working microphone always shows some noise, so this points to a hardware fault.</div>
   <small>Loudest peak in the last 3 s, measured after gain. Aim for 30–70 %; clipping distorts calls.</small>
+  <div class="row" style="margin-top:10px"><button type="button" id="listenBtn">Listen</button><span class="msg" id="listenMsg" style="margin:0"></span></div>
+  <div class="spec" id="spec" hidden><canvas id="spectrum" height="160"></canvas><div class="axis"><span id="axisTop"></span><span id="axisMid"></span><span>0</span></div></div>
+  <small>Plays what BirdNET-Go receives (after the filter and gain) with a spectrogram, newest on the right. It runs beside the RTSP stream and adds the same amount of WiFi traffic again while it plays.</small>
 </section>
 
 <div class="grid">
@@ -84,6 +90,7 @@ pre{margin:10px 0 0;max-height:50vh;overflow:auto;white-space:pre-wrap;word-brea
   <dt>Longest stall</dt><dd id="stall">–</dd>
   <dt>Frames sent</dt><dd id="sent">–</dd>
   <dt>Connections</dt><dd id="conns">–</dd>
+  <dt>Listening</dt><dd id="listener">–</dd>
 </dl><small>Dropped frames mean the network could not keep up for longer than the send queue holds. I2S overruns should always be 0.</small></section>
 
 <section class="card"><h2>Device</h2><dl>
@@ -262,6 +269,12 @@ function render(s) {
   set('stall', L.stall_max_ms + ' ms (' + num(L.stalls) + ' stalls)', L.stall_max_ms > cap * 1000 ? 'warn' : '');
   set('sent', num(L.sent));
   set('conns', L.connects + ' connections, ' + L.plays + ' streams since boot');
+  set('listener', L.listener || 'nobody');
+  if (listen && !L.listener && Date.now() - listen.started > 3000) stopListen('The device ended the stream.');
+  const busy = !listen && !!L.listener;
+  $('listenBtn').disabled = busy;
+  if (busy) set('listenMsg', 'In use by ' + L.listener, 'msg muted');
+  else if ($('listenMsg').textContent.startsWith('In use')) set('listenMsg', '', 'msg');
 
   set('uptime', dur(L.uptime));
   set('restart', L.restart_reason, /crash|watchdog|brownout|recovery/.test(L.restart_reason) ? 'warn' : '');
@@ -410,6 +423,64 @@ $('fwInstall').onclick = () => {
   xhr.open('POST', '/api/update');
   xhr.send(body);
 };
+
+// Live listening: the device streams WAV; a Web Audio analyser taps it for the spectrogram.
+let listen = null;
+const heat = [];   // black -> red -> yellow -> white
+for (let i = 0; i < 256; i++) { const t = i / 255, c = (x) => Math.round(255 * Math.max(0, Math.min(1, x))); heat.push([c(3 * t), c(3 * t - 1), c(3 * t - 2)]); }
+
+function startListen() {
+  const Ctx = window.AudioContext || window.webkitAudioContext;
+  if (!Ctx) { set('listenMsg', 'This browser cannot play the stream.', 'msg bad'); return; }
+  const audio = new Audio('/api/listen?t=' + Date.now());
+  const ctx = new Ctx();
+  const an = ctx.createAnalyser();
+  an.fftSize = 1024; an.smoothingTimeConstant = 0; an.minDecibels = -110; an.maxDecibels = -20;
+  ctx.createMediaElementSource(audio).connect(an);
+  an.connect(ctx.destination);
+  const canvas = $('spectrum');
+  canvas.width = Math.max(100, canvas.clientWidth || 600);
+  const top = Math.min(ctx.sampleRate, st ? st.live.rate : 32000) / 2;   // highest frequency shown
+  $('axisTop').textContent = (top / 1000).toFixed(0) + ' kHz';
+  $('axisMid').textContent = (top / 2000).toFixed(0);
+  listen = { audio, ctx, an, top, bins: new Uint8Array(an.frequencyBinCount), col: null, raf: 0, started: Date.now() };
+  audio.addEventListener('error', () => stopListen('The stream ended (another listener, an audio restart, or low memory).'));
+  audio.addEventListener('ended', () => stopListen('The device ended the stream.'));
+  audio.play().then(() => ctx.resume()).catch(() => stopListen('The browser did not start playback.'));
+  $('spec').hidden = false;
+  $('listenBtn').textContent = 'Stop';
+  set('listenMsg', 'Connecting…', 'msg muted');
+  audio.addEventListener('playing', () => set('listenMsg', '', 'msg'), { once: true });
+  drawSpectrum();
+}
+
+function stopListen(text) {
+  if (!listen) return;
+  cancelAnimationFrame(listen.raf);
+  listen.audio.pause();
+  listen.audio.removeAttribute('src');
+  listen.audio.load();   // drops the connection, which ends the device's listener
+  listen.ctx.close();
+  listen = null;
+  $('listenBtn').textContent = 'Listen';
+  set('listenMsg', text, text ? 'msg bad' : 'msg');
+}
+
+// One column per animation frame: scroll left by a pixel, draw the newest spectrum at the right.
+function drawSpectrum() {
+  const lis = listen, canvas = $('spectrum'), g = canvas.getContext('2d'), h = canvas.height;
+  if (!lis.col) lis.col = g.createImageData(1, h);
+  lis.an.getByteFrequencyData(lis.bins);
+  const binsShown = lis.top / (lis.ctx.sampleRate / 2) * lis.bins.length, d = lis.col.data;
+  for (let y = 0; y < h; y++) {
+    const c = heat[lis.bins[Math.min(lis.bins.length - 1, Math.floor((1 - y / h) * binsShown))]];
+    d[4 * y] = c[0]; d[4 * y + 1] = c[1]; d[4 * y + 2] = c[2]; d[4 * y + 3] = 255;
+  }
+  g.drawImage(canvas, -1, 0);
+  g.putImageData(lis.col, canvas.width - 1, 0);
+  lis.raf = requestAnimationFrame(drawSpectrum);
+}
+$('listenBtn').onclick = () => (listen ? stopListen('') : startListen());
 
 $('copyUrl').onclick = () => copyText($('url').textContent, $('copyUrl'));
 $('copyLog').onclick = () => copyText($('log').textContent, $('copyLog'));

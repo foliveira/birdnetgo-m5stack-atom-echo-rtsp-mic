@@ -16,6 +16,7 @@ const defaults = { rate: 32000, buffer: 1024, gain: 3, hpf: true, hpf_hz: 300, a
 let cfg = { ...defaults };
 let server = scenario !== 'latched', latched = scenario === 'latched', streaming = scenario === 'streaming';
 let sent = 0, clips = 0, downUntil = 0;
+let listenRes = null, listenerIp = '';   // the one live listener, as on the device
 let ohNote = latched ? 'Thermal protection stopped the stream on 2026-10-07 at 14:03 UTC: 81.5 °C for 3 minutes (limit 80 °C).' : '';
 
 const LOG_CAP = 48;
@@ -45,7 +46,7 @@ function state() {
       wifi_drops: 1, wifi_last_drop: 'BEACON_TIMEOUT', wifi_last_drop_s: 7380 + up, ps_suspended: false, heap_kb: 82, heap_min_kb: 71, cpu_mhz: cfg.cpu,
       temp_c: 51.2 + Math.random(), temp_max_c: 57.9,
       server, streaming: live, client: live ? '192.168.1.20' : '', session_s: live ? up : 0,
-      end_reason: live ? '' : 'client closed connection', connects: 4, plays: 3,
+      end_reason: live ? '' : 'client closed connection', connects: 4, plays: 3, listener: listenerIp,
       rate: cfg.rate, frame_ms: Math.round(frameMs * 100) / 100, sent, dropped: 0, overruns: 0, read_errors: 0,
       queue: Math.floor(Math.random() * 3), queue_peak: 6, queue_cap: 46,
       stall_max_ms: 180, stalls: 12, peak_pct: peak, hold_pct: peak + 8, clips,
@@ -89,6 +90,33 @@ function parseSetting(key, v, s) {
   return null;
 }
 
+// A WAV header for an endless 16-bit mono stream, as wavHeader() in src/AudioDsp.h writes it.
+function wavHeader(rate) {
+  const h = Buffer.alloc(44), data = 0x7fff0000;
+  h.write('RIFF', 0); h.writeUInt32LE(36 + data, 4); h.write('WAVEfmt ', 8);
+  h.writeUInt32LE(16, 16); h.writeUInt16LE(1, 20); h.writeUInt16LE(1, 22);
+  h.writeUInt32LE(rate, 24); h.writeUInt32LE(rate * 2, 28); h.writeUInt16LE(2, 32); h.writeUInt16LE(16, 34);
+  h.write('data', 36); h.writeUInt32LE(data, 40);
+  return h;
+}
+// Something to look at in the spectrogram: hiss, a rising call every 1.5 s, a high trill every 4 s.
+function birdSample(t) {
+  let s = (Math.random() * 2 - 1) * 250;
+  const p = t % 1.5;
+  if (p < 0.25) s += Math.sin(Math.PI * p / 0.25) * 9000 * Math.sin(2 * Math.PI * (3000 * p + 3000 * p * p / 0.5));
+  const q = t % 4;
+  if (q > 2 && q < 2.4) s += (Math.floor(q * 40) % 2) * 5000 * Math.sin(2 * Math.PI * 9500 * t);
+  return Math.max(-32768, Math.min(32767, Math.round(s)));
+}
+function endListening(why) {
+  if (!listenRes) return;
+  const res = listenRes;
+  listenRes = null;
+  log('Listening ended (' + why + ') for ' + listenerIp);
+  listenerIp = '';
+  res.destroy();
+}
+
 function body(req) {
   return new Promise((resolve) => { let b = ''; req.on('data', (c) => { b += c; }); req.on('end', () => resolve(new URLSearchParams(b))); });
 }
@@ -113,12 +141,13 @@ createServer(async (req, res) => {
       changes.push(k + '=' + v);
     }
     if (changes.length) log('Web UI settings: ' + changes.join(', '));
+    if (next.rate !== cfg.rate || next.buffer !== cfg.buffer) endListening('audio reconfiguration');
     cfg = next;
     json(res, 200, state());
   } else if (req.method === 'POST' && url.pathname === '/api/action') {
     if (crossSite(req)) { json(res, 403, { error: 'cross-site request refused' }); return; }
     const name = (await body(req)).get('name');
-    if (name === 'restart_audio') log('Web UI: restart audio');
+    if (name === 'restart_audio') { log('Web UI: restart audio'); endListening('audio reconfiguration'); }
     else if (name === 'server_on') {
       if (latched) { json(res, 409, { error: 'thermal protection is latched; use Resume streaming' }); return; }
       server = true; log('Web UI: RTSP server started');
@@ -146,6 +175,28 @@ createServer(async (req, res) => {
     log('Firmware update written; restarting into it');
     downUntil = Date.now() + 4000;
     json(res, 200, { ok: true });
+  } else if (req.method === 'GET' && url.pathname === '/api/listen') {
+    const range = req.headers.range || '';
+    if (range && !range.startsWith('bytes=0-')) { json(res, 416, { error: 'a live stream cannot be resumed' }); return; }
+    const from = req.socket.remoteAddress.replace(/^::ffff:/, '');
+    if (listenRes && from === listenerIp) endListening('replaced by a new request');   // same address: replace
+    if (listenRes) { json(res, 409, { error: 'someone is already listening' }); return; }
+    if (latched) { json(res, 503, { error: 'thermal protection is latched' }); return; }
+    listenRes = res;
+    listenerIp = from;
+    log('Listening started for ' + listenerIp);
+    res.writeHead(200, { 'Content-Type': 'audio/wav', 'Cache-Control': 'no-store', Connection: 'close' });
+    res.write(wavHeader(cfg.rate));
+    const rate = cfg.rate, started = Date.now();
+    let t = 0;
+    const tick = setInterval(() => {
+      const n = Math.floor((Date.now() - started) / 1000 * rate) - t;
+      if (n <= 0) return;
+      const buf = Buffer.alloc(n * 2);
+      for (let i = 0; i < n; i++, t++) buf.writeInt16LE(birdSample(t / rate), 2 * i);
+      res.write(buf);
+    }, 50);
+    res.on('close', () => { clearInterval(tick); if (listenRes === res) endListening('listener closed the connection'); });
   } else if (req.method === 'GET' && url.pathname === '/api/logs') {
     const end = logs.length;
     let first = Number.parseInt(url.searchParams.get('since') || '0', 10) || 0;

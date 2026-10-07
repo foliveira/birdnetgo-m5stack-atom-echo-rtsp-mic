@@ -15,7 +15,8 @@ This repository is a fork of [stedrow/birdnetgo-m5stack-atom-echo-rtsp-mic](http
 - Capture and network send run in separate tasks joined by a send queue of up to 3 s of audio, so WiFi stalls shorter than the queue lose nothing. RTP frames are always sent whole.
 - RTP sequence numbers and timestamps advance for every captured frame, so a frame that does get dropped reaches BirdNET-Go as a gap instead of a click.
 - 32 kHz by default, which carries the whole 0 to 15 kHz band BirdNET analyses. A DC blocker, a 2nd-order high-pass filter (300 Hz by default), manual gain applied live with a per-sample ramp, and optional automatic gain control.
-- Web UI: signal level, stream and WiFi diagnostics, settings with validation, the log, and firmware updates. One 9 KB page, English only.
+- Web UI: signal level, stream and WiFi diagnostics, settings with validation, the log, and firmware updates. One 10 KB page, English only.
+- Listen to the microphone in the browser, with a live spectrogram, while BirdNET-Go keeps streaming.
 - Firmware updates over WiFi. A new version that restarts before it has run for a minute with WiFi is rolled back to the previous one.
 - Prometheus metrics at `/metrics`: frames sent and dropped, stalls, WiFi drops, RSSI, temperature, signal level.
 - WiFi setup through a built-in captive portal; joins the strongest access point for the network name (mesh systems, repeaters).
