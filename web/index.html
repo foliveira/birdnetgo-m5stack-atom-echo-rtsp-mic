@@ -33,7 +33,7 @@ form label.check{display:flex;gap:8px;align-items:center}
 form label.check>span{display:inline;margin:0}
 small{display:block;color:var(--muted);font-size:12.5px;margin-top:3px}
 input,select,button{font:inherit;color:inherit}
-input[type=number],select{width:100%;max-width:260px;padding:6px 8px;border:1px solid var(--line);border-radius:6px;background:var(--field)}
+input[type=number],input[type=text],select{width:100%;max-width:260px;padding:6px 8px;border:1px solid var(--line);border-radius:6px;background:var(--field)}
 input[type=checkbox]{width:18px;height:18px;margin:0}
 .dirty{outline:2px solid var(--warn);outline-offset:1px}
 button{padding:7px 14px;border-radius:6px;border:1px solid var(--line);background:var(--card);cursor:pointer}
@@ -91,7 +91,7 @@ pre{margin:10px 0 0;max-height:50vh;overflow:auto;white-space:pre-wrap;word-brea
   <dt>WiFi</dt><dd id="wifi">–</dd>
   <dt>Access point</dt><dd id="ap">–</dd>
   <dt>WiFi drops</dt><dd id="drops">–</dd>
-  <dt>IP address</dt><dd id="ip">–</dd>
+  <dt>Address</dt><dd id="ip">–</dd>
   <dt>Power save</dt><dd id="psState">–</dd>
   <dt>Free memory</dt><dd id="heap">–</dd>
   <dt>CPU</dt><dd id="cpu">–</dd>
@@ -123,8 +123,9 @@ pre{margin:10px 0 0;max-height:50vh;overflow:auto;white-space:pre-wrap;word-brea
   <div class="msg"></div>
 </form></section>
 
-<section class="card"><h2>WiFi and power</h2>
+<section class="card"><h2>Network and power</h2>
 <form data-settings>
+  <label><span>Device name</span><input type="text" name="name" maxlength="32" required pattern="[a-z0-9]([a-z0-9\-]*[a-z0-9])?" autocapitalize="none" spellcheck="false"><small>Reachable as <i>name</i>.local (mDNS) at once; the router's DHCP list shows it after the next reconnect. Lowercase letters, digits and hyphens.</small></label>
   <label><span>WiFi transmit power (dBm)</span><select name="tx">
     <option>-1</option><option>2</option><option>5</option><option>7</option><option>8.5</option><option>11</option><option>13</option><option>15</option><option>17</option><option>18.5</option><option>19</option><option>19.5</option>
   </select><small>Lower only if the access point is close; weak links retransmit more.</small></label>
@@ -256,7 +257,7 @@ function render(s) {
   set('wifi', L.ssid + ', ' + L.rssi + ' dBm (' + q[0] + ')', q[1]);
   set('ap', L.bssid + ', channel ' + L.channel);
   set('drops', L.wifi_drops ? num(L.wifi_drops) + ' since boot, last ' + dur(L.wifi_last_drop_s) + ' ago (' + L.wifi_last_drop + ')' : 'none since boot');
-  set('ip', L.ip);
+  set('ip', L.ip + ', ' + C.name + '.local');
   set('psState', C.ps ? (L.ps_suspended ? 'suspended until reboot (frames dropped)' : 'on') : 'off', L.ps_suspended ? 'warn' : '');
   set('heap', L.heap_kb + ' KB free (lowest ' + L.heap_min_kb + ' KB)', L.heap_min_kb < 40 ? 'warn' : '');
   set('cpu', L.cpu_mhz + ' MHz');
@@ -287,7 +288,7 @@ for (const form of forms) {
     if (!el.name || !st) return;
     const now = el.type === 'checkbox' ? el.checked : el.value;
     const was = st.cfg[el.name];
-    const same = el.type === 'checkbox' ? now === !!was : Number(now) === Number(was);
+    const same = el.type === 'checkbox' ? now === !!was : el.type === 'text' ? now === was : Number(now) === Number(was);
     el.classList.toggle('dirty', !same);
     updateButtons(form);
     if (el.name === 'rate') frameLabels();

@@ -12,7 +12,7 @@ const scenario = process.env.MOCK_SCENARIO || 'streaming';
 const boot = Date.now();
 
 const defaults = { rate: 32000, buffer: 1024, gain: 3, hpf: true, hpf_hz: 300, agc: false,
-  tx: 19.5, ps: false, cpu: 80, led: 1, oh: true, oh_limit: 80, sched: false, sched_h: 24 };
+  tx: 19.5, ps: false, cpu: 80, led: 1, oh: true, oh_limit: 80, sched: false, sched_h: 24, name: 'atomecho' };
 let cfg = { ...defaults };
 let server = scenario !== 'latched', latched = scenario === 'latched', streaming = scenario === 'streaming';
 let sent = 0, clips = 0, downUntil = 0;
@@ -75,6 +75,11 @@ function parseSetting(key, v, s) {
     case 'led': d = num(v, 0, 2, true); if (d === null) return 'must be 0, 1 or 2'; s.led = d; break;
     case 'oh_limit': d = num(v, 30, 95, true); if (d === null) return 'must be 30 to 95'; s.oh_limit = 30 + Math.floor((d - 30) / 5) * 5; break;
     case 'sched_h': d = num(v, 1, 168, true); if (d === null) return 'must be 1 to 168 hours'; s.sched_h = d; break;
+    case 'name': {
+      const n = v.toLowerCase();
+      if (n.length < 1 || n.length > 32 || !/^[a-z0-9-]+$/.test(n) || n.startsWith('-') || n.endsWith('-')) return 'must be 1 to 32 letters, digits or hyphens, with no hyphen at either end';
+      s.name = n; break;
+    }
     default:
       if (!FLAGS.includes(key)) return 'unknown setting';
       if (['1', 'on', 'true'].includes(v)) s[key] = true;

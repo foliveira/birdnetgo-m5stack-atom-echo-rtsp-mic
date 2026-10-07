@@ -178,6 +178,18 @@ async function streamingScenario(base) {
   check(agcPost && agcPost.body === 'agc=1', 'checkbox posted as 1', agcPost && agcPost.body);
   await waitFor(page, "document.getElementById('agcText').textContent.startsWith('AGC')", 'AGC multiplier shown');
 
+  // Text setting: a valid name is saved, an invalid one is stopped by the form's pattern.
+  await setValue(page, 'name', 'garden-mic');
+  page.requests.length = 0;
+  await page.evaluate(`${formOf('name')}.requestSubmit()`);
+  await waitFor(page, `${formOf('name')}.querySelector('.msg').textContent === 'Saved.'`, 'name saved');
+  const namePost = page.requests.find((r) => r.url.endsWith('/api/settings'));
+  check(namePost && namePost.body === 'name=garden-mic', 'name posted', namePost && namePost.body);
+  check((await text(page, 'ip')).endsWith('garden-mic.local'), 'address shows the new name', await text(page, 'ip'));
+  await setValue(page, 'name', 'bad name-');
+  check(await page.evaluate(`!${field('name')}.validity.valid`), 'invalid name flagged by the form');
+  await page.evaluate(`${formOf('name')}.reset()`);
+
   // Server stop/start toggles the button.
   await page.evaluate("document.getElementById('serverBtn').click()");
   await waitFor(page, "document.getElementById('serverBtn').textContent === 'Start RTSP server'", 'server stopped');

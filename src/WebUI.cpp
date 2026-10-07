@@ -101,7 +101,7 @@ static void sendState() {
     j.b("hpf", highpassEnabled).u("hpf_hz", highpassCutoffHz).b("agc", agcEnabled);
     j.f("tx", snapWifiTxDbm(wifiTxPowerDbm), 1).b("ps", wifiPowerSave).u("cpu", cpuFrequencyMhz);
     j.u("led", ledMode).b("oh", overheatProtectionEnabled).u("oh_limit", lroundf(overheatShutdownC));
-    j.b("sched", scheduledResetEnabled).u("sched_h", resetIntervalHours);
+    j.b("sched", scheduledResetEnabled).u("sched_h", resetIntervalHours).s("name", deviceName);
     j.close();
 
     const bool streaming = isStreaming;
@@ -169,6 +169,7 @@ struct Settings {
     uint8_t ohLimit;
     bool sched;
     uint16_t schedH;
+    char name[33];
 };
 
 static Settings currentSettings() {
@@ -187,6 +188,7 @@ static Settings currentSettings() {
     s.ohLimit = (uint8_t)lroundf(overheatShutdownC);
     s.sched = scheduledResetEnabled;
     s.schedH = (uint16_t)resetIntervalHours;
+    strlcpy(s.name, deviceName, sizeof(s.name));
     return s;
 }
 
@@ -239,6 +241,11 @@ static const char* parseSetting(const String& key, const String& v, Settings& s)
     } else if (key == "sched_h") {
         if (!parseNum(v, 1, 168, true, d)) return "must be 1 to 168 hours";
         s.schedH = (uint16_t)d;
+    } else if (key == "name") {
+        String n = v;
+        n.toLowerCase();
+        if (!isValidDeviceName(n.c_str())) return "must be 1 to 32 letters, digits or hyphens, with no hyphen at either end";
+        strlcpy(s.name, n.c_str(), sizeof(s.name));
     } else {
         bool* flag = key == "hpf" ? &s.hpf : key == "agc" ? &s.agc : key == "ps" ? &s.ps :
                      key == "oh" ? &s.oh : key == "sched" ? &s.sched : nullptr;
@@ -289,6 +296,7 @@ static void httpSettings() {
         cpuFrequencyMhz = s.cpu;
         setCpuFrequencyMhz(s.cpu);
     }
+    if (strcmp(s.name, was.name) != 0) setDeviceName(s.name);
     overheatProtectionEnabled = s.oh;
     overheatShutdownC = s.ohLimit;
     scheduledResetEnabled = s.sched;

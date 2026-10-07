@@ -21,6 +21,7 @@ extern bool overheatProtectionEnabled;
 extern float overheatShutdownC;
 extern bool scheduledResetEnabled;
 extern uint32_t resetIntervalHours;
+extern char deviceName[33];              // DHCP and mDNS name
 
 #define OVERHEAT_MIN_LIMIT_C 30
 #define OVERHEAT_MAX_LIMIT_C 95
@@ -29,6 +30,7 @@ extern uint32_t resetIntervalHours;
 // Sample rates the PDM microphone runs at: its clock is 64 x the rate and must stay within
 // the SPM1423's 1.0-3.25 MHz.
 bool isSupportedSampleRate(uint32_t hz);
+bool isValidDeviceName(const char* name);
 
 // --- Live state (read by the Web UI on the loop task) ---
 extern uint32_t appliedSampleRate;       // what the I2S driver runs
@@ -74,6 +76,7 @@ void updateHighpassCoeffs();
 void applyWifiPowerSave(bool log);
 void applyWifiTxPower(bool log);
 float snapWifiTxDbm(float dbm);
+void setDeviceName(const char* name);
 bool setRtspServer(bool on);   // false: refused because the thermal latch is set
 void clearThermalLatch();
 void scheduleReboot(bool factoryReset, uint32_t delayMs, const char* why);   // why: a string literal

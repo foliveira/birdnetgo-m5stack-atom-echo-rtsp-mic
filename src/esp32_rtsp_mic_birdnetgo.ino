@@ -1,5 +1,6 @@
 #include <WiFi.h>
 #include <ESPmDNS.h>
+#include <mdns.h>
 #include "driver/i2s.h"
 #include <Preferences.h>
 #include <math.h>
@@ -111,7 +112,7 @@ const char* FW_VERSION_STR = FW_VERSION;
 #define LED_PIN         27  // SK6812 RGB LED
 
 // -- Network identity
-#define DEVICE_HOSTNAME "atomecho"            // DHCP and mDNS name (atomecho.local)
+#define DEFAULT_DEVICE_NAME "atomecho"        // DHCP and mDNS name (atomecho.local); a setting
 #define SETUP_AP_NAME "ESP32-RTSP-Mic-AP"     // open access point of the WiFi setup portal
 #define WIFI_JOIN_TIMEOUT_MS 60000            // stored network not joined within this -> setup portal
 #define WIFI_DOWN_RESTART_MS (10UL * 60 * 1000) // link lost this long at runtime -> restart (stuck driver)
@@ -192,6 +193,8 @@ uint32_t resetIntervalHours = 24; // Default 24 hours
 
 uint8_t cpuFrequencyMhz = DEFAULT_CPU_MHZ;
 
+char deviceName[33] = DEFAULT_DEVICE_NAME;
+
 // -- WiFi TX power / power save (configurable)
 float wifiTxPowerDbm = DEFAULT_WIFI_TX_DBM;
 bool wifiPowerSave = DEFAULT_WIFI_POWER_SAVE;  // WIFI_PS_MIN_MODEM when true
@@ -269,6 +272,26 @@ uint32_t uptimeSeconds() {
 
 bool isSupportedSampleRate(uint32_t hz) {
     return hz == 16000 || hz == 22050 || hz == 24000 || hz == 32000 || hz == 44100 || hz == 48000;
+}
+
+// A DNS label: 1-32 lowercase letters, digits and hyphens, no hyphen at either end. 32 is the
+// limit of the DHCP hostname in ESP-IDF.
+bool isValidDeviceName(const char* name) {
+    const size_t n = strlen(name);
+    if (n < 1 || n > 32 || name[0] == '-' || name[n - 1] == '-') return false;
+    for (size_t i = 0; i < n; i++) {
+        const char c = name[i];
+        if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-')) return false;
+    }
+    return true;
+}
+
+// Rename the device. mDNS answers to the new name at once; DHCP sends it from the next connection.
+void setDeviceName(const char* name) {
+    strlcpy(deviceName, name, sizeof(deviceName));
+    WiFi.setHostname(deviceName);
+    mdns_hostname_set(deviceName);
+    simplePrintln(String("Device name: ") + deviceName + " (mDNS " + deviceName + ".local now, DHCP after the next reconnect)");
 }
 
 // Uptime -> "Xd Yh Zm Ts"
@@ -477,6 +500,8 @@ void loadAudioSettings() {
     }
     wifiTxPowerDbm = audioPrefs.getFloat("wifiTxDbm", DEFAULT_WIFI_TX_DBM);
     wifiPowerSave = audioPrefs.getBool("wifiPs", DEFAULT_WIFI_POWER_SAVE);
+    if (audioPrefs.isKey("hostname")) audioPrefs.getString("hostname", deviceName, sizeof(deviceName));
+    if (!isValidDeviceName(deviceName)) strlcpy(deviceName, DEFAULT_DEVICE_NAME, sizeof(deviceName));
     highpassEnabled = audioPrefs.getBool("hpEnable", DEFAULT_HPF_ENABLED);
     highpassCutoffHz = (uint16_t)audioPrefs.getUInt("hpCutoff", DEFAULT_HPF_CUTOFF_HZ);
     agcEnabled = audioPrefs.getBool("agcEnable", false);
@@ -522,6 +547,7 @@ void saveAudioSettings() {
     audioPrefs.putUChar("cpuFreq", cpuFrequencyMhz);
     audioPrefs.putFloat("wifiTxDbm", wifiTxPowerDbm);
     audioPrefs.putBool("wifiPs", wifiPowerSave);
+    audioPrefs.putString("hostname", deviceName);
     audioPrefs.putBool("hpEnable", highpassEnabled);
     audioPrefs.putUInt("hpCutoff", (uint32_t)highpassCutoffHz);
     audioPrefs.putBool("agcEnable", agcEnabled);
@@ -572,6 +598,7 @@ void resetToDefaultSettings() {
     agcEnabled = false;
     agcMultiplier = 1.0f;
     ledMode = 1;
+    strlcpy(deviceName, DEFAULT_DEVICE_NAME, sizeof(deviceName));
     overheatProtectionEnabled = DEFAULT_OVERHEAT_PROTECTION;
     overheatShutdownC = (float)DEFAULT_OVERHEAT_LIMIT_C;
     overheatLastReason = "";
@@ -1466,11 +1493,11 @@ void setup() {
     Serial.println("Initializing WiFi...");
     WiFi.onEvent(onWifiEvent);
     WiFi.setSleep(false);
-    if (!wifiJoinStored(DEVICE_HOSTNAME, WIFI_JOIN_TIMEOUT_MS)) {
+    if (!wifiJoinStored(deviceName, WIFI_JOIN_TIMEOUT_MS)) {
         ledShow(LED_SETUP);
         simplePrintln(wifiHasStoredCredentials() ? "WiFi: stored network not reachable, starting setup portal"
                                                  : "WiFi: no network configured, starting setup portal");
-        wifiRunSetupPortal(SETUP_AP_NAME, DEVICE_HOSTNAME);   // restarts the device
+        wifiRunSetupPortal(SETUP_AP_NAME, deviceName);   // restarts the device
     }
     simplePrintln("WiFi connected: " + WiFi.localIP().toString() + " on " + WiFi.SSID() +
                   ", RSSI " + String(WiFi.RSSI()) + " dBm, channel " + String(WiFi.channel()));
@@ -1482,11 +1509,11 @@ void setup() {
     applyWifiTxPower(true);
     applyWifiPowerSave(true);
 
-    // mDNS: allows rtsp://atomecho.local:8554/audio
-    if (MDNS.begin(DEVICE_HOSTNAME)) {
+    // mDNS: allows rtsp://<name>.local:8554/audio
+    if (MDNS.begin(deviceName)) {
         MDNS.addService("rtsp", "tcp", 8554);
         MDNS.addService("http", "tcp", 80);
-        simplePrintln("mDNS: " DEVICE_HOSTNAME ".local");
+        simplePrintln(String("mDNS: ") + deviceName + ".local");
     }
 
     // CPU clock before the audio pipeline starts (WiFi needs >= 80 MHz)
@@ -1523,7 +1550,7 @@ void setup() {
     if (!overheatLatched) {
         simplePrintln("RTSP server ready on port 8554");
         simplePrintln("RTSP URL: rtsp://" + WiFi.localIP().toString() + ":8554/audio");
-        simplePrintln("RTSP URL: rtsp://atomecho.local:8554/audio");
+        simplePrintln(String("RTSP URL: rtsp://") + deviceName + ".local:8554/audio");
     } else {
         simplePrintln("RTSP server paused due to thermal latch. Clear via Web UI before resuming streaming.");
     }
