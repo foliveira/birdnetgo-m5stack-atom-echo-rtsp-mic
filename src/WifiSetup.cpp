@@ -134,6 +134,7 @@ static const char PAGE_HEAD[] =
     WebServer server(80);
 
     uint32_t lastActivity = millis();
+    uint32_t lastRetry = millis();
     String error;
     char pendSsid[33] = "", pendPass[65] = "";
     uint32_t pendingAt = 0;
@@ -236,6 +237,27 @@ static const char PAGE_HEAD[] =
             error = String("Could not join \"") + pendSsid + "\". Check the password and that it is a 2.4 GHz network.";
             WiFi.disconnect();   // stop the core's retries; the access point stays up
             lastActivity = millis();
+        }
+
+        // With a stored network, keep trying it while nobody uses the portal: after a power cut
+        // the router often boots slower than the device, and this joins as soon as it is up
+        // instead of waiting for the idle restart.
+        if (idleTimeoutMs && !pendingAt && WiFi.softAPgetStationNum() == 0 && millis() - lastRetry > 30000) {
+            Serial.println("[Setup] retrying the stored network");
+            WiFi.begin();   // stored credentials
+            const uint32_t t0 = millis();
+            while (WiFi.status() != WL_CONNECTED && millis() - t0 < 10000 && WiFi.softAPgetStationNum() == 0) {
+                dns.processNextRequest();
+                server.handleClient();
+                delay(10);
+            }
+            if (WiFi.status() == WL_CONNECTED) {
+                Serial.println("[Setup] stored network reachable again; restarting");
+                delay(100);
+                esp_restart();
+            }
+            WiFi.disconnect();   // stop the retries so the access point keeps a steady channel
+            lastRetry = millis();
         }
 
         if (idleTimeoutMs && millis() - lastActivity > idleTimeoutMs) {

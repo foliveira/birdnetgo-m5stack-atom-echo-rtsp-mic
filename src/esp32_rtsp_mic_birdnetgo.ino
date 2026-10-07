@@ -114,6 +114,7 @@ const char* FW_VERSION_STR = FW_VERSION;
 #define DEVICE_HOSTNAME "atomecho"            // DHCP and mDNS name (atomecho.local)
 #define SETUP_AP_NAME "ESP32-RTSP-Mic-AP"     // open access point of the WiFi setup portal
 #define WIFI_JOIN_TIMEOUT_MS 60000            // stored network not joined within this -> setup portal
+#define WIFI_DOWN_RESTART_MS (10UL * 60 * 1000) // link lost this long at runtime -> restart (stuck driver)
 
 // -- Servers
 WiFiServer rtspServer(8554);
@@ -437,6 +438,11 @@ static void checkWiFi() {
     if (!up && now - lastKick >= 15000) {
         lastKick = now;
         WiFi.reconnect();
+    }
+    if (!up && now - downSince >= WIFI_DOWN_RESTART_MS) {
+        // Nothing streams without the link; a restart also resets a WiFi driver that stopped retrying.
+        simplePrintln("WiFi down for 10 minutes; restarting");
+        restartWithNote("recovery: WiFi down for 10 min");
     }
     if (up && now - lastWeakWarn >= 600000) {
         const int32_t rssi = WiFi.RSSI();
@@ -779,11 +785,11 @@ static void ledShow(uint32_t c) {
     neopixelWrite(LED_PIN, (uint8_t)(c >> 16), (uint8_t)(c >> 8), (uint8_t)c);   // core RMT driver
 }
 
+// Faults (thermal latch, no WiFi) show even with the LED set to off: then it is the only sign.
 static uint32_t ledColorFor(bool streaming, bool clipped, float pct) {
-    if (!streaming) {
-        if (overheatLatched) return rgb(10, 0, 0);                    // red: thermal latch
-        return (ledMode > 0) ? rgb(0, 0, 10) : 0;                     // blue: ready
-    }
+    if (overheatLatched) return rgb(10, 0, 0);                        // red: thermal latch
+    if (!wifiLinkUp)     return LED_STARTUP;                          // yellow: no WiFi, as while joining at boot
+    if (!streaming) return (ledMode > 0) ? rgb(0, 0, 10) : 0;         // blue: ready
     if (ledMode == 0) return 0;
     if (ledMode == 1) return rgb(0, 10, 0);                           // static green: streaming
     if (clipped)      return rgb(20, 0, 0);                           // red: clipping
