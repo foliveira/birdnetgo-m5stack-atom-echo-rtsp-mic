@@ -7,9 +7,9 @@ See `README.md` for project documentation and usage, and `docs/DETAILS.md` for t
 - `src/App.h` — Everything the sketch shares with the other modules (settings, live state, actions). Add declarations here, not as loose `extern`s
 - `src/WebUI.cpp` / `WebUI.h` — HTTP server: page, `/api/state`, `/api/settings`, `/api/action`, `/api/update`, `/api/logs`, `/metrics`, log ring
 - `web/index.html` — The Web UI page. `scripts/embed_webui.py` gzips it into `webui_index.h` in the build directory before every build
-- `src/WifiSetup.cpp` / `WifiSetup.h` — Joining the stored network and the setup portal (replaces WiFiManager)
+- `src/WifiSetup.cpp` / `WifiSetup.h` — Joining the stored network, the setup portal (replaces WiFiManager) and Improv Wi-Fi over serial for the browser flasher
 - `src/RestartInfo.cpp` / `RestartInfo.h` — Restart reason, RTC note for the firmware's own restarts, core dump summary after a crash
-- `src/AudioDsp.h`, `src/RtspRequest.h`, `src/JsonOut.h`, `src/PromOut.h`, `src/HostCheck.h` — Plain C++ (no Arduino), unit-tested on the host in `test/host`
+- `src/AudioDsp.h`, `src/RtspRequest.h`, `src/JsonOut.h`, `src/PromOut.h`, `src/HostCheck.h`, `src/ImprovSerial.h` — Plain C++ (no Arduino), unit-tested on the host in `test/host`
 - `test/webui/` — Mock device, browser test and API key check for the page
 - `platformio.ini` — Build configuration; the platform is pinned
 

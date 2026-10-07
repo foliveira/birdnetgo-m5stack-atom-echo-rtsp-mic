@@ -216,9 +216,9 @@
       <ol>
         <li>Connect your Atom Echo via USB</li>
         <li>Select a firmware release below</li>
-        <li>Click <strong>Install</strong> and select the serial port</li>
+        <li>Click <strong>Connect</strong>, select the serial port, then choose to install</li>
         <li>Wait for flashing to complete (~30 seconds)</li>
-        <li>Connect to <code>ESP32-RTSP-Mic-AP</code> to configure WiFi</li>
+        <li>Choose your WiFi network when the installer asks for it (or later: join <code>ESP32-RTSP-Mic-AP</code>)</li>
         <li>Stream at <code>rtsp://atomecho.local:8554/audio</code></li>
       </ol>
     </div>
@@ -264,9 +264,13 @@
 
     function buildManifest(tag) {
       return {
+        // name and version as the firmware reports them over Improv, so an installed copy is recognised
         name: 'Atom Echo RTSP Mic for BirdNET-Go',
-        version: tag,
+        version: tag.replace(/^v/, ''),
         new_install_prompt_erase: true,
+        // the firmware answers Improv once it has joined the stored network or opened the setup
+        // portal; 15 s after installing covers a normal join
+        new_install_improv_wait_time: 15,
         builds: [{
           chipFamily: 'ESP32',
           parts: [

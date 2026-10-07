@@ -1788,7 +1788,7 @@ void setup() {
         ledShow(LED_SETUP);
         simplePrintln(wifiHasStoredCredentials() ? "WiFi: stored network not reachable, starting setup portal"
                                                  : "WiFi: no network configured, starting setup portal");
-        wifiRunSetupPortal(SETUP_AP_NAME, deviceName);   // restarts the device
+        wifiRunSetupPortal(SETUP_AP_NAME, deviceName, FW_VERSION);   // restarts the device
     }
     simplePrintln("WiFi connected: " + WiFi.localIP().toString() + " on " + WiFi.SSID() +
                   ", RSSI " + String(WiFi.RSSI()) + " dBm, channel " + String(WiFi.channel()));
@@ -1851,6 +1851,7 @@ void setup() {
 
 void loop() {
     webui_handleClient();
+    wifiImprovPoll(deviceName, FW_VERSION);
 
     if (millis() - lastTempCheck > 60000) { // 1 min
         checkTemperature();

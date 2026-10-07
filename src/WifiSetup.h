@@ -10,8 +10,14 @@ bool wifiJoinStored(const char* hostname, uint32_t timeoutMs);
 // chosen credentials. Never returns: the device restarts after a successful join. If credentials
 // are already stored (the join failed, e.g. during a router outage) it retries that network every
 // 30 s while nobody is connected to the portal, restarts as soon as it is reachable, and restarts
-// anyway after three minutes without anyone using the portal.
-[[noreturn]] void wifiRunSetupPortal(const char* apName, const char* hostname);
+// anyway after three minutes without anyone using the portal. Answers Improv like wifiImprovPoll.
+[[noreturn]] void wifiRunSetupPortal(const char* apName, const char* hostname, const char* firmwareVersion);
+
+// Improv Wi-Fi over the serial port: right after installing, the browser flasher (ESP Web Tools)
+// asks for the WiFi network, sends it over USB, then links to the Web UI. Reads what has arrived
+// on Serial; call it from loop(). A network joined this way replaces the stored one and the
+// device restarts, as with the setup portal; one that cannot be joined changes nothing.
+void wifiImprovPoll(const char* hostname, const char* firmwareVersion);
 
 // True if NVS holds an SSID.
 bool wifiHasStoredCredentials();

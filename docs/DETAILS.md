@@ -48,6 +48,7 @@ A capture watchdog in `loop()` reinstalls the I2S driver when the capture task h
 
 ### WiFi
 - **Joining**: the device scans all channels and joins the strongest access point that carries the stored network name. The ESP-IDF default joins the first one it finds, often a distant mesh node.
+- **Over USB (Improv)**: the firmware answers [Improv Wi-Fi](https://www.improv-wifi.com/serial/) on the serial port, in the setup portal and in normal operation. Right after installing, the browser flasher asks for the network, sends it to the device over USB and then shows a link to the Web UI. A network that cannot be joined within 20 s changes nothing; one that joins replaces the stored network and the device restarts. While the flasher shows its network list it asks for a new scan every 3 s; the device answers from its last scan for 15 s, because each scan takes the radio off its channel for 1 to 4 s.
 - **Setup portal**: with no stored network, or when the stored one cannot be joined within 60 s at boot, the device opens the open network `ESP32-RTSP-Mic-AP` with a captive page that lists nearby networks. With a stored network it retries that network every 30 s while nobody is connected to the portal and restarts as soon as it answers (a router that boots slower than the device after a power cut), and restarts after 3 idle minutes. Without one it waits indefinitely. A network entered in the portal that cannot be joined does not replace the stored one. Credentials live in the same NVS slot WiFiManager used, so devices upgraded from 2.x and 3.0 keep them.
 - **At runtime**: a WiFi event handler tracks the link. `loop()` logs each drop with its reason, nudges a reconnect every 15 s, and restarts the device after 10 minutes without a link. An RTSP session survives a short drop: when the link returns with the same address the TCP connection is still valid, and the sender ends the session itself if the client stays unreachable for 10 s. The LED is yellow while the link is down.
 - **Power save**: with WiFi power save on, the radio sleeps between beacons and TCP acknowledgements arrive once per DTIM period. The 5760-byte TCP send window then carries 5760 B per beacon interval, enough for 16 kHz with DTIM 1 but not for higher rates. The firmware turns power save off until the next reboot when a session drops 10 frames.
@@ -66,7 +67,7 @@ A capture watchdog in `loop()` reinstalls the I2S driver when the capture task h
 Controllable consumers, largest first: the WiFi receiver with power save off (~80 to 100 mA), CPU 160 vs 80 MHz (~10 mA), transmit power (a few mA at this duty cycle), the LED (<2 mA at the brightness used). The internal temperature sensor is uncalibrated and reads high; thermal protection therefore requires three consecutive readings, one per minute, at or over the limit.
 
 ### Restart reasons and crash reports
-The Device card and the boot log show why the device last restarted: power on, reset pin, brownout, crash, watchdog, or the note the firmware left before restarting itself (`scheduled reboot`, `Web UI reboot`, `defaults restored from the Web UI`, `firmware update`, `WiFi network forgotten from the Web UI`, `WiFi network forgotten (button)`, `recovery: WiFi down for 10 min`, `recovery: sender task stuck`, `joined a network from the setup portal`, `setup portal: stored network is back`, `setup portal idle for 3 minutes`).
+The Device card and the boot log show why the device last restarted: power on, reset pin, brownout, crash, watchdog, or the note the firmware left before restarting itself (`scheduled reboot`, `Web UI reboot`, `defaults restored from the Web UI`, `firmware update`, `WiFi network forgotten from the Web UI`, `WiFi network forgotten (button)`, `recovery: WiFi down for 10 min`, `recovery: sender task stuck`, `joined a network from the setup portal`, `joined a network sent over USB`, `setup portal: stored network is back`, `setup portal idle for 3 minutes`).
 
 After a crash or watchdog reset the panic handler has written a core dump to flash. The boot log then has a line like this, and the firmware erases the dump once it has logged it, so an old dump is never reported for a later reset:
 ```
@@ -213,7 +214,7 @@ Useful alerts: `increase(rtspmic_frames_dropped_total[1h]) > 0` (audio lost), `r
 - Later: the WiFi link is down. The device keeps reconnecting and restarts after 10 minutes. The Device card shows the reason of the last drop once the link is back.
 
 ### LED is cyan
-The setup portal is running: join `ESP32-RTSP-Mic-AP` and pick a network. If it appeared after a power cut, the device keeps retrying the stored network every 30 s and returns to it by itself once the router is up.
+The setup portal is running: join `ESP32-RTSP-Mic-AP` and pick a network, or connect the device to a computer and use the browser flasher's "Connect" button to send it a network over USB. If it appeared after a power cut, the device keeps retrying the stored network every 30 s and returns to it by itself once the router is up.
 
 ### LED is red (not streaming)
 Thermal protection stopped the stream. The Web UI shows when and at what temperature. Let the device cool, then press Resume streaming. To run cooler: WiFi power save on, CPU 80 MHz, LED off, shade.
@@ -242,7 +243,7 @@ Check "Last restart" in the Device card or the boot log. After a crash, decode t
 
 ## Development
 
-- `sh test/host/run.sh` builds and runs the host unit tests (DSP, RTSP request parsing, JSON and Prometheus writers) with the system C++ compiler.
+- `sh test/host/run.sh` builds and runs the host unit tests (DSP, RTSP request parsing, JSON and Prometheus writers, Host header check, Improv protocol) with the system C++ compiler.
 - `node test/webui/mock_server.mjs [port]` serves the page with a fake device that mirrors the firmware's API (`MOCK_SCENARIO=latched` or `idle` for other states).
 - `node test/webui/check_keys.mjs` checks that the page, `src/WebUI.cpp` and the mock use the same JSON keys.
 - `node test/webui/ui_test.mjs` drives the page in headless Chrome against the mock (see the file's header for starting Chrome).
@@ -257,6 +258,7 @@ Settings and WiFi credentials are preserved; see "Updating" in the README.
 - Listen to the microphone in the Web UI with a live spectrogram, beside the RTSP stream (`/api/listen`)
 - Firmware update from the Web UI (`/api/update`) with automatic rollback when the new version restarts within its first minute
 - Prometheus metrics at `/metrics`
+- WiFi setup from the browser flasher over USB (Improv Wi-Fi), right after installing
 - WiFiManager, M5Atom and FastLED removed: built-in setup portal, LED driven by the core's `neopixelWrite`. The firmware went from not fitting the app partition with current libraries (1.48 MB) to 0.95 MB.
 - Joins the strongest access point for the network name; RTSP sessions survive short WiFi drops; restart after 10 minutes without WiFi; the setup portal retries the stored network every 30 s
 - Change the WiFi network from the Web UI or by holding the button for 5 s

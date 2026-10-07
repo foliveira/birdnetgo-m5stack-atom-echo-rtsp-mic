@@ -1,5 +1,6 @@
 #include "WifiSetup.h"
 
+#include "ImprovSerial.h"
 #include "RestartInfo.h"
 
 #include <DNSServer.h>
@@ -50,7 +51,7 @@ bool wifiJoinStored(const char* hostname, uint32_t timeoutMs) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Setup portal
+// Scanning and joining, for the setup portal and Improv
 
 struct ScannedNet {
     char ssid[33];
@@ -59,6 +60,7 @@ struct ScannedNet {
 };
 static ScannedNet nets[20];
 static int netCount = 0;
+static uint32_t lastScanAt = 0;
 
 static void scanNetworks() {
     netCount = 0;
@@ -82,12 +84,97 @@ static void scanNetworks() {
         e.open = WiFi.encryptionType(i) == WIFI_AUTH_OPEN;
     }
     WiFi.scanDelete();
+    lastScanAt = millis();
     for (int i = 1; i < netCount; i++) {   // strongest first
         for (int k = i; k > 0 && nets[k].rssi > nets[k - 1].rssi; k--) {
             ScannedNet t = nets[k]; nets[k] = nets[k - 1]; nets[k - 1] = t;
         }
     }
 }
+
+// Try a network the user entered, for up to 20 s, running idle() while waiting. WiFi.begin()
+// stores the network in NVS before trying it, so the previous one is put back if the join fails:
+// a mistyped password, or anyone in range of the open setup network, must not replace a network
+// that works once the router is back.
+template <typename Idle>
+static bool joinNewNetwork(const char* ssid, const char* password, Idle idle) {
+    wifi_config_t previous;
+    const bool havePrevious = esp_wifi_get_config(WIFI_IF_STA, &previous) == ESP_OK;
+    WiFi.begin(ssid, password);
+    const uint32_t t0 = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 20000) {
+        idle();
+        delay(10);
+    }
+    if (WiFi.status() == WL_CONNECTED) return true;
+    WiFi.disconnect();   // stop the core's retries; in the portal the access point stays up
+    if (havePrevious) esp_wifi_set_config(WIFI_IF_STA, &previous);
+    return false;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Improv Wi-Fi over the serial port (protocol in ImprovSerial.h)
+
+namespace {
+class ImprovLink : public improv::Hooks {
+public:
+    // Firmware name as in the flasher's manifest, so the flasher recognises an installed copy.
+    const char* infoStrings[4] = {"Atom Echo RTSP Mic for BirdNET-Go", "", "ESP32", ""};
+    bool inPortal = false;
+
+    void write(const uint8_t* p, size_t n) override { Serial.write(p, n); }
+    bool provisioned() override { return WiFi.status() == WL_CONNECTED; }
+    void url(char* out, size_t cap) override {
+        snprintf(out, cap, "http://%s/", WiFi.localIP().toString().c_str());
+    }
+    const char* const* info() override { return infoStrings; }
+    int networks(improv::Network* out, int max) override {
+        // The flasher asks again 3 s after each answer while its form is open. A scan takes the
+        // radio off its channel for 1 to 4 s, so answer from the last one for 15 s.
+        if (lastScanAt == 0 || millis() - lastScanAt > 15000) scanNetworks();
+        int n = 0;
+        for (; n < netCount && n < max; n++) {
+            strlcpy(out[n].ssid, nets[n].ssid, sizeof(out[n].ssid));
+            out[n].rssi = nets[n].rssi;
+            out[n].secured = !nets[n].open;
+        }
+        return n;
+    }
+    bool join(const char* ssid, const char* password) override {
+        Serial.printf("[Improv] joining \"%s\"\n", ssid);
+        if (joinNewNetwork(ssid, password, []() {})) return true;
+        Serial.println("[Improv] join failed");
+        if (!inPortal) WiFi.begin();   // back to the stored network
+        return false;
+    }
+    void joined() override {
+        Serial.printf("[Improv] joined, address %s; restarting\n", WiFi.localIP().toString().c_str());
+        restartWithNote("joined a network sent over USB");
+    }
+};
+ImprovLink improvLink;
+improv::Device improvDevice(improvLink);
+}  // namespace
+
+// True if anything arrived.
+static bool improvPoll(const char* hostname, const char* firmwareVersion, bool inPortal) {
+    improvLink.infoStrings[1] = firmwareVersion;
+    improvLink.infoStrings[3] = hostname;
+    improvLink.inPortal = inPortal;
+    bool any = false;
+    while (Serial.available() > 0) {
+        improvDevice.feed((uint8_t)Serial.read());
+        any = true;
+    }
+    return any;
+}
+
+void wifiImprovPoll(const char* hostname, const char* firmwareVersion) {
+    improvPoll(hostname, firmwareVersion, false);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Setup portal pages
 
 static void appendEscaped(String& out, const char* s) {
     for (; *s; s++) {
@@ -114,7 +201,7 @@ static const char PAGE_HEAD[] =
     "button[type=submit]{margin-top:16px;width:100%;padding:12px;font:inherit;font-weight:600;color:#fff;"
     "background:#1f6feb;border:0;border-radius:6px}</style></head><body><main>";
 
-[[noreturn]] void wifiRunSetupPortal(const char* apName, const char* hostname) {
+[[noreturn]] void wifiRunSetupPortal(const char* apName, const char* hostname, const char* firmwareVersion) {
     // Without stored credentials there is nothing to retry, so the portal waits indefinitely.
     // With them (the join failed, e.g. the router was down), restart after 3 idle minutes.
     const uint32_t idleTimeoutMs = wifiHasStoredCredentials() ? 180000 : 0;
@@ -217,33 +304,20 @@ static const char PAGE_HEAD[] =
     for (;;) {
         dns.processNextRequest();
         server.handleClient();
+        if (improvPoll(hostname, firmwareVersion, true)) lastActivity = millis();   // the flasher, over USB
         if (WiFi.softAPgetStationNum() > 0) lastActivity = millis();   // someone is on the setup network
 
         // Join outside the request handler so the reply above reaches the phone first.
         if (pendingAt && millis() - pendingAt > 500) {
             pendingAt = 0;
             Serial.printf("[Setup] joining \"%s\"\n", pendSsid);
-            // WiFi.begin() stores the new network in NVS before trying it. Keep the previous one
-            // to put back if the join fails: a mistyped password, or anyone in range of this open
-            // network, must not replace a network that works once the router is back.
-            wifi_config_t previous;
-            const bool havePrevious = esp_wifi_get_config(WIFI_IF_STA, &previous) == ESP_OK;
-            WiFi.begin(pendSsid, pendPass);
-            const uint32_t t0 = millis();
-            while (WiFi.status() != WL_CONNECTED && millis() - t0 < 20000) {
-                dns.processNextRequest();
-                server.handleClient();
-                delay(10);
-            }
-            if (WiFi.status() == WL_CONNECTED) {
+            if (joinNewNetwork(pendSsid, pendPass, [&]() { dns.processNextRequest(); server.handleClient(); })) {
                 Serial.printf("[Setup] joined, address %s; restarting\n", WiFi.localIP().toString().c_str());
                 delay(500);
                 restartWithNote("joined a network from the setup portal");
             }
             Serial.println("[Setup] join failed");
             error = String("Could not join \"") + pendSsid + "\". Check the password and that it is a 2.4 GHz network.";
-            WiFi.disconnect();   // stop the core's retries; the access point stays up
-            if (havePrevious) esp_wifi_set_config(WIFI_IF_STA, &previous);
             lastActivity = millis();
         }
 
