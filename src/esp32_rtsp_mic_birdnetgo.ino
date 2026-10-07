@@ -9,6 +9,7 @@
 #include <esp_timer.h>
 #include "App.h"
 #include "AudioDsp.h"
+#include "RtspRequest.h"
 #include "WebUI.h"
 #include "WifiSetup.h"
 
@@ -40,6 +41,7 @@ struct TxFrame {
 #define SEND_STALL_LIMIT_MS 10000 // no byte accepted by the socket for this long -> drop the client
 #define SENDER_JOIN_LIMIT_MS 30000 // unconfirmed sender exit for this long -> reboot (never close under it)
 #define WIFI_PS_DROP_LIMIT 10     // dropped frames in a session that suspend WiFi power save until reboot
+#define RTSP_METHODS "OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN, GET_PARAMETER, SET_PARAMETER"
 
 static TxFrame*  framePool[MAX_QUEUE_FRAMES];
 static uint16_t  framePoolCount = 0;
@@ -1067,12 +1069,13 @@ static bool senderServiceRtsp(int fd, char* rx, int& rxlen, const int rxcap, int
                 rl = snprintf(resp, sizeof(resp), "RTSP/1.0 200 OK\r\nCSeq: %d\r\nSession: %s\r\n\r\n", cseq, streamSessionId);
                 endSession = true;
             } else if (strncmp(rx, "OPTIONS", 7) == 0) {
-                rl = snprintf(resp, sizeof(resp),
-                    "RTSP/1.0 200 OK\r\nCSeq: %d\r\nPublic: OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN, GET_PARAMETER\r\n\r\n", cseq);
-            } else if (strncmp(rx, "GET_PARAMETER", 13) == 0 || strncmp(rx, "SET_PARAMETER", 13) == 0) {
-                rl = snprintf(resp, sizeof(resp), "RTSP/1.0 200 OK\r\nCSeq: %d\r\nSession: %s\r\n\r\n", cseq, streamSessionId);  // keepalive
+                rl = snprintf(resp, sizeof(resp), "RTSP/1.0 200 OK\r\nCSeq: %d\r\nPublic: " RTSP_METHODS "\r\n\r\n", cseq);
+            } else if (strncmp(rx, "GET_PARAMETER", 13) == 0 || strncmp(rx, "SET_PARAMETER", 13) == 0 ||
+                       strncmp(rx, "PLAY", 4) == 0) {
+                // keepalive; PLAY while playing changes nothing
+                rl = snprintf(resp, sizeof(resp), "RTSP/1.0 200 OK\r\nCSeq: %d\r\nSession: %s\r\n\r\n", cseq, streamSessionId);
             } else {
-                rl = snprintf(resp, sizeof(resp), "RTSP/1.0 405 Method Not Allowed\r\nCSeq: %d\r\n\r\n", cseq);
+                rl = snprintf(resp, sizeof(resp), "RTSP/1.0 501 Not Implemented\r\nCSeq: %d\r\n\r\n", cseq);
             }
             if (!senderRespond(fd, resp, rl)) { *reason = stopStreamRequested ? "stop requested" : "client stalled"; return false; }
             lastRTSPActivity = millis();
@@ -1266,20 +1269,24 @@ void restartI2S() {
 }
 
 // ================== RTSP NEGOTIATION (loop task, only while not streaming) ==================
-void handleRTSPCommand(WiFiClient &client, String request) {
-    String cseq = "1";
-    int cseqPos = request.indexOf("CSeq: ");
-    if (cseqPos >= 0) {
-        cseq = request.substring(cseqPos + 6, request.indexOf("\r", cseqPos));
-        cseq.trim();
-    }
+
+// Value of a header in a request's header block, "" when absent (RtspRequest.h).
+static String rtspHeader(const String& req, const char* name) {
+    char v[160];
+    return rtspHeaderValue(req.c_str(), req.length(), name, v, sizeof(v)) ? String(v) : String();
+}
+
+// Replies are written with one print each: the socket has TCP_NODELAY set during negotiation, so
+// every print would be its own TCP segment.
+void handleRTSPCommand(WiFiClient &client, const String& request) {
+    String cseq = rtspHeader(request, "CSeq");
+    if (cseq.length() == 0) cseq = "0";
+    const String ok = "RTSP/1.0 200 OK\r\nCSeq: " + cseq + "\r\n";
 
     lastRTSPActivity = millis();
 
     if (request.startsWith("OPTIONS")) {
-        client.print("RTSP/1.0 200 OK\r\n");
-        client.print("CSeq: " + cseq + "\r\n");
-        client.print("Public: OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN, GET_PARAMETER\r\n\r\n");
+        client.print(ok + "Public: " RTSP_METHODS "\r\n\r\n");
 
     } else if (request.startsWith("DESCRIBE")) {
         String ip = WiFi.localIP().toString();
@@ -1291,22 +1298,15 @@ void handleRTSPCommand(WiFiClient &client, String request) {
         sdp += "m=audio 0 RTP/AVP 96\r\n";
         sdp += "a=rtpmap:96 L16/" + String(currentSampleRate) + "/1\r\n";
         sdp += "a=control:track1\r\n";
-
-        client.print("RTSP/1.0 200 OK\r\n");
-        client.print("CSeq: " + cseq + "\r\n");
-        client.print("Content-Type: application/sdp\r\n");
-        client.print("Content-Base: rtsp://" + ip + ":8554/audio/\r\n");
-        client.print("Content-Length: " + String(sdp.length()) + "\r\n\r\n");
-        client.print(sdp);
+        client.print(ok + "Content-Type: application/sdp\r\nContent-Base: rtsp://" + ip + ":8554/audio/\r\n"
+                     "Content-Length: " + String(sdp.length()) + "\r\n\r\n" + sdp);
 
     } else if (request.startsWith("SETUP")) {
         // Only TCP interleaved is offered. Answering 461 to a UDP request makes clients (VLC, some
         // ffmpeg configs) fall back to TCP immediately instead of failing their first attempt.
-        int tPos = request.indexOf("Transport:");
-        String transport = (tPos >= 0) ? request.substring(tPos, request.indexOf("\r", tPos) < 0 ? request.length() : request.indexOf("\r", tPos)) : String("");
-        if (tPos >= 0 && transport.indexOf("RTP/AVP/TCP") < 0) {
-            client.print("RTSP/1.0 461 Unsupported Transport\r\n");
-            client.print("CSeq: " + cseq + "\r\n\r\n");
+        const String transport = rtspHeader(request, "Transport");
+        if (transport.length() && transport.indexOf("RTP/AVP/TCP") < 0) {
+            client.print("RTSP/1.0 461 Unsupported Transport\r\nCSeq: " + cseq + "\r\n\r\n");
             return;
         }
         uint8_t ch = 0;
@@ -1317,12 +1317,14 @@ void handleRTSPCommand(WiFiClient &client, String request) {
         }
         rtpChannel = ch;
         rtspSessionId = String(random(100000000, 999999999));
-        client.print("RTSP/1.0 200 OK\r\n");
-        client.print("CSeq: " + cseq + "\r\n");
-        client.print("Session: " + rtspSessionId + ";timeout=60\r\n");
-        client.print("Transport: RTP/AVP/TCP;unicast;interleaved=" + String(ch) + "-" + String(ch + 1) + "\r\n\r\n");
+        client.print(ok + "Session: " + rtspSessionId + ";timeout=60\r\nTransport: RTP/AVP/TCP;unicast;interleaved=" +
+                     String(ch) + "-" + String(ch + 1) + "\r\n\r\n");
 
     } else if (request.startsWith("PLAY")) {
+        if (rtspSessionId.length() == 0) {
+            client.print("RTSP/1.0 455 Method Not Valid in This State\r\nCSeq: " + cseq + "\r\n\r\n");
+            return;
+        }
         if (senderTaskHandle != NULL || readyQ == NULL) {
             // Previous sender not joined yet, or no frame pool (allocation failed): say so instead of
             // answering 200 OK and then sending nothing until the idle timeout.
@@ -1335,11 +1337,8 @@ void handleRTSPCommand(WiFiClient &client, String request) {
         rtpSequence = (uint16_t)random(1, 65535);
         rtpTimestamp = (uint32_t)random(1, 0x7FFFFFFF);
         // Reply first (the sender is not running yet, so the loop still owns the socket).
-        // One print: the socket still has TCP_NODELAY set during negotiation.
-        String resp = "RTSP/1.0 200 OK\r\nCSeq: " + cseq + "\r\nSession: " + rtspSessionId +
-                      "\r\nRange: npt=0.000-\r\nRTP-Info: url=rtsp://" + ip + ":8554/audio/track1;seq=" +
-                      String(rtpSequence) + ";rtptime=" + String(rtpTimestamp) + "\r\n\r\n";
-        client.print(resp);
+        client.print(ok + "Session: " + rtspSessionId + "\r\nRange: npt=0.000-\r\nRTP-Info: url=rtsp://" + ip +
+                     ":8554/audio/track1;seq=" + String(rtpSequence) + ";rtptime=" + String(rtpTimestamp) + "\r\n\r\n");
         // (no client.flush(): on arduino-esp32 that discards the receive buffer)
 
         if (startStreamSession(client)) {
@@ -1353,57 +1352,59 @@ void handleRTSPCommand(WiFiClient &client, String request) {
 
     } else if (request.startsWith("TEARDOWN")) {
         // Only reached before PLAY (during a session the sender answers TEARDOWN itself)
-        client.print("RTSP/1.0 200 OK\r\n");
-        client.print("CSeq: " + cseq + "\r\n");
-        client.print("Session: " + rtspSessionId + "\r\n\r\n");
+        client.print(ok + "Session: " + rtspSessionId + "\r\n\r\n");
+        rtspSessionId = "";
         simplePrintln("RTSP TEARDOWN before PLAY");
-    } else if (request.startsWith("GET_PARAMETER")) {
-        // Many RTSP clients send GET_PARAMETER as keep-alive.
-        client.print("RTSP/1.0 200 OK\r\n");
-        client.print("CSeq: " + cseq + "\r\n\r\n");
+
+    } else if (request.startsWith("GET_PARAMETER") || request.startsWith("SET_PARAMETER")) {
+        client.print(ok + "\r\n");   // keepalive
+
+    } else {
+        client.print("RTSP/1.0 501 Not Implemented\r\nCSeq: " + cseq + "\r\n\r\n");
     }
 }
 
-// RTSP request assembly (loop task, only called when !isStreaming)
+// RTSP request assembly (loop task, only while no session runs). Answers every complete request in
+// the buffer, so a pipelined second request is not left waiting for more data, and skips request
+// bodies (Content-Length) instead of parsing them as the next request.
 void processRTSP(WiFiClient &client) {
     if (!client.connected()) return;
 
-    if (client.available()) {
-        int available = client.available();
-        int spaceLeft = sizeof(rtspParseBuffer) - rtspParseBufferPos - 1;
+    int available = client.available();
+    const int spaceLeft = sizeof(rtspParseBuffer) - 1 - rtspParseBufferPos;
+    if (available > spaceLeft) available = spaceLeft;
+    if (available > 0) {
+        const int n = client.read(rtspParseBuffer + rtspParseBufferPos, available);
+        if (n > 0) rtspParseBufferPos += n;
+    }
 
-        if (available > spaceLeft) {
-            available = spaceLeft;
-        }
-
-        if (available <= 0) {
+    while (rtspParseBufferPos > 0 && senderTaskHandle == NULL && client.connected()) {
+        char* buf = (char*)rtspParseBuffer;
+        int headerLen = 0;
+        const int used = rtspRequestLength(buf, rtspParseBufferPos, sizeof(rtspParseBuffer) - 1, &headerLen);
+        if (used == 0) return;   // wait for the rest
+        if (used < 0) {
             static unsigned long lastOverflowWarning = 0;
             if (millis() - lastOverflowWarning > 5000) {
-                simplePrintln("RTSP buffer full - resetting");
+                simplePrintln("RTSP request too large or malformed - discarded");
                 lastOverflowWarning = millis();
             }
             rtspParseBufferPos = 0;
             return;
         }
+        const char saved = buf[headerLen];
+        buf[headerLen] = '\0';
+        const String request(buf);
+        buf[headerLen] = saved;
 
-        client.read(rtspParseBuffer + rtspParseBufferPos, available);
-        rtspParseBufferPos += available;
-        rtspParseBuffer[rtspParseBufferPos] = '\0';
+        handleRTSPCommand(client, request);
 
-        char* endOfHeader = strstr((char*)rtspParseBuffer, "\r\n\r\n");
-        if (endOfHeader != nullptr) {
-            *endOfHeader = '\0';
-            String request = String((char*)rtspParseBuffer);
-
-            handleRTSPCommand(client, request);
-
-            int headerLen = (endOfHeader - (char*)rtspParseBuffer) + 4;
-            int remaining = rtspParseBufferPos - headerLen;
-            if (remaining > 0) {
-                memmove(rtspParseBuffer, rtspParseBuffer + headerLen, remaining);
-            }
-            rtspParseBufferPos = remaining;
+        if (senderTaskHandle != NULL || !client.connected()) {   // streaming now (or closed): the sender owns the socket
+            rtspParseBufferPos = 0;
+            return;
         }
+        memmove(buf, buf + used, rtspParseBufferPos - used);
+        rtspParseBufferPos -= used;
     }
 }
 
@@ -1599,6 +1600,7 @@ void loop() {
                     rtspClient = newClient;
                     rtspClient.setNoDelay(true);   // snappy negotiation; switched off for streaming
                     rtspClientIp = rtspClient.remoteIP().toString();
+                    rtspSessionId = "";   // PLAY needs a SETUP on this connection
                     rtspParseBufferPos = 0;
                     lastRTSPActivity = millis();
                     rtspConnectCount++;
