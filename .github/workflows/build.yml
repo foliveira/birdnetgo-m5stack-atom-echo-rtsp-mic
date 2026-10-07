@@ -23,6 +23,12 @@ jobs:
       - name: Web UI API keys match the firmware
         run: node test/webui/check_keys.mjs
 
+      - name: Web UI behaviour (headless Chrome against the mock device)
+        run: |
+          google-chrome --headless=new --no-sandbox --disable-gpu '--remote-allow-origins=*' --remote-debugging-port=9222 about:blank &
+          for i in $(seq 1 30); do curl -sf http://127.0.0.1:9222/json/version >/dev/null && break; sleep 1; done
+          node test/webui/ui_test.mjs
+
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
