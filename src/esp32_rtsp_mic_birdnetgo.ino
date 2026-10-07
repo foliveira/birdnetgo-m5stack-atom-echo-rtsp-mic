@@ -1216,11 +1216,21 @@ static void finishStreamSession(const char* reason) {
                   " ms, RSSI " + String(WiFi.RSSI()) + " dBm");
 }
 
+// Sums of earlier sessions' counters: the counters restart at every session, /metrics needs totals.
+static StreamTotals pastSessions = {0, 0, 0, 0, 0};
+
+StreamTotals streamTotals() {
+    return {pastSessions.sent + audioPacketsSent, pastSessions.dropped + framesDroppedQueueFull,
+            pastSessions.overruns + i2sOverruns, pastSessions.readErrors + i2sReadErrors,
+            pastSessions.stalls + sendStallCount};
+}
+
 // Loop task: hand the negotiated client to a new sender task. Called right after the PLAY reply.
 static bool startStreamSession(WiFiClient& client) {
     if (senderTaskHandle || !readyQ) return false;
     flushReadyQueue();
     strlcpy(streamSessionId, rtspSessionId.c_str(), sizeof(streamSessionId));
+    pastSessions = streamTotals();
     audioPacketsSent = 0;
     framesDroppedQueueFull = 0;
     i2sOverruns = 0;

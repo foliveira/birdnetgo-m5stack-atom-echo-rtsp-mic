@@ -63,6 +63,12 @@ extern bool overheatSensorFault;
 extern bool overheatLatched;
 extern String overheatLastReason;
 
+// Since-boot totals of the per-session counters above.
+struct StreamTotals {
+    uint32_t sent, dropped, overruns, readErrors, stalls;
+};
+StreamTotals streamTotals();
+
 const char* currentRtspClient();
 uint16_t streamQueueDepth();
 uint16_t streamQueueFrames();

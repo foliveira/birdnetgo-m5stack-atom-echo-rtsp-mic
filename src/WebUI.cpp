@@ -4,6 +4,7 @@
 #include <math.h>
 #include "App.h"
 #include "JsonOut.h"
+#include "PromOut.h"
 #include "RestartInfo.h"
 #include "WebUI.h"
 #include "webui_index.h"   // INDEX_HTML_GZ: web/index.html, gzipped by scripts/embed_webui.py
@@ -14,6 +15,7 @@
 //   POST /api/settings   any subset of the cfg keys; all are validated before any is applied
 //   POST /api/action     name=restart_audio|server_on|server_off|clear_thermal|reboot|defaults
 //   GET  /api/logs?since=N  log lines after line N as text; X-Log-Seq holds the newest line number
+//   GET  /metrics        Prometheus text format; counters are totals since boot
 
 static WebServer web(80);
 
@@ -140,6 +142,58 @@ static void sendState() {
 
     j.close();
     sendJson(200, j);
+}
+
+// Prometheus scrape. The buffer is taken from the heap per request (scrapes are seconds apart)
+// rather than held permanently, where it would shorten the frame pool.
+static void httpMetrics() {
+    const size_t cap = 4096;
+    char* buf = (char*)malloc(cap);
+    if (!buf) {
+        web.send(503, "text/plain", "out of memory");
+        return;
+    }
+    PromOut p(buf, cap);
+    const char* const info[] = {"version", FW_VERSION_STR, "name", deviceName, nullptr};
+    const StreamTotals t = streamTotals();
+    const uint16_t peak = lastPeakAbs16, hold = peakHoldAbs16;
+    p.info("rtspmic_info", "Firmware version and device name.", info);
+    p.gauge("rtspmic_uptime_seconds", "Seconds since boot.", uptimeSeconds());
+    p.gauge("rtspmic_wifi_rssi_dbm", "Signal strength of the access point.", WiFi.RSSI());
+    p.gauge("rtspmic_wifi_channel", "WiFi channel.", WiFi.channel());
+    p.counter("rtspmic_wifi_disconnects_total", "WiFi link losses.", wifiDrops);
+    p.gauge("rtspmic_heap_free_bytes", "Free heap.", ESP.getFreeHeap());
+    p.gauge("rtspmic_heap_min_free_bytes", "Lowest free heap since boot.", ESP.getMinFreeHeap());
+    if (lastTemperatureValid) p.gauge("rtspmic_temperature_celsius", "Chip sensor, uncalibrated.", lastTemperatureC, 1);
+    p.gauge("rtspmic_thermal_latched", "1 while thermal protection holds the server off.", overheatLatched);
+    p.gauge("rtspmic_rtsp_server_enabled", "1 while the RTSP server accepts clients.", rtspServerEnabled);
+    p.gauge("rtspmic_streaming", "1 while a client receives audio.", isStreaming);
+    p.counter("rtspmic_rtsp_connections_total", "RTSP connections accepted.", rtspConnectCount);
+    p.counter("rtspmic_rtsp_sessions_total", "RTSP sessions started (PLAY).", rtspPlayCount);
+    p.gauge("rtspmic_sample_rate_hertz", "Audio sample rate.", appliedSampleRate);
+    p.counter("rtspmic_frames_sent_total", "RTP frames sent.", t.sent);
+    p.counter("rtspmic_frames_dropped_total", "RTP frames dropped because the network fell behind.", t.dropped);
+    p.counter("rtspmic_i2s_overruns_total", "DMA buffers lost because capture fell behind.", t.overruns);
+    p.counter("rtspmic_i2s_read_errors_total", "Failed or short I2S reads.", t.readErrors);
+    p.counter("rtspmic_send_stalls_total", "Times the socket accepted no data.", t.stalls);
+    p.gauge("rtspmic_send_stall_max_seconds", "Longest send stall in the current session.", sendStallMaxMs / 1000.0, 3);
+    p.gauge("rtspmic_send_queue_frames", "Frames waiting to be sent.", streamQueueDepth());
+    p.gauge("rtspmic_send_queue_capacity_frames", "Frames the send queue holds.", streamQueueFrames());
+    p.gauge("rtspmic_audio_peak_ratio", "Loudest peak of the last 3 s after gain, 1 = full scale.",
+            (hold > peak ? hold : peak) / 32767.0, 3);
+    p.counter("rtspmic_audio_clipped_blocks_total", "Audio blocks that clipped.", audioClipCount);
+    p.gauge("rtspmic_agc_multiplier", "Automatic gain control factor (1 when off).", agcMultiplier, 2);
+    p.gauge("rtspmic_microphone_flat", "1 while the microphone delivers constant samples.", micFlat);
+
+    if (p.overflow()) {
+        web.send(500, "text/plain", "metrics buffer too small");
+    } else {
+        web.sendHeader("Cache-Control", "no-store");
+        web.setContentLength(p.length());
+        web.send(200, "text/plain; version=0.0.4; charset=utf-8", "");
+        web.sendContent(p.c_str(), p.length());
+    }
+    free(buf);
 }
 
 // Browsers attach Origin to cross-site POSTs. Refusing those keeps other web pages open in the
@@ -367,6 +421,7 @@ void webui_begin() {
     web.on("/api/settings", HTTP_POST, httpSettings);
     web.on("/api/action", HTTP_POST, httpAction);
     web.on("/api/logs", HTTP_GET, httpLogs);
+    web.on("/metrics", HTTP_GET, httpMetrics);
     web.onNotFound([]() { web.send(404, "text/plain", "Not found"); });
     web.begin();
 }
