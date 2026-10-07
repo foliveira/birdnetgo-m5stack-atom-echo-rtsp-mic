@@ -42,7 +42,6 @@ extern uint32_t minAcceptableRate;
 extern uint32_t performanceCheckInterval;
 extern bool autoRecoveryEnabled;
 extern uint8_t cpuFrequencyMhz;
-extern wifi_power_t currentWifiPowerLevel;
 extern void resetToDefaultSettings();
 extern bool autoThresholdEnabled;
 extern uint32_t computeRecommendedMinRate();
@@ -96,7 +95,6 @@ static void rebootTask(void* arg){
 }
 
 // Helper functions in main
-extern float wifiPowerLevelToDbm(wifi_power_t lvl);
 extern String formatUptime(unsigned long seconds);
 extern String formatSince(unsigned long eventMs);
 extern void restartI2S();
@@ -321,7 +319,7 @@ static void httpStatus() {
     json += "\"fw_version\":\"" + String(FW_VERSION_STR) + "\",";
     json += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
     json += "\"wifi_rssi\":" + String(WiFi.RSSI()) + ",";
-    json += "\"wifi_tx_dbm\":" + String(wifiPowerLevelToDbm(currentWifiPowerLevel),1) + ",";
+    json += "\"wifi_tx_dbm\":" + String(WiFi.getTxPower() * 0.25f,1) + ",";
     json += "\"free_heap_kb\":" + String(ESP.getFreeHeap()/1024) + ",";
     json += "\"min_free_heap_kb\":" + String(minFreeHeap/1024) + ",";
     json += "\"uptime\":\"" + uptimeStr + "\",";

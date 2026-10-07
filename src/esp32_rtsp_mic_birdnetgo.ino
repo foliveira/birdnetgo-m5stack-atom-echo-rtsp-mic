@@ -1,5 +1,4 @@
 #include <WiFi.h>
-#include <WiFiManager.h>
 #include <ESPmDNS.h>
 #include "driver/i2s.h"
 #include <Preferences.h>
@@ -8,6 +7,7 @@
 #include <lwip/sockets.h>
 #include <esp_heap_caps.h>
 #include "WebUI.h"
+#include "WifiSetup.h"
 
 // ================== PIPELINE ARCHITECTURE ==================
 // Capture task (core 1, high priority):  I2S DMA -> HPF/gain/AGC -> complete RTP frame -> readyQ
@@ -101,6 +101,11 @@ const char* FW_VERSION_STR = FW_VERSION;
 #define I2S_DATA_IN_PIN 23  // Microphone Data In
 #define I2S_DATA_OUT_PIN 22 // Speaker Data Out (not used for mic-only)
 #define LED_PIN         27  // SK6812 RGB LED
+
+// -- Network identity
+#define DEVICE_HOSTNAME "atomecho"            // DHCP and mDNS name (atomecho.local)
+#define SETUP_AP_NAME "ESP32-RTSP-Mic-AP"     // open access point of the WiFi setup portal
+#define WIFI_JOIN_TIMEOUT_MS 60000            // stored network not joined within this -> setup portal
 
 // -- Servers
 WiFiServer rtspServer(8554);
@@ -210,9 +215,13 @@ uint8_t cpuFrequencyMhz = DEFAULT_CPU_MHZ;
 
 // -- WiFi TX power / power save (configurable)
 float wifiTxPowerDbm = DEFAULT_WIFI_TX_DBM;
-wifi_power_t currentWifiPowerLevel = WIFI_POWER_19_5dBm;
 bool wifiPowerSave = DEFAULT_WIFI_POWER_SAVE;  // WIFI_PS_MIN_MODEM when true
 bool wifiPsSuspended = false;                  // power save turned off for this boot because the stream dropped frames
+
+// -- WiFi link state: written by the WiFi event task, acted on (and logged) by loop()
+volatile bool wifiLinkUp = false;
+volatile uint8_t wifiDropReason = 0;
+uint32_t wifiDrops = 0;                        // link losses since boot
 
 // -- RTSP connect/PLAY statistics
 unsigned long lastRtspClientConnectMs = 0;
@@ -222,52 +231,28 @@ uint32_t rtspPlayCount = 0;
 
 // ===============================================
 
-// Helper: convert WiFi power enum to dBm (for logs)
-float wifiPowerLevelToDbm(wifi_power_t lvl) {
-    switch (lvl) {
-        case WIFI_POWER_19_5dBm:    return 19.5f;
-        case WIFI_POWER_19dBm:      return 19.0f;
-        case WIFI_POWER_18_5dBm:    return 18.5f;
-        case WIFI_POWER_17dBm:      return 17.0f;
-        case WIFI_POWER_15dBm:      return 15.0f;
-        case WIFI_POWER_13dBm:      return 13.0f;
-        case WIFI_POWER_11dBm:      return 11.0f;
-        case WIFI_POWER_8_5dBm:     return 8.5f;
-        case WIFI_POWER_7dBm:       return 7.0f;
-        case WIFI_POWER_5dBm:       return 5.0f;
-        case WIFI_POWER_2dBm:       return 2.0f;
-        case WIFI_POWER_MINUS_1dBm: return -1.0f;
-        default:                    return 19.5f;
+// Transmit power steps the radio supports. wifi_power_t values are in 0.25 dBm units.
+static const wifi_power_t WIFI_TX_STEPS[] = {
+    WIFI_POWER_MINUS_1dBm, WIFI_POWER_2dBm, WIFI_POWER_5dBm, WIFI_POWER_7dBm, WIFI_POWER_8_5dBm,
+    WIFI_POWER_11dBm, WIFI_POWER_13dBm, WIFI_POWER_15dBm, WIFI_POWER_17dBm, WIFI_POWER_18_5dBm,
+    WIFI_POWER_19dBm, WIFI_POWER_19_5dBm};
+
+// Nearest supported transmit power step, in dBm.
+float snapWifiTxDbm(float dbm) {
+    float best = WIFI_TX_STEPS[0] * 0.25f;
+    for (wifi_power_t s : WIFI_TX_STEPS) {
+        if (fabsf(s * 0.25f - dbm) < fabsf(best - dbm)) best = s * 0.25f;
     }
+    return best;
 }
 
-// Helper: pick the highest power level not exceeding requested dBm
-static wifi_power_t pickWifiPowerLevel(float dbm) {
-    if (dbm <= -1.0f) return WIFI_POWER_MINUS_1dBm;
-    if (dbm <= 2.0f)  return WIFI_POWER_2dBm;
-    if (dbm <= 5.0f)  return WIFI_POWER_5dBm;
-    if (dbm <= 7.0f)  return WIFI_POWER_7dBm;
-    if (dbm <= 8.5f)  return WIFI_POWER_8_5dBm;
-    if (dbm <= 11.0f) return WIFI_POWER_11dBm;
-    if (dbm <= 13.0f) return WIFI_POWER_13dBm;
-    if (dbm <= 15.0f) return WIFI_POWER_15dBm;
-    if (dbm <= 17.0f) return WIFI_POWER_17dBm;
-    if (dbm <= 18.5f) return WIFI_POWER_18_5dBm;
-    if (dbm <= 19.0f) return WIFI_POWER_19dBm;
-    return WIFI_POWER_19_5dBm;
-}
-
-// Apply WiFi TX power
-// Logs only when changed; can be muted with log=false
+// Apply the configured transmit power unless the driver already uses it (it falls back to its
+// default whenever the station interface restarts). Logs only if log is set and it changed.
 void applyWifiTxPower(bool log = true) {
-    wifi_power_t desired = pickWifiPowerLevel(wifiTxPowerDbm);
-    if (desired != currentWifiPowerLevel) {
-        WiFi.setTxPower(desired);
-        currentWifiPowerLevel = desired;
-        if (log) {
-            simplePrintln("WiFi TX power set to " + String(wifiPowerLevelToDbm(currentWifiPowerLevel), 1) + " dBm");
-        }
-    }
+    const wifi_power_t desired = (wifi_power_t)lroundf(snapWifiTxDbm(wifiTxPowerDbm) * 4.0f);
+    if (WiFi.getTxPower() == desired) return;
+    WiFi.setTxPower(desired);
+    if (log) simplePrintln("WiFi TX power set to " + String(desired * 0.25f, 1) + " dBm");
 }
 
 // Apply WiFi modem power save. MIN_MODEM lets the radio sleep between DTIM beacons, which is the
@@ -483,21 +468,47 @@ void checkPerformance() {
     }
 }
 
-// WiFi health check
-void checkWiFiHealth() {
-    if (WiFi.status() != WL_CONNECTED) {
-        // Stop streaming before reconnecting — no point sending RTP into a dead radio
-        requestStreamStop("WiFi disconnect");
-        simplePrintln("WiFi disconnected! Reconnecting...");
+static void onWifiEvent(arduino_event_id_t event, arduino_event_info_t info) {
+    if (event == ARDUINO_EVENT_WIFI_STA_GOT_IP) {
+        wifiLinkUp = true;
+    } else if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
+        wifiDropReason = info.wifi_sta_disconnected.reason;
+        wifiLinkUp = false;
+    }
+}
+
+// WiFi link supervision, once a second from loop(). The core reconnects by itself for most
+// disconnect reasons; this logs the transitions and nudges it if the link stays down. A running
+// RTSP session is left alone: when the link returns with the same address its TCP connection
+// survives, and the sender ends the session itself after SEND_STALL_LIMIT_MS without progress.
+static void checkWiFi() {
+    static bool wasUp = true;
+    static unsigned long downSince = 0, lastKick = 0, lastWeakWarn = 0;
+    const unsigned long now = millis();
+    const bool up = wifiLinkUp;
+    if (up != wasUp) {
+        wasUp = up;
+        if (!up) {
+            downSince = lastKick = now;
+            wifiDrops++;
+            simplePrintln(String("WiFi lost (") + WiFi.disconnectReasonName((wifi_err_reason_t)wifiDropReason) +
+                          "), reconnecting");
+        } else {
+            simplePrintln("WiFi back after " + String((now - downSince) / 1000) + " s: " +
+                          WiFi.localIP().toString() + ", RSSI " + String(WiFi.RSSI()) + " dBm");
+            applyWifiTxPower(false);
+        }
+    }
+    if (!up && now - lastKick >= 15000) {
+        lastKick = now;
         WiFi.reconnect();
     }
-
-    // Re-apply TX power WITHOUT logging (prevent periodic log spam)
-    applyWifiTxPower(false);
-
-    int32_t rssi = WiFi.RSSI();
-    if (rssi < -85) {
-        simplePrintln("WARNING: Weak WiFi signal: " + String(rssi) + " dBm");
+    if (up && now - lastWeakWarn >= 600000) {
+        const int32_t rssi = WiFi.RSSI();
+        if (rssi < -80) {
+            lastWeakWarn = now;
+            simplePrintln("WARNING: weak WiFi signal (" + String(rssi) + " dBm); expect retransmissions and stalls");
+        }
     }
 }
 
@@ -562,7 +573,7 @@ void loadAudioSettings() {
         rtspServerEnabled = false;
     }
     // Log the configured TX dBm (not the current enum), snapped for clarity
-    float txShown = wifiPowerLevelToDbm(pickWifiPowerLevel(wifiTxPowerDbm));
+    float txShown = snapWifiTxDbm(wifiTxPowerDbm);
     simplePrintln("Loaded settings: Rate=" + String(currentSampleRate) +
                   ", Gain=" + String(currentGainFactor, 1) +
                   ", Buffer=" + String(currentBufferSize) +
@@ -670,22 +681,21 @@ void resetToDefaultSettings() {
 
 // Minimal print helpers: Serial + buffered for Web UI
 // Timestamp prefix for log messages (NTP time if available, uptime fallback)
+// "[14:03:12Z] " in UTC once SNTP has synced, "[+00:00:12] " (time since boot) before that.
 static String logTimestamp() {
+    char buf[24];
     time_t now;
     time(&now);
-    if (now > 100000) {
+    if (now > 1600000000) {
         struct tm ti;
-        localtime_r(&now, &ti);
-        char buf[24];
-        strftime(buf, sizeof(buf), "[%H:%M:%S] ", &ti);
+        gmtime_r(&now, &ti);
+        strftime(buf, sizeof(buf), "[%H:%M:%SZ] ", &ti);
         return String(buf);
     }
-    // Fallback: uptime
     unsigned long s = (millis() - bootTime) / 1000;
     unsigned long h = s / 3600; s %= 3600;
     unsigned long m = s / 60; s %= 60;
-    char buf[16];
-    snprintf(buf, sizeof(buf), "[%02lu:%02lu:%02lu] ", h, m, s);
+    snprintf(buf, sizeof(buf), "[+%02lu:%02lu:%02lu] ", h, m, s);
     return String(buf);
 }
 
@@ -861,6 +871,7 @@ static inline uint32_t rgb(uint8_t r, uint8_t g, uint8_t b) {
     return ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
 }
 #define LED_STARTUP rgb(10, 10, 0)    // yellow
+#define LED_SETUP   rgb(0, 10, 10)    // cyan: WiFi setup portal
 
 static void ledShow(uint32_t c) {
     neopixelWrite(LED_PIN, (uint8_t)(c >> 16), (uint8_t)(c >> 8), (uint8_t)c);   // core RMT driver
@@ -1563,45 +1574,29 @@ void setup() {
 
     // WiFi: power save is applied from settings after the connection is up
     Serial.println("Initializing WiFi...");
+    WiFi.onEvent(onWifiEvent);
     WiFi.setSleep(false);
-
-    WiFiManager wm;
-    wm.setConnectTimeout(60);
-    wm.setConfigPortalTimeout(180);
-    if (!wm.autoConnect("ESP32-RTSP-Mic-AP")) {
-        simplePrintln("WiFi failed, restarting...");
-        ESP.restart();
+    if (!wifiJoinStored(DEVICE_HOSTNAME, WIFI_JOIN_TIMEOUT_MS)) {
+        ledShow(LED_SETUP);
+        simplePrintln(wifiHasStoredCredentials() ? "WiFi: stored network not reachable, starting setup portal"
+                                                 : "WiFi: no network configured, starting setup portal");
+        wifiRunSetupPortal(SETUP_AP_NAME, DEVICE_HOSTNAME);   // restarts the device
     }
+    simplePrintln("WiFi connected: " + WiFi.localIP().toString() + " on " + WiFi.SSID() +
+                  ", RSSI " + String(WiFi.RSSI()) + " dBm, channel " + String(WiFi.channel()));
 
-    simplePrintln("WiFi connected: " + WiFi.localIP().toString());
-
-    // NTP time sync (EST = UTC-5, no DST)
-    configTime(-5 * 3600, 0, "pool.ntp.org");
-    Serial.print("Waiting for NTP time sync...");
-    time_t now = 0;
-    for (int i = 0; i < 20 && now < 100000; i++) {
-        delay(250);
-        time(&now);
-    }
-    if (now > 100000) {
-        struct tm ti;
-        localtime_r(&now, &ti);
-        char buf[32];
-        strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &ti);
-        Serial.printf(" OK: %s EST\n", buf);
-    } else {
-        Serial.println(" failed (will use uptime)");
-    }
+    // Log timestamps in UTC once SNTP has synced (in the background); uptime until then.
+    configTime(0, 0, "pool.ntp.org");
 
     // Apply configured WiFi TX power / power save after connect
     applyWifiTxPower(true);
     applyWifiPowerSave(true);
 
     // mDNS: allows rtsp://atomecho.local:8554/audio
-    if (MDNS.begin("atomecho")) {
+    if (MDNS.begin(DEVICE_HOSTNAME)) {
         MDNS.addService("rtsp", "tcp", 8554);
         MDNS.addService("http", "tcp", 80);
-        simplePrintln("mDNS: atomecho.local");
+        simplePrintln("mDNS: " DEVICE_HOSTNAME ".local");
     }
 
     // CPU clock before the audio pipeline starts (WiFi needs >= 80 MHz)
@@ -1687,9 +1682,9 @@ void loop() {
         lastPerformanceCheck = millis();
     }
 
-    if (millis() - lastWiFiCheck > 30000) { // 30 s
-        checkWiFiHealth(); // without TX power log spam
+    if (millis() - lastWiFiCheck >= 1000) {
         lastWiFiCheck = millis();
+        checkWiFi();
     }
 
     checkScheduledReset();
