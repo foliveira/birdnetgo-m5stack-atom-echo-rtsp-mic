@@ -29,16 +29,17 @@ struct TxFrame {
 #define FRAME_HDR_BYTES   16
 #define I2S_DMA_BUF_COUNT 8
 #define I2S_DMA_BUF_LEN   512    // frames per DMA buffer; one buffer is lost per RX_Q_OVF event
-#define TARGET_QUEUE_MS   1500   // software buffer in front of the socket
+#define TARGET_QUEUE_MS   3000   // software buffer in front of the socket; one lwIP retransmission timeout is >= 1.5 s
 #define MIN_QUEUE_FRAMES  4
-#define MAX_QUEUE_FRAMES  64
-#define MAX_POOL_BYTES    (64 * 1024)  // cap on the frame pool regardless of rate/buffer choice
-#define HEAP_HEADROOM_BYTES (80 * 1024) // leave this much of the largest free block to WiFi/lwIP/HTTP
+#define MAX_QUEUE_FRAMES  256
+#define MAX_POOL_BYTES    (128 * 1024) // cap on the frame pool regardless of rate/buffer choice
+#define HEAP_HEADROOM_BYTES (80 * 1024) // free heap left to WiFi/lwIP/HTTP once the pool is allocated
+#define CAPTURE_STALL_MS  3000   // no complete I2S block for this long -> reinstall the driver
 #define SEND_STALL_LIMIT_MS 10000 // no byte accepted by the socket for this long -> drop the client
 #define SENDER_JOIN_LIMIT_MS 30000 // unconfirmed sender exit for this long -> reboot (never close under it)
 #define WIFI_PS_DROP_LIMIT 10     // dropped frames in a session that suspend WiFi power save until reboot
 
-static uint8_t*  framePoolMem = NULL;
+static TxFrame*  framePool[MAX_QUEUE_FRAMES];
 static uint16_t  framePoolCount = 0;
 static uint32_t  frameSlotBytes = 0;
 volatile uint16_t pipelineSamples = 0;   // samples per packet the pool is sized for; changes only while capture is parked
@@ -677,63 +678,58 @@ void simplePrintln(String message) {
 static void freeFramePool() {
     if (freeQ)  { vQueueDelete(freeQ);  freeQ = NULL; }
     if (readyQ) { vQueueDelete(readyQ); readyQ = NULL; }
-    if (framePoolMem) { free(framePoolMem); framePoolMem = NULL; }
+    for (uint16_t i = 0; i < framePoolCount; i++) {
+        free(framePool[i]);
+        framePool[i] = NULL;
+    }
     framePoolCount = 0;
     frameSlotBytes = 0;
 }
 
-// Allocate frames for TARGET_QUEUE_MS of audio at the current rate/buffer size.
+// Allocate frames for TARGET_QUEUE_MS of audio at the current rate/buffer size, one heap block
+// per frame. The heap is split over several memory regions, so its largest block is much smaller
+// than the total free and a single allocation would cap the queue far below what fits. Stops
+// early to leave HEAP_HEADROOM_BYTES free.
 // Only call while the capture task is parked (or not yet started) and no sender is running.
 static bool allocFramePool() {
     freeFramePool();
     pipelineSamples = currentBufferSize;   // the capture task reads this, never currentBufferSize directly
                                            // (set even if the pool fails so metering keeps running)
-    uint32_t frameMs = (uint32_t)currentBufferSize * 1000UL / currentSampleRate;
-    if (frameMs == 0) frameMs = 1;
-    uint32_t want = (TARGET_QUEUE_MS + frameMs - 1) / frameMs;
-    if (want < MIN_QUEUE_FRAMES) want = MIN_QUEUE_FRAMES;
+    const uint32_t perFrame = (uint32_t)currentBufferSize * 1000UL;   // frames = ms * rate / perFrame
+    uint32_t want = (TARGET_QUEUE_MS * currentSampleRate + perFrame - 1) / perFrame;
     if (want > MAX_QUEUE_FRAMES) want = MAX_QUEUE_FRAMES;
-    frameSlotBytes = (sizeof(TxFrame) + FRAME_HDR_BYTES + (uint32_t)currentBufferSize * 2 + 3) & ~3UL;
-
-    // Byte budget: never more than MAX_POOL_BYTES, and always leave HEAP_HEADROOM_BYTES of the
-    // largest free block for WiFi/lwIP/HTTP. (At 48 kHz the time-based count alone would ask
-    // for ~130 KB.)
-    uint32_t byTarget = want;
+    frameSlotBytes = sizeof(TxFrame) + FRAME_HDR_BYTES + (uint32_t)currentBufferSize * 2;
     if (want > MAX_POOL_BYTES / frameSlotBytes) want = MAX_POOL_BYTES / frameSlotBytes;
-    size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
-    uint32_t byHeap = (largest > HEAP_HEADROOM_BYTES) ? (uint32_t)((largest - HEAP_HEADROOM_BYTES) / frameSlotBytes) : 0;
-    if (want > byHeap) want = byHeap;
-    if (want < MIN_QUEUE_FRAMES) want = MIN_QUEUE_FRAMES;
 
-    while (want >= MIN_QUEUE_FRAMES) {
-        framePoolMem = (uint8_t*)malloc(frameSlotBytes * want);
-        if (framePoolMem) break;
-        want /= 2;
-    }
-    if (!framePoolMem) {
-        simplePrintln("FATAL: cannot allocate audio frame pool");
-        return false;
-    }
-    freeQ = xQueueCreate(want, sizeof(TxFrame*));
-    readyQ = xQueueCreate(want, sizeof(TxFrame*));
-    if (!freeQ || !readyQ) {
-        freeFramePool();
-        simplePrintln("FATAL: cannot allocate frame queues");
-        return false;
-    }
-    for (uint32_t i = 0; i < want; i++) {
-        TxFrame* f = (TxFrame*)(framePoolMem + i * frameSlotBytes);
+    const uint32_t caps = MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL;
+    const size_t heapBefore = heap_caps_get_free_size(caps);
+    uint16_t n = 0;
+    while (n < want && heap_caps_get_free_size(caps) >= HEAP_HEADROOM_BYTES + frameSlotBytes) {
+        TxFrame* f = (TxFrame*)heap_caps_malloc(frameSlotBytes, caps);
+        if (!f) break;
         f->len = 0;
         f->seq = 0;
-        xQueueSend(freeQ, &f, 0);
+        framePool[n++] = f;
     }
-    framePoolCount = (uint16_t)want;
+    framePoolCount = n;
+    if (n >= MIN_QUEUE_FRAMES) {
+        freeQ = xQueueCreate(n, sizeof(TxFrame*));
+        readyQ = xQueueCreate(n, sizeof(TxFrame*));
+    }
+    if (!freeQ || !readyQ) {
+        freeFramePool();
+        simplePrintln("FATAL: cannot allocate the audio frame pool (free heap " + String(heapBefore / 1024) + " KB)");
+        return false;
+    }
+    for (uint16_t i = 0; i < n; i++) xQueueSend(freeQ, &framePool[i], 0);
     appliedBufferSize = currentBufferSize;
-    simplePrintln("Frame pool: " + String(want) + " x " + String(frameSlotBytes) + " B (" +
-                  String(want * frameMs) + " ms of audio), largest free block was " + String(largest / 1024) + " KB");
-    if (want < byTarget) {
-        simplePrintln("NOTE: pool shorter than " + String(TARGET_QUEUE_MS) +
-                      " ms target (memory); shorter WiFi stalls will drop frames. Lower the sample rate or buffer size.");
+    const uint32_t poolMs = (uint32_t)((uint64_t)n * perFrame / currentSampleRate);
+    simplePrintln("Frame pool: " + String(n) + " x " + String(frameSlotBytes) + " B (" + String(poolMs) +
+                  " ms of audio), free heap " + String(heapBefore / 1024) + " -> " +
+                  String(heap_caps_get_free_size(caps) / 1024) + " KB");
+    if (poolMs < TARGET_QUEUE_MS) {
+        simplePrintln("NOTE: frame pool below the " + String(TARGET_QUEUE_MS) + " ms target (memory); WiFi stalls over " +
+                      String(poolMs) + " ms drop audio. A lower sample rate lengthens it.");
     }
     return true;
 }
@@ -1650,6 +1646,16 @@ void loop() {
     }
 
     checkScheduledReset();
+
+    // Capture watchdog. i2s_read gives up after 1 s, so CAPTURE_STALL_MS without one complete block
+    // means the driver stopped delivering; reinstalling it ends any session (the client reconnects).
+    if (captureTaskHandle && !capturePauseRequested && appliedSampleRate != 0 &&
+        millis() - lastCaptureOkMs > CAPTURE_STALL_MS && millis() - lastI2SReset > 30000) {
+        lastI2SReset = millis();
+        simplePrintln("Capture stalled: no I2S data for " + String((millis() - lastCaptureOkMs) / 1000) +
+                      " s (read errors " + String(i2sReadErrors) + "); restarting audio");
+        restartI2S();
+    }
 
     // WiFi power save can starve the TCP send window (5760 B per beacon-period RTT). If a session
     // drops frames while it is on, switch it off until reboot rather than keep dropping audio.
