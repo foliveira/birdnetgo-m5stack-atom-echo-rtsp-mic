@@ -4,6 +4,7 @@
 #include <math.h>
 #include "App.h"
 #include "JsonOut.h"
+#include "RestartInfo.h"
 #include "WebUI.h"
 #include "webui_index.h"   // INDEX_HTML_GZ: web/index.html, gzipped by scripts/embed_webui.py
 
@@ -107,9 +108,17 @@ static void sendState() {
     const uint32_t rate = appliedSampleRate ? appliedSampleRate : currentSampleRate;
     const uint16_t peak = lastPeakAbs16, hold = peakHoldAbs16;
     j.open("live");
-    j.u("uptime", uptimeSeconds());
+    j.u("uptime", uptimeSeconds()).s("restart_reason", restartReason());
     j.s("ip", WiFi.localIP().toString().c_str()).s("ssid", WiFi.SSID().c_str()).i("rssi", WiFi.RSSI());
-    j.u("wifi_drops", wifiDrops).b("ps_suspended", wifiPsSuspended);
+    j.s("bssid", WiFi.BSSIDstr().c_str()).u("channel", WiFi.channel());
+    j.u("wifi_drops", wifiDrops);
+    if (wifiDrops) {
+        j.s("wifi_last_drop", WiFi.disconnectReasonName((wifi_err_reason_t)wifiLastDropReason));
+        j.u("wifi_last_drop_s", uptimeSeconds() - wifiLastDropAt);
+    } else {
+        j.null("wifi_last_drop").null("wifi_last_drop_s");
+    }
+    j.b("ps_suspended", wifiPsSuspended);
     j.u("heap_kb", ESP.getFreeHeap() / 1024).u("heap_min_kb", ESP.getMinFreeHeap() / 1024);
     j.u("cpu_mhz", getCpuFrequencyMhz());
     j.f("temp_c", lastTemperatureValid ? lastTemperatureC : NAN, 1);
@@ -123,7 +132,7 @@ static void sendState() {
     j.u("queue", streamQueueDepth()).u("queue_peak", queueHighWater).u("queue_cap", streamQueueFrames());
     j.u("stall_max_ms", sendStallMaxMs).u("stalls", sendStallCount);
     j.f("peak_pct", pct(peak), 1).f("hold_pct", pct(hold > peak ? hold : peak), 1);
-    j.u("clips", audioClipCount).f("agc_x", agcMultiplier, 2);
+    j.u("clips", audioClipCount).f("agc_x", agcMultiplier, 2).b("mic_flat", micFlat);
     j.b("oh_latched", overheatLatched).b("oh_sensor_fault", overheatSensorFault);
     j.s("oh_note", overheatLastReason.c_str());
     j.u("log_seq", logSeq);
@@ -323,10 +332,10 @@ static void httpAction() {
         clearThermalLatch();
     } else if (name == "reboot") {
         simplePrintln("Web UI: reboot");
-        scheduleReboot(false, 500);
+        scheduleReboot(false, 500, "Web UI reboot");
     } else if (name == "defaults") {
         simplePrintln("Web UI: restore defaults and reboot");
-        scheduleReboot(true, 500);
+        scheduleReboot(true, 500, "defaults restored from the Web UI");
     } else {
         sendError(400, "unknown action");
         return;

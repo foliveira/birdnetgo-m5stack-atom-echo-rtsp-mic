@@ -68,6 +68,7 @@ pre{margin:10px 0 0;max-height:50vh;overflow:auto;white-space:pre-wrap;word-brea
   <h2>Signal level</h2>
   <div class="meter"><div id="meter"></div></div>
   <div class="lvl"><span id="lvlText">–</span><span id="clipText"></span><span id="agcText"></span></div>
+  <div class="bad" id="micFlat" hidden>No signal from the microphone: its samples have not changed for 10 s. A working microphone always shows some noise, so this points to a hardware fault.</div>
   <small>Loudest peak in the last 3 s, measured after gain. Aim for 30–70 %; clipping distorts calls.</small>
 </section>
 
@@ -86,7 +87,10 @@ pre{margin:10px 0 0;max-height:50vh;overflow:auto;white-space:pre-wrap;word-brea
 
 <section class="card"><h2>Device</h2><dl>
   <dt>Uptime</dt><dd id="uptime">–</dd>
+  <dt>Last restart</dt><dd id="restart">–</dd>
   <dt>WiFi</dt><dd id="wifi">–</dd>
+  <dt>Access point</dt><dd id="ap">–</dd>
+  <dt>WiFi drops</dt><dd id="drops">–</dd>
   <dt>IP address</dt><dd id="ip">–</dd>
   <dt>Power save</dt><dd id="psState">–</dd>
   <dt>Free memory</dt><dd id="heap">–</dd>
@@ -233,6 +237,7 @@ function render(s) {
   set('lvlText', pct > 0 ? pct.toFixed(0) + ' %  (' + (20 * Math.log10(pct / 100)).toFixed(1) + ' dBFS)' : 'silent');
   set('clipText', clipping ? 'Clipping: lower the gain' : 'Clipped blocks: ' + num(L.clips), clipping ? 'bad' : 'muted');
   set('agcText', C.agc ? 'AGC ×' + L.agc_x.toFixed(2) + ' (total ×' + (C.gain * L.agc_x).toFixed(1) + ')' : '', 'muted');
+  $('micFlat').hidden = !L.mic_flat;
 
   set('client', L.client || (L.server ? 'none' : 'server stopped'));
   set('session', L.streaming ? dur(L.session_s) : L.end_reason ? 'ended: ' + L.end_reason : '–');
@@ -246,8 +251,11 @@ function render(s) {
   set('conns', L.connects + ' connections, ' + L.plays + ' streams since boot');
 
   set('uptime', dur(L.uptime));
+  set('restart', L.restart_reason, /crash|watchdog|brownout|recovery/.test(L.restart_reason) ? 'warn' : '');
   const q = L.rssi >= -60 ? ['excellent', 'ok'] : L.rssi >= -70 ? ['good', 'ok'] : L.rssi >= -80 ? ['fair', 'warn'] : ['weak', 'bad'];
-  set('wifi', L.ssid + ', ' + L.rssi + ' dBm (' + q[0] + ')' + (L.wifi_drops ? ', ' + L.wifi_drops + (L.wifi_drops === 1 ? ' drop' : ' drops') + ' since boot' : ''), q[1]);
+  set('wifi', L.ssid + ', ' + L.rssi + ' dBm (' + q[0] + ')', q[1]);
+  set('ap', L.bssid + ', channel ' + L.channel);
+  set('drops', L.wifi_drops ? num(L.wifi_drops) + ' since boot, last ' + dur(L.wifi_last_drop_s) + ' ago (' + L.wifi_last_drop + ')' : 'none since boot');
   set('ip', L.ip);
   set('psState', C.ps ? (L.ps_suspended ? 'suspended until reboot (frames dropped)' : 'on') : 'off', L.ps_suspended ? 'warn' : '');
   set('heap', L.heap_kb + ' KB free (lowest ' + L.heap_min_kb + ' KB)', L.heap_min_kb < 40 ? 'warn' : '');

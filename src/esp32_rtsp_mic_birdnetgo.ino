@@ -9,6 +9,7 @@
 #include <esp_timer.h>
 #include "App.h"
 #include "AudioDsp.h"
+#include "RestartInfo.h"
 #include "RtspRequest.h"
 #include "WebUI.h"
 #include "WifiSetup.h"
@@ -74,6 +75,9 @@ volatile uint16_t queueHighWater = 0;
 volatile uint32_t sendStallMaxMs = 0;
 volatile uint32_t sendStallCount = 0;
 volatile uint32_t lastCaptureOkMs = 0;         // last successful i2s_read (capture watchdog)
+volatile uint32_t lastMicSignalMs = 0;         // last block whose raw samples were not all identical
+bool micFlat = false;                          // no signal from the microphone for MIC_FLAT_MS
+#define MIC_FLAT_MS 10000
 
 portMUX_TYPE logMux = portMUX_INITIALIZER_UNLOCKED;  // guards the fixed-size log ring (WebUI.cpp)
 portMUX_TYPE hpfMux = portMUX_INITIALIZER_UNLOCKED;  // guards HPF coefficient hand-off
@@ -170,6 +174,7 @@ bool scheduledFactoryReset = false;
 bool rebootScheduled = false;
 unsigned long rebootRequestedAt = 0;
 uint32_t rebootDelayMs = 0;
+const char* rebootNote = "";               // reported as the restart reason after the reboot
 unsigned long lastI2SReset = 0;
 float maxTemperature = 0.0f;
 float lastTemperatureC = 0.0f;
@@ -195,6 +200,8 @@ bool wifiPsSuspended = false;                  // power save turned off for this
 volatile bool wifiLinkUp = false;
 volatile uint8_t wifiDropReason = 0;
 uint32_t wifiDrops = 0;                        // link losses since boot
+uint8_t wifiLastDropReason = 0;                // reason code of the latest loss (0 = none yet)
+uint32_t wifiLastDropAt = 0;                   // uptime (s) of the latest loss
 
 // -- RTSP connect/PLAY statistics
 unsigned long lastRtspPlayMs = 0;
@@ -417,6 +424,8 @@ static void checkWiFi() {
         if (!up) {
             downSince = lastKick = now;
             wifiDrops++;
+            wifiLastDropReason = wifiDropReason;
+            wifiLastDropAt = uptimeSeconds();
             simplePrintln(String("WiFi lost (") + WiFi.disconnectReasonName((wifi_err_reason_t)wifiDropReason) +
                           "), reconnecting");
         } else {
@@ -444,8 +453,7 @@ void checkScheduledReset() {
 
     if (uptimeSeconds() / 3600 >= resetIntervalHours) {
         simplePrintln("SCHEDULED RESET: " + String(resetIntervalHours) + " hours reached");
-        delay(1000);
-        ESP.restart();
+        restartWithNote("scheduled reboot");
     }
 }
 
@@ -525,11 +533,13 @@ void saveAudioSettings() {
 }
 
 // Reboot (optionally restoring defaults first) from loop() once delayMs has passed, so an HTTP
-// handler can send its reply before the device goes away.
-void scheduleReboot(bool factoryReset, uint32_t delayMs) {
+// handler can send its reply before the device goes away. `why` is shown as the restart reason
+// after the reboot; it must be a string literal.
+void scheduleReboot(bool factoryReset, uint32_t delayMs, const char* why) {
     scheduledFactoryReset = factoryReset;
     rebootRequestedAt = millis();
     rebootDelayMs = delayMs;
+    rebootNote = why;
     rebootScheduled = true;
 }
 
@@ -811,7 +821,7 @@ static void captureTask(void* arg) {
             localHpfVersion = 0xFFFFFFFF;  // sample rate may have changed: refetch coefficients
             localHpf.reset();
             dcRate = 0;
-            lastCaptureOkMs = millis();
+            lastCaptureOkMs = lastMicSignalMs = millis();
             continue;
         }
 
@@ -936,6 +946,7 @@ static void captureTask(void* arg) {
         audioClippedLastBlock = st.clipped;
         if (st.clipped) audioClipCount++;
         const unsigned long now = millis();
+        if (!st.flat) lastMicSignalMs = now;
         if (lastPeakAbs16 > peakHoldAbs16) {
             peakHoldAbs16 = lastPeakAbs16;
             peakHoldSinceMs = now;
@@ -980,7 +991,7 @@ static void resumeCapture() {
 
 static void startCaptureTask() {
     if (captureTaskHandle) return;
-    lastCaptureOkMs = millis();
+    lastCaptureOkMs = lastMicSignalMs = millis();
     BaseType_t ok = xTaskCreatePinnedToCore(captureTask, "AudioCapture", 4096, NULL, 20,
                                             &captureTaskHandle, 1);
     if (ok != pdPASS) {
@@ -1430,6 +1441,11 @@ void setup() {
 
     Serial.println("\n\n=== ESP32 RTSP Mic Starting ===");
     Serial.println("Board: M5Stack Atom Echo");
+    restartInfoInit();
+    simplePrintln(String("Firmware ") + FW_VERSION + ", last restart: " + restartReason());
+    if (restartCrashDetails()[0]) {
+        simplePrintln(String("Crash: ") + restartCrashDetails());
+    }
 
     senderExitSem = xSemaphoreCreateBinary();
 
@@ -1544,14 +1560,29 @@ void loop() {
 
     checkScheduledReset();
 
+    // The capture task (higher priority, same core) stamps these at any moment. Read them before
+    // millis(): the other order can pair a newer stamp with an older "now", and the unsigned
+    // difference then wraps to ~49 days.
+    const uint32_t captureOkAt = lastCaptureOkMs, micSignalAt = lastMicSignalMs;
+    const uint32_t nowMs = millis();
+
     // Capture watchdog. i2s_read gives up after 1 s, so CAPTURE_STALL_MS without one complete block
     // means the driver stopped delivering; reinstalling it ends any session (the client reconnects).
     if (captureTaskHandle && !capturePauseRequested && appliedSampleRate != 0 &&
-        millis() - lastCaptureOkMs > CAPTURE_STALL_MS && millis() - lastI2SReset > 30000) {
-        lastI2SReset = millis();
-        simplePrintln("Capture stalled: no I2S data for " + String((millis() - lastCaptureOkMs) / 1000) +
+        nowMs - captureOkAt > CAPTURE_STALL_MS && nowMs - lastI2SReset > 30000) {
+        lastI2SReset = nowMs;
+        simplePrintln("Capture stalled: no I2S data for " + String((nowMs - captureOkAt) / 1000) +
                       " s (read errors " + String(i2sReadErrors) + "); restarting audio");
         restartI2S();
+    }
+
+    // Microphone check. A stuck PDM data line decodes to one constant value; a working microphone
+    // varies by at least 1 LSB even in a silent room. Only judged while capture is delivering.
+    const bool flatNow = nowMs - captureOkAt < 2000 && nowMs - micSignalAt > MIC_FLAT_MS;
+    if (flatNow != micFlat) {
+        micFlat = flatNow;
+        simplePrintln(micFlat ? "WARNING: no signal from the microphone (constant samples for 10 s); check the hardware"
+                              : "Microphone signal back");
     }
 
     // WiFi power save can starve the TCP send window (5760 B per beacon-period RTT). If a session
@@ -1577,7 +1608,7 @@ void loop() {
     if (senderTaskHandle && stopStreamRequested && stopRequestedAt != 0 &&
         millis() - stopRequestedAt > SENDER_JOIN_LIMIT_MS && !rebootScheduled) {
         simplePrintln("Sender task did not exit for 30 s; rebooting to recover");
-        scheduleReboot(false, 200);
+        scheduleReboot(false, 200, "recovery: sender task stuck");
     }
 
     // RTSP idle timeout — disconnect clients that connect but never stream (60s)
@@ -1622,8 +1653,7 @@ void loop() {
         if (scheduledFactoryReset) {
             resetToDefaultSettings();
         }
-        delay(50);
-        ESP.restart();
+        restartWithNote(rebootNote);
     }
 
     // Everything above is poll-based. WebServer::handleClient already sleeps 1 ms when no HTTP

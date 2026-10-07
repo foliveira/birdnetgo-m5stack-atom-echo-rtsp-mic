@@ -115,6 +115,18 @@ static void testClipping() {
     CHECK(st2.peak > 15000.0f && st2.peak < 21000.0f);
 }
 
+static void testFlatInput() {
+    // A stuck PDM line decodes to a constant; any working microphone varies by at least 1 LSB.
+    const int n = 512;
+    std::vector<int16_t> in(n, -32768);
+    DcBlocker dc; dc.design(32000.0f, 10.0f);
+    CHECK(processBlock(in.data(), n, dc, nullptr, 3.0f, 3.0f, nullptr).flat);
+    in[n - 1] = -32767;
+    CHECK(!processBlock(in.data(), n, dc, nullptr, 3.0f, 3.0f, nullptr).flat);
+    std::vector<int16_t> quiet = sine(32000.0f, 1000.0f, 1.0f, n);   // +-1 LSB of signal
+    CHECK(!processBlock(quiet.data(), n, dc, nullptr, 3.0f, 3.0f, nullptr).flat);
+}
+
 static void testAgcIndependentOfBlockSize() {
     // One second of a loud signal must reduce the AGC multiplier by the same amount whether the
     // capture task runs 16 ms or 128 ms blocks.
@@ -137,6 +149,7 @@ int main() {
     testGainRampRoundingAndByteOrder();
     testRoundingIsSymmetric();
     testClipping();
+    testFlatInput();
     testAgcIndependentOfBlockSize();
     return checkSummary("test_dsp");
 }

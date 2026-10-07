@@ -46,6 +46,7 @@ struct BlockStats {
     float peak;        // largest |sample| after gain, before clipping (0..)
     float sumSquares;  // for RMS (AGC)
     bool clipped;
+    bool flat;         // every input sample identical: a stuck PDM data line, not a quiet scene
 };
 
 // DC block -> optional high-pass -> gain ramped linearly from g0 to g1 across the block (no
@@ -53,10 +54,11 @@ struct BlockStats {
 // written big-endian (RTP L16) to outBE when it is non-null; metering runs either way.
 inline BlockStats processBlock(const int16_t* in, uint32_t n, DcBlocker& dc, Biquad* hpf,
                                float g0, float g1, uint8_t* outBE) {
-    BlockStats st{0.0f, 0.0f, false};
+    BlockStats st{0.0f, 0.0f, false, true};
     const float step = (g1 - g0) / (float)n;
     float g = g0;
     for (uint32_t i = 0; i < n; i++) {
+        if (in[i] != in[0]) st.flat = false;
         float s = dc.process((float)in[i]);
         if (hpf) s = hpf->process(s);
         g += step;

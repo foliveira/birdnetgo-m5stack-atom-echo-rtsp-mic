@@ -119,6 +119,10 @@ async function streamingScenario(base) {
   check(await page.evaluate(`${field('rate')}.value`) === '32000', 'rate select filled from cfg');
   check((await text(page, 'wifi')).includes('Garden "AP"'), 'SSID shown as text, quotes intact', await text(page, 'wifi'));
   check((await text(page, 'format')).startsWith('32 kHz'), 'audio format line', await text(page, 'format'));
+  check(await text(page, 'restart') === 'scheduled reboot', 'restart reason shown', await text(page, 'restart'));
+  check(await text(page, 'ap') === '3C:84:6A:12:34:56, channel 6', 'access point and channel', await text(page, 'ap'));
+  check(/^1 since boot, last 2h \d+m ago \(BEACON_TIMEOUT\)$/.test(await text(page, 'drops')), 'last WiFi drop', await text(page, 'drops'));
+  check(await page.evaluate("document.getElementById('micFlat').hidden"), 'no microphone warning while it delivers signal');
   const frameLabel = await page.evaluate(`${field('buffer')}.selectedOptions[0].textContent`);
   check(frameLabel === '1024 samples (32 ms)', 'frame size label shows duration at the current rate', frameLabel);
   await screenshot(page, 'desktop');
@@ -210,6 +214,7 @@ async function latchedScenario(base) {
   check(await text(page, 'status') === 'Stopped: thermal protection', 'pill shows the latch', await text(page, 'status'));
   check(await page.evaluate("getComputedStyle(document.getElementById('thermalAlert')).display") === 'block', 'latch alert visible');
   check((await text(page, 'thermalAlertText')).includes('81.5 °C'), 'latch note shown', await text(page, 'thermalAlertText'));
+  check(await page.evaluate("!document.getElementById('micFlat').hidden"), 'microphone warning shown');
   await screenshot(page, 'latched');
   await page.evaluate("document.querySelector('#thermalAlert button').click()");
   await waitFor(page, "getComputedStyle(document.getElementById('thermalAlert')).display === 'none'", 'alert cleared');

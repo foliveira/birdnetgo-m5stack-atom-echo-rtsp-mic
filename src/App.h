@@ -51,6 +51,9 @@ extern volatile uint32_t audioClipCount;
 extern volatile float agcMultiplier;
 extern bool wifiPsSuspended;
 extern uint32_t wifiDrops;
+extern uint8_t wifiLastDropReason;       // 0 = no loss since boot
+extern uint32_t wifiLastDropAt;          // uptime (s) of the latest loss
+extern bool micFlat;                     // the microphone delivers constant samples
 extern float lastTemperatureC;
 extern bool lastTemperatureValid;
 extern float maxTemperature;
@@ -73,5 +76,5 @@ void applyWifiTxPower(bool log);
 float snapWifiTxDbm(float dbm);
 bool setRtspServer(bool on);   // false: refused because the thermal latch is set
 void clearThermalLatch();
-void scheduleReboot(bool factoryReset, uint32_t delayMs);
+void scheduleReboot(bool factoryReset, uint32_t delayMs, const char* why);   // why: a string literal
 bool requestStreamStop(const char* reason);
