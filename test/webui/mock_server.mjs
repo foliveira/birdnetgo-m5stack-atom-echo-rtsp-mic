@@ -77,7 +77,7 @@ function parseSetting(key, v, s) {
     case 'sched_h': d = num(v, 1, 168, true); if (d === null) return 'must be 1 to 168 hours'; s.sched_h = d; break;
     case 'name': {
       const n = v.toLowerCase();
-      if (n.length < 1 || n.length > 32 || !/^[a-z0-9-]+$/.test(n) || n.startsWith('-') || n.endsWith('-')) return 'must be 1 to 32 letters, digits or hyphens, with no hyphen at either end';
+      if (n.length < 1 || n.length > 31 || !/^[a-z0-9-]+$/.test(n) || n.startsWith('-') || n.endsWith('-')) return 'must be 1 to 31 letters, digits or hyphens, with no hyphen at either end';
       s.name = n; break;
     }
     default:
@@ -140,7 +140,8 @@ createServer(async (req, res) => {
     for await (const c of req) chunks.push(c);
     const raw = Buffer.concat(chunks);
     const start = raw.indexOf('\r\n\r\n');
-    if (start < 0 || raw.length <= start + 4) { json(res, 400, { error: 'no firmware file in the request' }); return; }
+    const multipart = (req.headers['content-type'] || '').startsWith('multipart/form-data');
+    if (!multipart || start < 0 || raw.length <= start + 4) { json(res, 400, { error: 'no firmware file in the request' }); return; }
     if (raw[start + 4] !== 0xe9) { log('Firmware update failed: Wrong Magic Byte'); json(res, 400, { error: 'Wrong Magic Byte' }); return; }
     log('Firmware update written; restarting into it');
     downUntil = Date.now() + 4000;

@@ -48,7 +48,7 @@ A capture watchdog in `loop()` reinstalls the I2S driver when the capture task h
 
 ### WiFi
 - **Joining**: the device scans all channels and joins the strongest access point that carries the stored network name. The ESP-IDF default joins the first one it finds, often a distant mesh node.
-- **Setup portal**: with no stored network, or when the stored one cannot be joined within 60 s at boot, the device opens the open network `ESP32-RTSP-Mic-AP` with a captive page that lists nearby networks. With a stored network it retries that network every 30 s while nobody is connected to the portal and restarts as soon as it answers (a router that boots slower than the device after a power cut), and restarts after 3 idle minutes. Without one it waits indefinitely. Credentials live in the same NVS slot WiFiManager used, so devices upgraded from 2.x and 3.0 keep them.
+- **Setup portal**: with no stored network, or when the stored one cannot be joined within 60 s at boot, the device opens the open network `ESP32-RTSP-Mic-AP` with a captive page that lists nearby networks. With a stored network it retries that network every 30 s while nobody is connected to the portal and restarts as soon as it answers (a router that boots slower than the device after a power cut), and restarts after 3 idle minutes. Without one it waits indefinitely. A network entered in the portal that cannot be joined does not replace the stored one. Credentials live in the same NVS slot WiFiManager used, so devices upgraded from 2.x and 3.0 keep them.
 - **At runtime**: a WiFi event handler tracks the link. `loop()` logs each drop with its reason, nudges a reconnect every 15 s, and restarts the device after 10 minutes without a link. An RTSP session survives a short drop: when the link returns with the same address the TCP connection is still valid, and the sender ends the session itself if the client stays unreachable for 10 s. The LED is yellow while the link is down.
 - **Power save**: with WiFi power save on, the radio sleeps between beacons and TCP acknowledgements arrive once per DTIM period. The 5760-byte TCP send window then carries 5760 B per beacon interval, enough for 16 kHz with DTIM 1 but not for higher rates. The firmware turns power save off until the next reboot when a session drops 10 frames.
 
@@ -65,7 +65,7 @@ Controllable consumers, largest first: the WiFi receiver with power save off (~8
 ### Restart reasons and crash reports
 The Device card and the boot log show why the device last restarted: power on, reset pin, brownout, crash, watchdog, or the note the firmware left before restarting itself (`scheduled reboot`, `Web UI reboot`, `defaults restored from the Web UI`, `firmware update`, `WiFi network forgotten from the Web UI`, `WiFi network forgotten (button)`, `recovery: WiFi down for 10 min`, `recovery: sender task stuck`, `joined a network from the setup portal`, `setup portal: stored network is back`, `setup portal idle for 3 minutes`).
 
-After a crash or watchdog reset the panic handler has written a core dump to flash. The boot log then has a line like
+After a crash or watchdog reset the panic handler has written a core dump to flash. The boot log then has a line like this, and the firmware erases the dump once it has logged it, so an old dump is never reported for a later reset:
 ```
 Crash: task AudioCapture, PC 0x400d2f1c, backtrace: 0x400d2f19 0x400d3a2e ...
 ```
@@ -122,7 +122,9 @@ One page (`web/index.html`, gzipped into the firmware at build time) that polls 
 
 ## HTTP API
 
-POST bodies are form-encoded. Replies are JSON unless noted. POST requests whose `Origin` header names another site are refused with `403`, so a page on another site cannot drive the device through a browser. There is no authentication.
+POST bodies are form-encoded. Replies are JSON unless noted. There is no authentication. Two checks keep web pages from other sites out:
+- Every request must be addressed (`Host` header) to the device's IPv4 address, its name, `<name>.local`, or its name under `.lan`, `.home`, `.home.arpa`, `.internal`, `.localdomain` or `.fritz.box`, with any port. Anything else gets `403`. This defeats DNS rebinding, where a page points a name of its own at the device's address.
+- POST requests whose `Origin` header names another site get `403`.
 
 ### `GET /api/state`
 ```json
@@ -143,7 +145,7 @@ POST bodies are form-encoded. Replies are JSON unless noted. POST requests whose
 | `led` | 0 off, 1 status colour, 2 signal level |
 | `oh`, `oh_limit` | thermal protection on/off, limit 30 to 95 °C in steps of 5 |
 | `sched`, `sched_h` | scheduled reboot on/off, every 1 to 168 hours |
-| `name` | device name: 1 to 32 lowercase letters, digits or hyphens, no hyphen at either end |
+| `name` | device name: 1 to 31 lowercase letters, digits or hyphens, no hyphen at either end |
 
 `live` holds the status the page shows: `uptime`, `restart_reason`, `ip`, `ssid`, `rssi`, `bssid`, `channel`, `wifi_drops`, `wifi_last_drop`, `wifi_last_drop_s`, `ps_suspended`, `heap_kb`, `heap_min_kb`, `cpu_mhz`, `temp_c`, `temp_max_c`, `server`, `streaming`, `client`, `session_s`, `end_reason`, `connects`, `plays`, `rate`, `frame_ms`, `sent`, `dropped`, `overruns`, `read_errors`, `queue`, `queue_peak`, `queue_cap`, `stall_max_ms`, `stalls`, `peak_pct`, `hold_pct`, `clips`, `agc_x`, `mic_flat`, `oh_latched`, `oh_sensor_fault`, `oh_note`, `log_seq`. Stream counters restart with every session. Unknown values are `null`.
 
@@ -157,7 +159,7 @@ curl -d gain=4 -d agc=0 http://atomecho.local/api/settings
 `name=` one of `restart_audio`, `server_on`, `server_off`, `clear_thermal`, `reboot`, `defaults`, `forget_wifi`. `server_on` answers `409` while the thermal latch is set (use `clear_thermal`). `reboot`, `defaults` and `forget_wifi` restart the device half a second after replying.
 
 ### `POST /api/update`
-Multipart upload of a `firmware.bin` (any field name). Replies `{"ok": true}` and restarts into the new firmware, or `400` with the Update library's error (for example `Wrong Magic Byte` for a file that is not an ESP32 image). The RTSP session is stopped before writing.
+Multipart upload (`multipart/form-data`) of a `firmware.bin` (any field name). Replies `{"ok": true}` and restarts into the new firmware, or `400` with the Update library's error (for example `Wrong Magic Byte` for a file that is not an ESP32 image), or `no firmware file in the request` for any other body. The RTSP session is stopped before writing. If the upload connection drops, the partial update is discarded.
 
 ### `GET /api/logs?since=N`
 Plain text: the log lines after line number `N` (at most the last 48). The `X-Log-Seq` header holds the number of the newest line; pass it as `since` next time.
@@ -245,13 +247,13 @@ v2.3.0 and earlier are [@stedrow](https://github.com/stedrow)'s releases of the 
 
 ### v3.1.0
 Settings and WiFi credentials are preserved; see "Updating" in the README.
-- Web UI rewritten: English only, one gzipped 9 KB page, a single JSON state endpoint polled once a second, settings validated before they are applied, cross-site POSTs refused. The old `/api/*` endpoints are removed.
+- Web UI rewritten: English only, one gzipped 9 KB page, a single JSON state endpoint polled once a second, settings validated before they are applied, cross-site POSTs and foreign host names (DNS rebinding) refused. The old `/api/*` endpoints are removed.
 - Firmware update from the Web UI (`/api/update`) with automatic rollback when the new version restarts within its first minute
 - Prometheus metrics at `/metrics`
 - WiFiManager, M5Atom and FastLED removed: built-in setup portal, LED driven by the core's `neopixelWrite`. The firmware went from not fitting the app partition with current libraries (1.48 MB) to 0.95 MB.
 - Joins the strongest access point for the network name; RTSP sessions survive short WiFi drops; restart after 10 minutes without WiFi; the setup portal retries the stored network every 30 s
 - Change the WiFi network from the Web UI or by holding the button for 5 s
-- Device name setting for mDNS and DHCP
+- Device name setting for mDNS and DHCP (applied at once; DHCP sends it from its next request)
 - Default sample rate 32 kHz (BirdNET's full band); 8 kHz removed (below the microphone's clock range)
 - Always-on DC blocker, rounding instead of truncation, AGC time constants independent of rate and frame size; the speaker amplifier's pins are held low
 - Frame pool allocated frame by frame with a 3 s target; capture watchdog restarts a stalled I2S driver (replaces the packet-rate auto recovery)

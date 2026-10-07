@@ -37,9 +37,9 @@ void restartInfoInit() {
     }
     noteMagic = 0;
 
-    // The panic handler (crashes and watchdog timeouts) writes a core dump to the coredump
-    // partition. Its summary is only meaningful right after such a reset: an older dump stays in
-    // flash until the next crash overwrites it.
+    // The panic handler (crashes and most watchdog timeouts) writes a core dump to the coredump
+    // partition. Some resets (RTC watchdog, a hung panic handler) write none, and the dump in
+    // flash would then be an older one, so each dump is erased once it has been summarised.
     if (r != ESP_RST_PANIC && r != ESP_RST_INT_WDT && r != ESP_RST_TASK_WDT && r != ESP_RST_WDT) return;
     esp_core_dump_summary_t* s = (esp_core_dump_summary_t*)malloc(sizeof(esp_core_dump_summary_t));
     if (!s) return;
@@ -55,6 +55,7 @@ void restartInfoInit() {
         if (s->exc_bt_info.corrupted && n > 0 && n < (int)sizeof(crash) - 12) {
             snprintf(crash + n, sizeof(crash) - n, " (corrupted)");
         }
+        esp_core_dump_image_erase();
     }
     free(s);
 }

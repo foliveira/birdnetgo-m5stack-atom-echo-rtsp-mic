@@ -126,7 +126,7 @@ pre{margin:10px 0 0;max-height:50vh;overflow:auto;white-space:pre-wrap;word-brea
 
 <section class="card"><h2>Network and power</h2>
 <form data-settings>
-  <label><span>Device name</span><input type="text" name="name" maxlength="32" required pattern="[a-z0-9]([a-z0-9\-]*[a-z0-9])?" autocapitalize="none" spellcheck="false"><small>Reachable as <i>name</i>.local (mDNS) at once; the router's DHCP list shows it after the next reconnect. Lowercase letters, digits and hyphens.</small></label>
+  <label><span>Device name</span><input type="text" name="name" maxlength="31" required pattern="[a-z0-9]([a-z0-9\-]*[a-z0-9])?" autocapitalize="none" spellcheck="false"><small>Reachable as <i>name</i>.local (mDNS) at once; the router learns it when the device next renews its address. Lowercase letters, digits and hyphens.</small></label>
   <label><span>WiFi transmit power (dBm)</span><select name="tx">
     <option>-1</option><option>2</option><option>5</option><option>7</option><option>8.5</option><option>11</option><option>13</option><option>15</option><option>17</option><option>18.5</option><option>19</option><option>19.5</option>
   </select><small>Lower only if the access point is close; weak links retransmit more.</small></label>

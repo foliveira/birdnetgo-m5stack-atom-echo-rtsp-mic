@@ -223,7 +223,12 @@ static const char PAGE_HEAD[] =
         if (pendingAt && millis() - pendingAt > 500) {
             pendingAt = 0;
             Serial.printf("[Setup] joining \"%s\"\n", pendSsid);
-            WiFi.begin(pendSsid, pendPass);   // stores the credentials in NVS
+            // WiFi.begin() stores the new network in NVS before trying it. Keep the previous one
+            // to put back if the join fails: a mistyped password, or anyone in range of this open
+            // network, must not replace a network that works once the router is back.
+            wifi_config_t previous;
+            const bool havePrevious = esp_wifi_get_config(WIFI_IF_STA, &previous) == ESP_OK;
+            WiFi.begin(pendSsid, pendPass);
             const uint32_t t0 = millis();
             while (WiFi.status() != WL_CONNECTED && millis() - t0 < 20000) {
                 dns.processNextRequest();
@@ -238,6 +243,7 @@ static const char PAGE_HEAD[] =
             Serial.println("[Setup] join failed");
             error = String("Could not join \"") + pendSsid + "\". Check the password and that it is a 2.4 GHz network.";
             WiFi.disconnect();   // stop the core's retries; the access point stays up
+            if (havePrevious) esp_wifi_set_config(WIFI_IF_STA, &previous);
             lastActivity = millis();
         }
 

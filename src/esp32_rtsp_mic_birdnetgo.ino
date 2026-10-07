@@ -7,6 +7,7 @@
 #include <errno.h>
 #include <lwip/sockets.h>
 #include <esp_heap_caps.h>
+#include <esp_netif.h>
 #include <esp_ota_ops.h>
 #include <esp_timer.h>
 #include "App.h"
@@ -277,11 +278,11 @@ bool isSupportedSampleRate(uint32_t hz) {
     return hz == 16000 || hz == 22050 || hz == 24000 || hz == 32000 || hz == 44100 || hz == 48000;
 }
 
-// A DNS label: 1-32 lowercase letters, digits and hyphens, no hyphen at either end. 32 is the
-// limit of the DHCP hostname in ESP-IDF.
+// A DNS label: 1-31 lowercase letters, digits and hyphens, no hyphen at either end. 31 is what
+// the core's hostname buffer (32 bytes) keeps.
 bool isValidDeviceName(const char* name) {
     const size_t n = strlen(name);
-    if (n < 1 || n > 32 || name[0] == '-' || name[n - 1] == '-') return false;
+    if (n < 1 || n > 31 || name[0] == '-' || name[n - 1] == '-') return false;
     for (size_t i = 0; i < n; i++) {
         const char c = name[i];
         if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-')) return false;
@@ -289,12 +290,14 @@ bool isValidDeviceName(const char* name) {
     return true;
 }
 
-// Rename the device. mDNS answers to the new name at once; DHCP sends it from the next connection.
+// Rename the device. mDNS answers to the new name at once; the DHCP client sends it from its next
+// request (lease renewal or reconnect).
 void setDeviceName(const char* name) {
     strlcpy(deviceName, name, sizeof(deviceName));
-    WiFi.setHostname(deviceName);
+    WiFi.setHostname(deviceName);   // only used when the station interface starts (boot)
+    if (esp_netif_t* sta = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF")) esp_netif_set_hostname(sta, deviceName);
     mdns_hostname_set(deviceName);
-    simplePrintln(String("Device name: ") + deviceName + " (mDNS " + deviceName + ".local now, DHCP after the next reconnect)");
+    simplePrintln(String("Device name: ") + deviceName + " (mDNS " + deviceName + ".local now, DHCP from its next request)");
 }
 
 // Uptime -> "Xd Yh Zm Ts"
@@ -1010,8 +1013,8 @@ static bool pauseCapture() {
     if (!captureTaskHandle) return true;
     capturePauseRequested = true;
     __asm__ __volatile__("memw" ::: "memory");
-    unsigned long deadline = millis() + 2500;
-    while (!capturePaused && millis() < deadline) vTaskDelay(pdMS_TO_TICKS(5));
+    const unsigned long start = millis();
+    while (!capturePaused && millis() - start < 2500) vTaskDelay(pdMS_TO_TICKS(5));
     if (!capturePaused) {
         Serial.println("[Loop] WARNING: capture task did not pause");
         capturePauseRequested = false;

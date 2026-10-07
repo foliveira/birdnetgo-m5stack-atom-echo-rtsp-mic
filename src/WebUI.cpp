@@ -4,6 +4,7 @@
 #include <WebServer.h>
 #include <math.h>
 #include "App.h"
+#include "HostCheck.h"
 #include "JsonOut.h"
 #include "PromOut.h"
 #include "RestartInfo.h"
@@ -198,6 +199,13 @@ static void httpMetrics() {
     free(buf);
 }
 
+// Every request must name the device in Host (HostCheck.h), which defeats DNS rebinding.
+static const char* const UNKNOWN_HOST = "unknown host name: open the device by its IP address or name.local";
+
+static bool knownHost() {
+    return isDeviceHost(web.hostHeader().c_str(), deviceName);
+}
+
 // Browsers attach Origin to cross-site POSTs. Refusing those keeps other web pages open in the
 // same browser from changing settings, uploading firmware or rebooting the device; curl and
 // scripts send no Origin.
@@ -206,10 +214,28 @@ static bool crossSite() {
     return origin.length() != 0 && origin != "http://" + web.hostHeader();
 }
 
+// First call of every POST handler.
 static bool fromThisPage() {
-    if (!crossSite()) return true;
-    sendError(403, "cross-site request refused");
-    return false;
+    if (!knownHost()) {
+        sendError(403, UNKNOWN_HOST);
+        return false;
+    }
+    if (crossSite()) {
+        sendError(403, "cross-site request refused");
+        return false;
+    }
+    return true;
+}
+
+// Wraps every GET handler.
+static WebServer::THandlerFunction deviceHostOnly(void (*handler)()) {
+    return [handler]() {
+        if (!knownHost()) {
+            sendError(403, UNKNOWN_HOST);
+            return;
+        }
+        handler();
+    };
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -305,7 +331,7 @@ static const char* parseSetting(const String& key, const String& v, Settings& s)
     } else if (key == "name") {
         String n = v;
         n.toLowerCase();
-        if (!isValidDeviceName(n.c_str())) return "must be 1 to 32 letters, digits or hyphens, with no hyphen at either end";
+        if (!isValidDeviceName(n.c_str())) return "must be 1 to 31 letters, digits or hyphens, with no hyphen at either end";
         strlcpy(s.name, n.c_str(), sizeof(s.name));
     } else {
         bool* flag = key == "hpf" ? &s.hpf : key == "agc" ? &s.agc : key == "ps" ? &s.ps :
@@ -424,14 +450,19 @@ static void httpAction() {
 
 static String updateError;
 static bool updateStarted = false;
+static bool updateWritten = false;   // Update.end() verified the image and switched the boot slot
 
 static void httpUpdateUpload() {
+    // WebServer also calls this for a POST body that is not multipart (its "raw" mode), when
+    // web.upload() refers to nothing. httpUpdateDone answers such a request "no firmware file".
+    if (!web.header("Content-Type").startsWith("multipart/form-data")) return;
     HTTPUpload& up = web.upload();
     if (up.status == UPLOAD_FILE_START) {
         updateError = "";
-        updateStarted = false;
-        if (crossSite()) {
-            updateError = "cross-site request refused";
+        updateStarted = updateWritten = false;
+        if (Update.isRunning()) Update.abort();   // never left running, but begin() would refuse
+        if (!knownHost() || crossSite()) {
+            updateError = "refused";   // httpUpdateDone sends the 403
             return;
         }
         simplePrintln("Firmware update: receiving " + up.filename);
@@ -446,19 +477,32 @@ static void httpUpdateUpload() {
             updateError = Update.errorString();
         }
     } else if (up.status == UPLOAD_FILE_END) {
-        if (updateStarted && updateError.length() == 0 && !Update.end(true)) updateError = Update.errorString();
+        if (updateStarted && updateError.length() == 0) {
+            updateWritten = Update.end(true);
+            if (!updateWritten) updateError = Update.errorString();
+        }
     } else if (up.status == UPLOAD_FILE_ABORTED) {
-        updateError = "upload interrupted";
+        // The connection dropped. WebServer does not call httpUpdateDone after this, so release
+        // the update (and its buffer) here.
+        if (updateStarted) Update.abort();
+        updateStarted = updateWritten = false;
+        updateError = "";
+        simplePrintln("Firmware update interrupted: the upload connection dropped");
     }
 }
 
 static void httpUpdateDone() {
+    String error = updateError;
+    const bool started = updateStarted, written = updateWritten;
+    updateError = "";   // the next request starts clean, whatever this one was
+    updateStarted = updateWritten = false;
     if (!fromThisPage()) return;
-    if (!updateStarted && updateError.length() == 0) updateError = "no firmware file in the request";
-    if (updateError.length()) {
+    if (!started && error.length() == 0) error = "no firmware file in the request";
+    if (started && !written && error.length() == 0) error = "the upload ended early";
+    if (error.length()) {
         Update.abort();   // frees the buffer; a half-written slot is never made bootable
-        simplePrintln("Firmware update failed: " + updateError);
-        sendError(400, updateError.c_str());
+        simplePrintln("Firmware update failed: " + error);
+        sendError(400, error.c_str());
         return;
     }
     simplePrintln("Firmware update written; restarting into it");
@@ -476,14 +520,14 @@ static void httpIndex() {
 }
 
 void webui_begin() {
-    static const char* headers[] = {"Origin"};
-    web.collectHeaders(headers, 1);
-    web.on("/", HTTP_GET, httpIndex);
-    web.on("/api/state", HTTP_GET, sendState);
+    static const char* headers[] = {"Origin", "Content-Type"};
+    web.collectHeaders(headers, 2);
+    web.on("/", HTTP_GET, deviceHostOnly(httpIndex));
+    web.on("/api/state", HTTP_GET, deviceHostOnly(sendState));
+    web.on("/api/logs", HTTP_GET, deviceHostOnly(httpLogs));
+    web.on("/metrics", HTTP_GET, deviceHostOnly(httpMetrics));
     web.on("/api/settings", HTTP_POST, httpSettings);
     web.on("/api/action", HTTP_POST, httpAction);
-    web.on("/api/logs", HTTP_GET, httpLogs);
-    web.on("/metrics", HTTP_GET, httpMetrics);
     web.on("/api/update", HTTP_POST, httpUpdateDone, httpUpdateUpload);
     web.onNotFound([]() { web.send(404, "text/plain", "Not found"); });
     web.begin();

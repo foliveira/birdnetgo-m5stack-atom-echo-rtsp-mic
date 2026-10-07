@@ -9,7 +9,7 @@ See `README.md` for project documentation and usage, and `docs/DETAILS.md` for t
 - `web/index.html` — The Web UI page. `scripts/embed_webui.py` gzips it into `webui_index.h` in the build directory before every build
 - `src/WifiSetup.cpp` / `WifiSetup.h` — Joining the stored network and the setup portal (replaces WiFiManager)
 - `src/RestartInfo.cpp` / `RestartInfo.h` — Restart reason, RTC note for the firmware's own restarts, core dump summary after a crash
-- `src/AudioDsp.h`, `src/RtspRequest.h`, `src/JsonOut.h`, `src/PromOut.h` — Plain C++ (no Arduino), unit-tested on the host in `test/host`
+- `src/AudioDsp.h`, `src/RtspRequest.h`, `src/JsonOut.h`, `src/PromOut.h`, `src/HostCheck.h` — Plain C++ (no Arduino), unit-tested on the host in `test/host`
 - `test/webui/` — Mock device, browser test and API key check for the page
 - `platformio.ini` — Build configuration; the platform is pinned
 
@@ -38,7 +38,8 @@ See `README.md` for project documentation and usage, and `docs/DETAILS.md` for t
 ### Web UI and API
 - The page lives in `web/index.html`; never paste HTML into C++ strings.
 - `sendState()` / `parseSetting()` in `WebUI.cpp`, the page and `test/webui/mock_server.mjs` must use the same keys, messages and status codes. `node test/webui/check_keys.mjs` checks the keys.
-- State changes only through POST, and every POST handler starts with `fromThisPage()` (Origin check). GET handlers must not change state.
+- State changes only through POST, and every POST handler starts with `fromThisPage()` (Host and Origin checks). GET handlers are registered through `deviceHostOnly()` (Host check, against DNS rebinding) and must not change state.
+- WebServer calls an upload callback for non-multipart POST bodies too (raw mode), when `web.upload()` is invalid: check the Content-Type first.
 - `/api/settings` validates every key before applying any.
 - Replies are built in fixed buffers (`JsonOut`, `PromOut`); no `String` concatenation of whole replies.
 
