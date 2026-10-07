@@ -423,17 +423,19 @@ $('fwInstall').onclick = () => {
     done('Not installed: ' + err);
   };
   // After the browser has sent the whole file a lost reply can mean the device is restarting into
-  // it, or that the end of the file never arrived. Its uptime tells which.
+  // it, or that the end of the file never arrived. Its uptime and restart reason tell which.
   let sent = false;
-  const upBefore = st ? st.live.uptime : 0, t0 = Date.now();
+  const upBefore = st ? st.live.uptime : 0, fwBefore = st ? st.fw : '', t0 = Date.now();
   xhr.upload.onload = () => { sent = true; };
   xhr.onerror = () => {
     if (!sent) { done('Upload failed: the connection dropped.'); return; }
     showOverlay('Waiting for the device…');
     const tick = () => fetch('/api/state', { cache: 'no-store' }).then((r) => r.json()).then((s) => {
-      if (s.live.uptime < upBefore + (Date.now() - t0) / 1000 - 3) { location.reload(); return; }
+      const restarted = s.live.uptime < upBefore + (Date.now() - t0) / 1000 - 3;
+      if (restarted && (s.live.restart_reason === 'firmware update' || s.fw !== fwBefore)) { location.reload(); return; }
       $('overlay').style.display = 'none';
-      done('Not installed: the connection dropped before the device had the whole file.');
+      done(restarted ? 'Not installed: the device restarted (' + s.live.restart_reason + ').'
+                     : 'Not installed: the connection dropped before the device had the whole file.');
     }).catch(() => setTimeout(tick, 2000));
     setTimeout(tick, 5000);
   };

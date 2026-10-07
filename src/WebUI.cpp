@@ -482,6 +482,9 @@ static void httpUpdateUpload() {
         if (updateStarted && updateError.length() == 0) {
             updateWritten = Update.end(true);
             if (!updateWritten) updateError = Update.errorString();
+            // The image boots at the next restart, whatever causes it (even the loop watchdog,
+            // if WebServer then hangs on the rest of the request): record where it came from now.
+            if (updateWritten) noteFirmwareUpdateInstalled();
         }
     } else if (up.status == UPLOAD_FILE_ABORTED) {
         // The connection dropped. WebServer does not call httpUpdateDone after this.
@@ -491,7 +494,6 @@ static void httpUpdateUpload() {
             // already the boot slot: finish as httpUpdateDone would.
             updateStarted = updateWritten = false;
             simplePrintln("Firmware update written, but the connection closed before the reply; restarting into it");
-            noteFirmwareUpdateInstalled();
             scheduleReboot(RebootKind::Plain, 1000, "firmware update");
             return;
         }
@@ -518,7 +520,6 @@ static void httpUpdateDone() {
         return;
     }
     simplePrintln("Firmware update written; restarting into it");
-    noteFirmwareUpdateInstalled();
     sendOk();
     scheduleReboot(RebootKind::Plain, 1000, "firmware update");
 }

@@ -303,6 +303,11 @@ async function streamingScenario(base) {
   check(await text(page, 'fwMsg') === 'Not installed: the connection dropped before the device had the whole file.',
     'says the update was not installed', await text(page, 'fwMsg'));
   check(!(await page.evaluate(overlayShown)), 'overlay gone once the device answered');
+  await pick([0xe9, 0x03, 0x02, 0x20]);   // the mock restarts for another reason
+  await page.evaluate("document.getElementById('fwInstall').click()");
+  await waitFor(page, "document.getElementById('fwMsg').textContent.startsWith('Not installed: the device restarted')", 'restart for another reason', 15000);
+  check(await text(page, 'fwMsg') === 'Not installed: the device restarted (recovery: main loop stuck for 60 s).',
+    'names the restart reason', await text(page, 'fwMsg'));
 
   // Reboot shows the overlay and the page reloads when the device answers again.
   await page.evaluate("document.querySelector('[data-action=reboot]').click()");

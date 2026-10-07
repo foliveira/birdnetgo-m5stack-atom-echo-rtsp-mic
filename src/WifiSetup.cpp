@@ -106,7 +106,10 @@ static bool sameNetwork(const wifi_config_t& a, const wifi_config_t& b) {
 // network is then stored. Otherwise the previous one is put back and the station left
 // disconnected.
 template <typename Idle>
-static bool joinNewNetwork(const char* ssid, const char* password, Idle idle) {
+static bool joinNewNetwork(const char* ssidIn, const char* passwordIn, Idle idle) {
+    char ssid[33], password[65];   // idle() may serve a request that rewrites the caller's buffers
+    strlcpy(ssid, ssidIn, sizeof(ssid));
+    strlcpy(password, passwordIn, sizeof(password));
     wifi_config_t previous;
     if (esp_wifi_get_config(WIFI_IF_STA, &previous) != ESP_OK) return false;
     esp_wifi_set_storage(WIFI_STORAGE_RAM);
@@ -137,8 +140,8 @@ static bool joinNewNetwork(const char* ssid, const char* password, Idle idle) {
             conf.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
             if (esp_wifi_set_config(WIFI_IF_STA, &conf) == ESP_OK) return true;
         }
+        // NVS may hold part of it now: storage stays FLASH, so the restore below rewrites it.
         Serial.println("[WiFi] could not store the new network");
-        esp_wifi_set_storage(WIFI_STORAGE_RAM);
     }
     // Put the previous network back. After some failures the core's event task (higher priority
     // than this one) reconnects with WiFi.begin(), which writes back the configuration it read:
@@ -152,7 +155,11 @@ static bool joinNewNetwork(const char* ssid, const char* password, Idle idle) {
         wifi_config_t now;
         restored = esp_wifi_get_config(WIFI_IF_STA, &now) == ESP_OK && sameNetwork(now, previous);
     }
-    if (!restored) restartWithNote("recovery: WiFi trial not undone");   // NVS still has the previous one
+    // NVS still has the previous network, unless storing the new one failed part-way.
+    if (!restored) restartWithNote("recovery: WiFi trial not undone");
+    // A reconnect the event task had already begun may still be running with the new network's
+    // settings: stop it too. Anything it starts from now on reads the previous network.
+    WiFi.disconnect();
     esp_wifi_set_storage(WIFI_STORAGE_FLASH);
     WiFi.setAutoReconnect(true);
     return false;
@@ -214,6 +221,9 @@ public:
             Serial.printf("[Improv] joined, address %s; restarting\n", WiFi.localIP().toString().c_str());
             restartWithNote("joined a network sent over USB");
         }
+        // loop() was blocked for the whole change, so checkWiFi() saw no drop and no return:
+        // do what it does when the link comes back.
+        applyWifiTxPower(false);
         simplePrintln(String("WiFi: joined \"") + WiFi.SSID() + "\" sent over USB, address " + WiFi.localIP().toString());
     }
 };
@@ -376,14 +386,16 @@ static const char PAGE_HEAD[] =
         // Join outside the request handler so the reply above reaches the phone first.
         if (pendingAt && millis() - pendingAt > 500) {
             pendingAt = 0;
-            Serial.printf("[Setup] joining \"%s\"\n", pendSsid);
-            if (joinNewNetwork(pendSsid, pendPass, [&]() { dns.processNextRequest(); server.handleClient(); })) {
+            char trying[33];   // a request served during the join may replace pendSsid
+            strlcpy(trying, pendSsid, sizeof(trying));
+            Serial.printf("[Setup] joining \"%s\"\n", trying);
+            if (joinNewNetwork(trying, pendPass, [&]() { dns.processNextRequest(); server.handleClient(); })) {
                 Serial.printf("[Setup] joined, address %s; restarting\n", WiFi.localIP().toString().c_str());
                 delay(500);
                 restartWithNote("joined a network from the setup portal");
             }
             Serial.println("[Setup] join failed");
-            error = String("Could not join \"") + pendSsid + "\". Check the password and that it is a 2.4 GHz network.";
+            error = String("Could not join \"") + trying + "\". Check the password and that it is a 2.4 GHz network.";
             lastActivity = millis();
         }
 

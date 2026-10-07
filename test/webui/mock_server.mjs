@@ -9,15 +9,15 @@ import { readFileSync } from 'node:fs';
 const port = Number(process.argv[2]) || 8080;
 const page = new URL('../../web/index.html', import.meta.url);
 const scenario = process.env.MOCK_SCENARIO || 'streaming';
-let boot = Date.now(), uptimeBase = 86400 * 2;
+let boot = Date.now(), uptimeBase = 86400 * 2, restartReason = 'scheduled reboot';
 
 const defaults = { rate: 32000, buffer: 1024, gain: 3, hpf: true, hpf_hz: 300, agc: false,
   tx: 19.5, ps: false, cpu: 80, led: 1, oh: true, oh_limit: 80, sched: false, sched_h: 24, name: 'atomecho' };
 let cfg = { ...defaults };
 let server = scenario !== 'latched', latched = scenario === 'latched', streaming = scenario === 'streaming';
 let sent = 0, clips = 0, downUntil = 0;
-// A restart: no answers for ms, then uptime counts from zero.
-function restart(ms) { downUntil = Date.now() + ms; boot = downUntil; uptimeBase = 0; }
+// A restart: no answers for ms, then uptime counts from zero and the reason is the note given.
+function restart(ms, reason) { downUntil = Date.now() + ms; boot = downUntil; uptimeBase = 0; restartReason = reason; }
 let listenRes = null, listenerIp = '';   // the one live listener, as on the device
 let ohNote = latched ? 'Thermal protection stopped the stream on 2026-10-07 at 14:03 UTC: 81.5 °C for 3 minutes (limit 80 °C).' : '';
 
@@ -43,7 +43,7 @@ function state() {
     fw: '3.1.0',
     cfg: { ...cfg, tx: snapTx(cfg.tx) },
     live: {
-      uptime: up + uptimeBase, restart_reason: 'scheduled reboot', ip: '192.168.1.50', ssid: 'Garden "AP"',
+      uptime: up + uptimeBase, restart_reason: restartReason, ip: '192.168.1.50', ssid: 'Garden "AP"',
       rssi: -63, bssid: '3C:84:6A:12:34:56', channel: 6,
       wifi_drops: 1, wifi_last_drop: 'BEACON_TIMEOUT', wifi_last_drop_s: 7380 + up, ps_suspended: false, heap_kb: 82, heap_min_kb: 71, cpu_mhz: cfg.cpu,
       temp_c: 51.2 + Math.random(), temp_max_c: 57.9,
@@ -158,10 +158,10 @@ createServer(async (req, res) => {
     else if (name === 'reboot' || name === 'defaults') {
       log(name === 'reboot' ? 'Web UI: reboot' : 'Web UI: restore defaults and reboot');
       if (name === 'defaults') cfg = { ...defaults };
-      restart(4000);
+      restart(4000, name === 'reboot' ? 'Web UI reboot' : 'defaults restored from the Web UI');
     } else if (name === 'forget_wifi') {
       log('Web UI: forget the WiFi network and restart into the setup portal');
-      restart(60000);
+      restart(60000, 'WiFi network forgotten from the Web UI');
     } else { json(res, 400, { error: 'unknown action' }); return; }
     json(res, 200, { ok: true });
   } else if (req.method === 'POST' && url.pathname === '/api/update') {
@@ -175,16 +175,18 @@ createServer(async (req, res) => {
     if (!multipart || start < 0 || raw.length <= start + 4) { json(res, 400, { error: 'no firmware file in the request' }); return; }
     if (raw[start + 4] !== 0xe9) { log('Firmware update failed: Wrong Magic Byte'); json(res, 400, { error: 'Wrong Magic Byte' }); return; }
     // Test hooks, by the image's second byte: 1 = the connection drops after the image was
-    // verified (the device restarts into it), 2 = it drops before the end of the file.
+    // verified (the device restarts into it), 2 = it drops before the end of the file, 3 = it
+    // drops and the device restarts for another reason before the end of the file.
     if (raw[start + 5] === 2) { log('Firmware update interrupted: the upload connection dropped'); req.socket.destroy(); return; }
+    if (raw[start + 5] === 3) { restart(4000, 'recovery: main loop stuck for 60 s'); req.socket.destroy(); return; }
     if (raw[start + 5] === 1) {
       log('Firmware update written, but the connection closed before the reply; restarting into it');
-      restart(4000);
+      restart(4000, 'firmware update');
       req.socket.destroy();
       return;
     }
     log('Firmware update written; restarting into it');
-    restart(4000);
+    restart(4000, 'firmware update');
     json(res, 200, { ok: true });
   } else if (req.method === 'GET' && url.pathname === '/api/listen') {
     const range = req.headers.range || '';

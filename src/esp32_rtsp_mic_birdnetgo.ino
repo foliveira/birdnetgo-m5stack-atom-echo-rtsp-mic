@@ -446,8 +446,10 @@ static void onWifiEvent(arduino_event_id_t event, arduino_event_info_t info) {
 
 // WiFi link supervision, once a second from loop(). The core reconnects by itself for most
 // disconnect reasons; this logs the transitions and nudges it if the link stays down. A running
-// RTSP session is left alone: when the link returns with the same address its TCP connection
-// survives, and the sender ends the session itself after SEND_STALL_LIMIT_MS without progress.
+// RTSP session is left to the sender: a disconnection clears the station's address and lwIP then
+// aborts every TCP connection on it (the core is built without
+// CONFIG_LWIP_TCP_KEEP_CONNECTION_WHEN_IP_CHANGES), so the sender's next send fails and the
+// session ends; the client reconnects once the link is back.
 static void checkWiFi() {
     static bool wasUp = true;
     static unsigned long downSince = 0, lastKick = 0, lastWeakWarn = 0;
@@ -1751,8 +1753,8 @@ static void confirmFirmware() {
     audioPrefs.end();
 }
 
-// Before restarting into an update, remember the slot it was installed from. Booting from that
-// slot again while the other one is marked invalid means the bootloader rolled the update back.
+// Once an update is written, remember the slot it was installed from. Booting from that slot
+// again while the other one is marked invalid means the bootloader rolled the update back.
 void noteFirmwareUpdateInstalled() {
     audioPrefs.begin("audio", false);
     audioPrefs.putString("otaFrom", esp_ota_get_running_partition()->label);
