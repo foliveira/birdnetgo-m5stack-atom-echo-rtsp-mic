@@ -93,8 +93,9 @@ async function openPage() {
       requests.push({ method: r.method, url: r.url, body: r.postData || '' });
     }
   });
+  const on = (method, fn) => listeners.push((msg) => { if (msg.method === method) fn(msg.params); });
   const close = async () => { ws.close(); await fetch(CDP + '/json/close/' + target.id); };
-  return { send, once, evaluate, requests, dialogs, close };
+  return { send, once, on, evaluate, requests, dialogs, close };
 }
 
 async function load(page, url, width = 1280, height = 900, mobile = false) {
@@ -288,6 +289,21 @@ async function streamingScenario(base) {
   await waitFor(page, "getComputedStyle(document.getElementById('overlay')).display === 'flex'", 'restart overlay after an update');
   await waitFor(page, "getComputedStyle(document.getElementById('overlay')).display !== 'flex'", 'page reloaded after the update', 15000);
 
+  // The reply is lost after the whole file went out: the device's uptime shows whether it restarted.
+  const overlayShown = "getComputedStyle(document.getElementById('overlay')).display === 'flex'";
+  await pick([0xe9, 0x01, 0x02, 0x20]);   // the mock installs it and restarts
+  await page.evaluate("document.getElementById('fwInstall').click()");
+  await waitFor(page, overlayShown, 'overlay while the page checks a lost reply');
+  await waitFor(page, `!(${overlayShown}) && document.getElementById('status').textContent !== 'Loading…'`,
+    'page reloaded after the restart', 15000);
+  check(await text(page, 'fwMsg') === '', 'no error after a lost reply and a restart', await text(page, 'fwMsg'));
+  await pick([0xe9, 0x02, 0x02, 0x20]);   // the mock loses the end of the file
+  await page.evaluate("document.getElementById('fwInstall').click()");
+  await waitFor(page, "document.getElementById('fwMsg').textContent.startsWith('Not installed')", 'lost reply without a restart', 15000);
+  check(await text(page, 'fwMsg') === 'Not installed: the connection dropped before the device had the whole file.',
+    'says the update was not installed', await text(page, 'fwMsg'));
+  check(!(await page.evaluate(overlayShown)), 'overlay gone once the device answered');
+
   // Reboot shows the overlay and the page reloads when the device answers again.
   await page.evaluate("document.querySelector('[data-action=reboot]').click()");
   await waitFor(page, "getComputedStyle(document.getElementById('overlay')).display === 'flex'", 'reboot overlay');
@@ -316,22 +332,58 @@ async function latchedScenario(base) {
   await page.close();
 }
 
-// The device answers only to its current name, so a page opened by the old name has to move on
-// after a rename. The mock is named "localhost" here, a name the browser resolves.
+// Serve the page's requests for host (a name the browser cannot resolve here) from base; the page
+// still sees its own URL. Origin follows, as Host and Origin would agree on the device.
+async function mapHost(page, host, base) {
+  page.on('Fetch.requestPaused', (p) => {
+    const u = new URL(p.request.url);
+    const headers = Object.entries(p.request.headers).map(([name, value]) =>
+      ({ name, value: name.toLowerCase() === 'origin' ? new URL(base).origin : value }));
+    page.send('Fetch.continueRequest', { requestId: p.requestId, url: new URL(u.pathname + u.search, base).href, headers });
+  });
+  await page.send('Fetch.enable', { patterns: [{ urlPattern: `http://${host}/*` }] });
+}
+
+// The device answers only to its current name, so a page opened by the old name moves on after a
+// rename: to the new .local name, or to the device's address (192.168.1.50 in the mock).
 async function renameScenario(port) {
-  await fetch(`http://127.0.0.1:${port}/api/settings`, { method: 'POST', body: new URLSearchParams({ name: 'localhost' }) });
-  const page = await openPage();
+  const base = `http://127.0.0.1:${port}/`;
+  const nameMock = (name) => fetch(base + 'api/settings', { method: 'POST', body: new URLSearchParams({ name }) });
+  const rename = async (page, name) => {
+    page.requests.length = 0;
+    await setValue(page, 'name', name);
+    await page.evaluate(`${formOf('name')}.requestSubmit()`);
+  };
+  const navigatesTo = async (page, url) => {
+    for (const end = Date.now() + 4000; Date.now() < end; await sleep(50)) {
+      if (page.requests.some((r) => r.url === url)) return true;
+    }
+    return page.requests.filter((r) => !r.url.includes('/api/')).map((r) => r.url);
+  };
+
+  await nameMock('atomecho');
+  let page = await openPage();
+  await mapHost(page, `atomecho.local:${port}`, base);
+  await load(page, `http://atomecho.local:${port}/`);
+  await rename(page, 'garden');
+  let to = await navigatesTo(page, `http://garden.local:${port}/`);
+  check(to === true, 'a page opened as name.local continues at the new name', to);
+  await page.close();
+
+  await nameMock('localhost');
+  page = await openPage();
   await load(page, `http://localhost:${port}/`);
-  await setValue(page, 'name', 'garden');
-  await page.evaluate(`${formOf('name')}.requestSubmit()`);
-  let url = '';
-  for (const end = Date.now() + 4000; Date.now() < end; await sleep(50)) {
-    // While the browser switches to the new site the page answers "not attached": ask again.
-    const h = await page.send('Page.getNavigationHistory').catch(() => null);
-    if (h) url = h.entries[h.currentIndex].url;
-    if (url.includes('garden')) break;
-  }
-  check(url === `http://garden.local:${port}/`, 'a page opened by the old name continues at the new one', url);
+  await rename(page, 'pond');
+  to = await navigatesTo(page, `http://192.168.1.50:${port}/`);
+  check(to === true, 'a page opened by another name continues at the address', to);
+  await page.close();
+
+  await nameMock('127');   // a name that looks like the start of the address
+  page = await openPage();
+  await load(page, base);
+  await rename(page, 'garden');
+  await waitFor(page, `${formOf('name')}.querySelector('.msg').textContent === 'Saved.'`, 'name saved by address');
+  check(await page.evaluate('location.href') === base, 'a page opened by address stays', await page.evaluate('location.href'));
   await page.close();
 }
 

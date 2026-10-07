@@ -1703,7 +1703,8 @@ static void checkButton() {
 // ends leaves the device unreachable until a power cycle. The core's WebServer can cause one: it
 // reads a multipart request body that lacks the parts it expects forever, even after the client
 // has gone. An esp_timer callback (core 0) restarts the device once a pass has taken
-// LOOP_STUCK_MS. Long work inside a single pass (a firmware upload) calls keepLoopAlive().
+// LOOP_STUCK_MS. The setup portal's loop is watched the same way. Long work inside a single pass
+// (a firmware upload, a WiFi join) calls keepLoopAlive().
 #define LOOP_STUCK_MS 60000
 static volatile uint32_t loopAliveMs = 0;
 
@@ -1713,7 +1714,7 @@ void keepLoopAlive() {
 
 static void checkLoopAlive(void*) {
     const uint32_t alive = loopAliveMs;   // read before millis(), as with lastCaptureOkMs
-    if (millis() - alive > LOOP_STUCK_MS) restartWithNote("recovery: loop() stuck for 60 s");
+    if (millis() - alive > LOOP_STUCK_MS) restartWithNote("recovery: main loop stuck for 60 s");
 }
 
 static void startLoopWatchdog() {
@@ -1819,6 +1820,7 @@ void setup() {
         ledShow(LED_SETUP);
         simplePrintln(wifiHasStoredCredentials() ? "WiFi: stored network not reachable, starting setup portal"
                                                  : "WiFi: no network configured, starting setup portal");
+        startLoopWatchdog();
         wifiRunSetupPortal(SETUP_AP_NAME, deviceName, FW_VERSION);   // restarts the device
     }
     simplePrintln("WiFi connected: " + WiFi.localIP().toString() + " on " + WiFi.SSID() +

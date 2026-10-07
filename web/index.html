@@ -337,10 +337,12 @@ for (const form of forms) {
     const oldName = st && st.cfg.name;
     try {
       const s = await (await api('/api/settings', body)).json();
-      // The device answers only to its current name: a page opened by the old one moves on.
-      const host = location.hostname.toLowerCase();
-      if (oldName && s.cfg.name !== oldName && (host === oldName || host.startsWith(oldName + '.'))) {
-        location.href = 'http://' + s.cfg.name + '.local' + (location.port ? ':' + location.port : '') + '/';
+      // The device answers only to its current name, so a page opened by the old one moves on:
+      // to the new .local name if it used .local (mDNS knows it at once), else to the address.
+      const host = location.hostname.toLowerCase().replace(/\.$/, '');
+      if (oldName && s.cfg.name !== oldName && !/^[\d.]+$/.test(host) && (host === oldName || host.startsWith(oldName + '.'))) {
+        const to = host === oldName + '.local' ? s.cfg.name + '.local' : s.live.ip;
+        location.href = 'http://' + to + (location.port ? ':' + location.port : '') + '/';
         return;
       }
       for (const el of dirtyFields(form)) el.classList.remove('dirty');
@@ -420,12 +422,20 @@ $('fwInstall').onclick = () => {
     try { err = JSON.parse(xhr.responseText).error || err; } catch (e) { /* not JSON */ }
     done('Not installed: ' + err);
   };
-  // Once the whole file is out, a lost reply can mean the device is already restarting into it.
+  // After the browser has sent the whole file a lost reply can mean the device is restarting into
+  // it, or that the end of the file never arrived. Its uptime tells which.
   let sent = false;
+  const upBefore = st ? st.live.uptime : 0, t0 = Date.now();
   xhr.upload.onload = () => { sent = true; };
   xhr.onerror = () => {
-    if (sent) { uploading = false; waitForReboot(); return; }
-    done('Upload failed: the connection dropped.');
+    if (!sent) { done('Upload failed: the connection dropped.'); return; }
+    showOverlay('Waiting for the device…');
+    const tick = () => fetch('/api/state', { cache: 'no-store' }).then((r) => r.json()).then((s) => {
+      if (s.live.uptime < upBefore + (Date.now() - t0) / 1000 - 3) { location.reload(); return; }
+      $('overlay').style.display = 'none';
+      done('Not installed: the connection dropped before the device had the whole file.');
+    }).catch(() => setTimeout(tick, 2000));
+    setTimeout(tick, 5000);
   };
   uploading = true;
   clearTimeout(timer);

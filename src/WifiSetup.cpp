@@ -1,5 +1,6 @@
 #include "WifiSetup.h"
 
+#include "App.h"
 #include "ImprovSerial.h"
 #include "RestartInfo.h"
 
@@ -63,8 +64,9 @@ static int netCount = 0;
 static uint32_t lastScanAt = 0;
 
 static void scanNetworks() {
-    netCount = 0;
     const int n = WiFi.scanNetworks();
+    if (n < 0) return;   // the scan failed (the station was busy connecting): keep the last list
+    netCount = 0;
     for (int i = 0; i < n; i++) {
         String ssid = WiFi.SSID(i);
         if (ssid.length() == 0 || ssid.length() > 32) continue;   // hidden network
@@ -92,23 +94,67 @@ static void scanNetworks() {
     }
 }
 
-// Try a network the user entered, for up to 20 s, running idle() while waiting. WiFi.begin()
-// stores the network in NVS before trying it, so the previous one is put back if the join fails:
-// a mistyped password, or anyone in range of the open setup network, must not replace a network
-// that works once the router is back.
+static bool sameNetwork(const wifi_config_t& a, const wifi_config_t& b) {
+    return strncmp((const char*)a.sta.ssid, (const char*)b.sta.ssid, sizeof(a.sta.ssid)) == 0 &&
+           strncmp((const char*)a.sta.password, (const char*)b.sta.password, sizeof(a.sta.password)) == 0;
+}
+
+// Try a network the user entered, for up to 20 s, running idle() while waiting. The driver keeps
+// its configuration in RAM during the attempt, so the stored network stays in NVS until the new
+// one has joined: a mistyped password, anyone in range of the open setup network, or a reset
+// during the attempt cannot replace a network that works once the router is back. A joined
+// network is then stored. Otherwise the previous one is put back and the station left
+// disconnected.
 template <typename Idle>
 static bool joinNewNetwork(const char* ssid, const char* password, Idle idle) {
     wifi_config_t previous;
-    const bool havePrevious = esp_wifi_get_config(WIFI_IF_STA, &previous) == ESP_OK;
-    WiFi.begin(ssid, password);
-    const uint32_t t0 = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 20000) {
-        idle();
-        delay(10);
+    if (esp_wifi_get_config(WIFI_IF_STA, &previous) != ESP_OK) return false;
+    esp_wifi_set_storage(WIFI_STORAGE_RAM);
+    // Leave the current network first, so its connection cannot pass for the new one.
+    if (WiFi.status() == WL_CONNECTED) {
+        WiFi.disconnect();
+        for (int i = 0; i < 200 && WiFi.status() == WL_CONNECTED; i++) delay(10);
     }
-    if (WiFi.status() == WL_CONNECTED) return true;
-    WiFi.disconnect();   // stop the core's retries; in the portal the access point stays up
-    if (havePrevious) esp_wifi_set_config(WIFI_IF_STA, &previous);
+    bool joined = false;
+    if (WiFi.status() != WL_CONNECTED) {
+        WiFi.begin(ssid, password);
+        for (const uint32_t t0 = millis(); millis() - t0 < 20000;) {
+            if (WiFi.status() == WL_CONNECTED && WiFi.SSID() == ssid) {
+                joined = true;
+                break;
+            }
+            keepLoopAlive();
+            idle();
+            delay(10);
+        }
+    }
+    if (joined) {
+        // Store it, with the scan settings wifiJoinStored would otherwise write at the next boot.
+        wifi_config_t conf;
+        esp_wifi_set_storage(WIFI_STORAGE_FLASH);
+        if (esp_wifi_get_config(WIFI_IF_STA, &conf) == ESP_OK) {
+            conf.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
+            conf.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
+            if (esp_wifi_set_config(WIFI_IF_STA, &conf) == ESP_OK) return true;
+        }
+        Serial.println("[WiFi] could not store the new network");
+        esp_wifi_set_storage(WIFI_STORAGE_RAM);
+    }
+    // Put the previous network back. After some failures the core's event task (higher priority
+    // than this one) reconnects with WiFi.begin(), which writes back the configuration it read:
+    // switch that off, disconnect, and check that the restore holds.
+    WiFi.setAutoReconnect(false);
+    WiFi.disconnect();
+    bool restored = false;
+    for (int i = 0; i < 3 && !restored; i++) {
+        delay(100);
+        esp_wifi_set_config(WIFI_IF_STA, &previous);
+        wifi_config_t now;
+        restored = esp_wifi_get_config(WIFI_IF_STA, &now) == ESP_OK && sameNetwork(now, previous);
+    }
+    if (!restored) restartWithNote("recovery: WiFi trial not undone");   // NVS still has the previous one
+    esp_wifi_set_storage(WIFI_STORAGE_FLASH);
+    WiFi.setAutoReconnect(true);
     return false;
 }
 
@@ -130,8 +176,22 @@ public:
     const char* const* info() override { return infoStrings; }
     int networks(improv::Network* out, int max) override {
         // The flasher asks again 3 s after each answer while its form is open. A scan takes the
-        // radio off its channel for 1 to 4 s, so answer from the last one for 15 s.
-        if (lastScanAt == 0 || millis() - lastScanAt > 15000) scanNetworks();
+        // radio off its channel for 1 to 4 s, more than the RTSP frame pool can cover: reuse the
+        // last list for 15 s, and for as long as a client streams.
+        if (lastScanAt == 0 || (!isStreaming && millis() - lastScanAt > 15000)) {
+            // A scan fails while the station is trying to connect: pause that meanwhile.
+            const bool pause = !inPortal && WiFi.status() != WL_CONNECTED;
+            if (pause) {
+                WiFi.setAutoReconnect(false);
+                WiFi.disconnect();
+                delay(100);
+            }
+            scanNetworks();
+            if (pause) {
+                WiFi.setAutoReconnect(true);
+                WiFi.begin();
+            }
+        }
         int n = 0;
         for (; n < netCount && n < max; n++) {
             strlcpy(out[n].ssid, nets[n].ssid, sizeof(out[n].ssid));
@@ -148,8 +208,13 @@ public:
         return false;
     }
     void joined() override {
-        Serial.printf("[Improv] joined, address %s; restarting\n", WiFi.localIP().toString().c_str());
-        restartWithNote("joined a network sent over USB");
+        // The setup portal runs inside setup(): restart for the rest of it. In normal operation
+        // everything follows the new network by itself (mDNS, the servers, WiFi supervision).
+        if (inPortal) {
+            Serial.printf("[Improv] joined, address %s; restarting\n", WiFi.localIP().toString().c_str());
+            restartWithNote("joined a network sent over USB");
+        }
+        simplePrintln(String("WiFi: joined \"") + WiFi.SSID() + "\" sent over USB, address " + WiFi.localIP().toString());
     }
 };
 ImprovLink improvLink;
@@ -302,6 +367,7 @@ static const char PAGE_HEAD[] =
     server.begin();
 
     for (;;) {
+        keepLoopAlive();   // the loop watchdog covers the portal too: its web server can hang
         dns.processNextRequest();
         server.handleClient();
         if (improvPoll(hostname, firmwareVersion, true)) lastActivity = millis();   // the flasher, over USB

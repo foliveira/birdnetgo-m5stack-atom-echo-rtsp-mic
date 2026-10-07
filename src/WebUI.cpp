@@ -474,7 +474,7 @@ static void httpUpdateUpload() {
         }
         updateStarted = true;
     } else if (up.status == UPLOAD_FILE_WRITE) {
-        keepLoopAlive();   // the whole upload runs inside one loop() pass
+        if (updateStarted) keepLoopAlive();   // the whole upload runs inside one loop() pass
         if (updateStarted && updateError.length() == 0 && Update.write(up.buf, up.currentSize) != up.currentSize) {
             updateError = Update.errorString();
         }
