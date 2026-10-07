@@ -6,6 +6,7 @@
 #include <errno.h>
 #include <lwip/sockets.h>
 #include <esp_heap_caps.h>
+#include "AudioDsp.h"
 #include "WebUI.h"
 #include "WifiSetup.h"
 
@@ -67,6 +68,7 @@ volatile uint32_t i2sReadErrors = 0;
 volatile uint16_t queueHighWater = 0;
 volatile uint32_t sendStallMaxMs = 0;
 volatile uint32_t sendStallCount = 0;
+volatile uint32_t lastCaptureOkMs = 0;         // last successful i2s_read (capture watchdog)
 
 portMUX_TYPE logMux = portMUX_INITIALIZER_UNLOCKED;  // guards the fixed-size log ring (WebUI.cpp)
 portMUX_TYPE hpfMux = portMUX_INITIALIZER_UNLOCKED;  // guards HPF coefficient hand-off
@@ -77,11 +79,11 @@ portMUX_TYPE hpfMux = portMUX_INITIALIZER_UNLOCKED;  // guards HPF coefficient h
 const char* FW_VERSION_STR = FW_VERSION;
 
 // -- DEFAULT PARAMETERS (configurable via Web UI / API)
-#define DEFAULT_SAMPLE_RATE 16000  // M5Stack Atom Echo: 16kHz for PDM microphone
+#define DEFAULT_SAMPLE_RATE 32000  // audio up to 16 kHz: BirdNET analyses 0-15 kHz (16 kHz cut it at 8)
 #define DEFAULT_GAIN_FACTOR 3.0f
-#define DEFAULT_BUFFER_SIZE 1024   // 64ms @ 16kHz - good balance for BirdNET-Go
+#define DEFAULT_BUFFER_SIZE 1024   // 32 ms per RTP packet at 32 kHz
 #define DEFAULT_WIFI_TX_DBM 19.5f  // Default WiFi TX power in dBm
-#define DEFAULT_CPU_MHZ 80         // Plenty for 16 kHz DSP + ~260 kbit/s TCP; runs noticeably cooler than 160
+#define DEFAULT_CPU_MHZ 80         // Plenty for 48 kHz DSP + ~800 kbit/s TCP; runs noticeably cooler than 160
 #define DEFAULT_WIFI_POWER_SAVE false
 // High-pass filter defaults (to remove low-frequency rumble)
 #define DEFAULT_HPF_ENABLED true
@@ -95,11 +97,11 @@ const char* FW_VERSION_STR = FW_VERSION;
 #define OVERHEAT_LIMIT_STEP_C 5
 #define OVERHEAT_CONSECUTIVE_READINGS 3  // readings (1/min) at/above the limit before tripping
 
-// -- Pins (M5Stack Atom Echo with SPM1423 PDM Microphone)
-#define I2S_BCLK_PIN    19  // Bit Clock
-#define I2S_LRCLK_PIN   33  // Word Select / Left-Right Clock
-#define I2S_DATA_IN_PIN 23  // Microphone Data In
-#define I2S_DATA_OUT_PIN 22 // Speaker Data Out (not used for mic-only)
+// -- Pins (M5Stack Atom Echo: SPM1423 PDM microphone, NS4168 speaker amplifier)
+#define I2S_CLK_PIN     33  // PDM clock to the microphone (also the amplifier's LRCLK)
+#define I2S_DATA_IN_PIN 23  // PDM data from the microphone
+#define SPK_BCLK_PIN    19  // amplifier bit clock: unused, held low
+#define SPK_DATA_PIN    22  // amplifier data: unused, held low
 #define LED_PIN         27  // SK6812 RGB LED
 
 // -- Network identity
@@ -141,37 +143,21 @@ volatile uint16_t lastPeakAbs16 = 0;       // last block peak absolute value (0.
 volatile uint32_t audioClipCount = 0;      // total blocks where clipping occurred
 volatile bool audioClippedLastBlock = false; // clipping occurred in last processed block
 volatile uint16_t peakHoldAbs16 = 0;       // peak hold (recent window)
-unsigned long peakHoldUntilMs = 0; // when to clear hold
+unsigned long peakHoldSinceMs = 0;         // when the held peak was set (cleared after 3 s)
 
 // -- LED mode: 0=off, 1=static, 2=level
 uint8_t ledMode = 1;  // Default: static green during streaming
 
-// -- Automatic Gain Control (AGC)
+// -- Automatic Gain Control (AGC); the control law is agcUpdate() in AudioDsp.h
 bool agcEnabled = false;
 volatile float agcMultiplier = 1.0f;   // Current AGC multiplier (read by WebUI)
-const float AGC_TARGET_RMS = 0.15f;    // Target RMS as fraction of full scale (~-16 dBFS)
-const float AGC_MIN_MULT = 0.1f;
-const float AGC_MAX_MULT = 10.0f;      // With 3.0x base gain, max effective = 30x
-const float AGC_ATTACK_RATE = 0.05f;   // Fast attack (gain reduction) per buffer
-const float AGC_RELEASE_RATE = 0.001f; // Slow release (gain increase) per buffer
 
-// -- High-pass filter (biquad) to cut low-frequency rumble
-struct Biquad {
-    float b0{1.0f}, b1{0.0f}, b2{0.0f}, a1{0.0f}, a2{0.0f};
-    float x1{0.0f}, x2{0.0f}, y1{0.0f}, y2{0.0f};
-    inline float process(float x) {
-        float y = b0 * x + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
-        x2 = x1; x1 = x; y2 = y1; y1 = y;
-        return y;
-    }
-    inline void reset() { x1 = x2 = y1 = y2 = 0.0f; }
-};
+// -- High-pass filter (biquad, AudioDsp.h) to cut low-frequency rumble
 bool highpassEnabled = DEFAULT_HPF_ENABLED;
 uint16_t highpassCutoffHz = DEFAULT_HPF_CUTOFF_HZ;
 Biquad hpf;                              // coefficients published by the loop task (under hpfMux)
 volatile uint32_t hpfVersion = 0;        // bumped on every coefficient update
-uint32_t hpfConfigSampleRate = 0;
-uint16_t hpfConfigCutoff = 0;
+#define DC_BLOCK_HZ 10.0f                // corner of the always-on DC blocker ahead of the HPF
 
 // -- Preferences for persistent settings
 Preferences audioPrefs;
@@ -268,41 +254,18 @@ void applyWifiPowerSave(bool log = true) {
 // Recompute HPF coefficients (2nd-order Butterworth high-pass) and publish them to the capture task.
 // The capture task keeps its own filter state, so changing the cutoff does not reset the filter.
 void updateHighpassCoeffs() {
-    if (!highpassEnabled) {
-        hpfConfigSampleRate = currentSampleRate;
-        hpfConfigCutoff = highpassCutoffHz;
-        return;
-    }
-    float fs = (float)currentSampleRate;
+    if (!highpassEnabled) return;
+    const float fs = (float)currentSampleRate;
     float fc = (float)highpassCutoffHz;
     if (fc < 10.0f) fc = 10.0f;
-    if (fc > fs * 0.45f) fc = fs * 0.45f; // keep reasonable
-
-    const float pi = 3.14159265358979323846f;
-    float w0 = 2.0f * pi * (fc / fs);
-    float cosw0 = cosf(w0);
-    float sinw0 = sinf(w0);
-    float Q = 0.70710678f; // Butterworth-like
-    float alpha = sinw0 / (2.0f * Q);
-
-    float b0 =  (1.0f + cosw0) * 0.5f;
-    float b1 = -(1.0f + cosw0);
-    float b2 =  (1.0f + cosw0) * 0.5f;
-    float a0 =  1.0f + alpha;
-    float a1 = -2.0f * cosw0;
-    float a2 =  1.0f - alpha;
+    if (fc > fs * 0.45f) fc = fs * 0.45f;
+    Biquad c;
+    designHighpass(c, fs, fc);
 
     portENTER_CRITICAL(&hpfMux);
-    hpf.b0 = b0 / a0;
-    hpf.b1 = b1 / a0;
-    hpf.b2 = b2 / a0;
-    hpf.a1 = a1 / a0;
-    hpf.a2 = a2 / a0;
+    hpf.b0 = c.b0; hpf.b1 = c.b1; hpf.b2 = c.b2; hpf.a1 = c.a1; hpf.a2 = c.a2;
     hpfVersion++;
     portEXIT_CRITICAL(&hpfMux);
-
-    hpfConfigSampleRate = currentSampleRate;
-    hpfConfigCutoff = (uint16_t)fc;
 }
 
 // Uptime -> "Xd Yh Zm Ts"
@@ -798,8 +761,8 @@ void setup_i2s_driver() {
     i2sEventQueue = NULL;
 
     // Hardware ring: 8 buffers x 512 frames. The driver keeps one buffer in flight, so 7 x 512 =
-    // 3584 samples (224 ms at 16 kHz) can wait for the capture task before samples are lost; the
-    // old 6 x 60 ring gave 22.5 ms. (Buffer bytes stay well under the driver's 4092-byte limit.)
+    // 3584 samples (112 ms at 32 kHz, 224 ms at 16 kHz) can wait for the capture task before
+    // samples are lost. (Buffer bytes stay well under the driver's 4092-byte limit.)
     i2s_config_t i2s_config = {
         // PDM mode required for SPM1423 microphone on Atom Echo
         .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX | I2S_MODE_PDM),
@@ -816,16 +779,20 @@ void setup_i2s_driver() {
         .dma_buf_len = I2S_DMA_BUF_LEN,
         .use_apll = false,
         .tx_desc_auto_clear = false,
-        .fixed_mclk = 0
+        .fixed_mclk = 0,
+        .mclk_multiple = I2S_MCLK_MULTIPLE_DEFAULT,
+        .bits_per_chan = I2S_BITS_PER_CHAN_DEFAULT
     };
 
+    // PDM RX needs only the clock (on WS) and data in. M5's example also routes the speaker's
+    // bit clock and data because it shares the config with playback; a microphone does not.
     i2s_pin_config_t pin_config = {
 #if (ESP_IDF_VERSION > ESP_IDF_VERSION_VAL(4, 3, 0))
         .mck_io_num = I2S_PIN_NO_CHANGE,
 #endif
-        .bck_io_num = I2S_BCLK_PIN,
-        .ws_io_num = I2S_LRCLK_PIN,
-        .data_out_num = I2S_DATA_OUT_PIN,
+        .bck_io_num = I2S_PIN_NO_CHANGE,
+        .ws_io_num = I2S_CLK_PIN,
+        .data_out_num = I2S_PIN_NO_CHANGE,
         .data_in_num = I2S_DATA_IN_PIN
     };
 
@@ -843,16 +810,15 @@ void setup_i2s_driver() {
     i2s_set_pin(I2S_NUM_0, &pin_config);
     i2s_set_clk(I2S_NUM_0, currentSampleRate, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_MONO);
 
-    simplePrintln("I2S ready (PDM mode): " + String(currentSampleRate) + "Hz, buffer " +
-                  String(currentBufferSize) + " samples, DMA slack 3584 samples");
+    simplePrintln("I2S ready (PDM mode): " + String(currentSampleRate) + " Hz, " +
+                  String(currentBufferSize) + " samples/packet, DMA slack " +
+                  String((I2S_DMA_BUF_COUNT - 1) * I2S_DMA_BUF_LEN * 1000UL / currentSampleRate) + " ms");
 }
 
 // ================== CAPTURE TASK (core 1) ==================
 // Runs from boot for the life of the device. Always meters the signal (so the Web UI level works
 // without a client) and, while a session is active, produces complete RTP frames into readyQ.
 // It is also the only LED writer after setup(), which removes the LED ownership race.
-
-static inline uint16_t bswap16(uint16_t v) { return (uint16_t)((v << 8) | (v >> 8)); }
 
 // Returns the number of DMA buffers the driver discarded since the last call.
 static inline uint32_t drainI2sEvents() {
@@ -892,11 +858,11 @@ static uint32_t ledColorFor(bool streaming, bool clipped, float pct) {
 }
 
 static void captureTask(void* arg) {
-    Serial.printf("[Capture] task started on core %d\n", xPortGetCoreID());
-
     int16_t* captureBuf = NULL;
     uint16_t capSamples = 0;
 
+    DcBlocker dc;                          // removes the PDM decoder's DC offset (state lives here)
+    uint32_t dcRate = 0;                   // sample rate dc was designed for
     Biquad localHpf;                       // coefficients + filter state live here
     uint32_t localHpfVersion = 0xFFFFFFFF;
     bool hpfWasEnabled = false;
@@ -905,7 +871,6 @@ static void captureTask(void* arg) {
 
     uint32_t lastLed = 0xFFFFFFFF;         // impossible value forces the first draw
     unsigned long lastLedUpdate = 0;
-    unsigned long lastStatsLog = millis();
 
     for (;;) {
         // --- pause protocol: the loop task reinstalls I2S / reallocates the pool while we are parked ---
@@ -919,6 +884,8 @@ static void captureTask(void* arg) {
             capturePaused = false;
             localHpfVersion = 0xFFFFFFFF;  // sample rate may have changed: refetch coefficients
             localHpf.reset();
+            dcRate = 0;
+            lastCaptureOkMs = millis();
             continue;
         }
 
@@ -933,6 +900,13 @@ static void captureTask(void* arg) {
                 vTaskDelay(pdMS_TO_TICKS(1000));
                 continue;
             }
+        }
+        const uint32_t rate = appliedSampleRate;   // changes only while this task is parked
+        if (rate == 0) { vTaskDelay(pdMS_TO_TICKS(100)); continue; }   // I2S driver not installed
+        if (rate != dcRate) {
+            dc.design((float)rate, DC_BLOCK_HZ);
+            dc.reset();
+            dcRate = rate;
         }
 
         // --- one packet worth of samples (blocks in the driver until the DMA has them) ---
@@ -954,6 +928,7 @@ static void captureTask(void* arg) {
             if (r != ESP_OK) vTaskDelay(pdMS_TO_TICKS(20));
             continue;
         }
+        lastCaptureOkMs = millis();
 
         // --- HPF coefficient hand-off (published by the loop under hpfMux) ---
         const bool hpfOn = highpassEnabled;
@@ -969,14 +944,11 @@ static void captureTask(void* arg) {
         }
         hpfWasEnabled = hpfOn;
 
+        // Gain ramps linearly from the last block's value to this block's target, so AGC steps and
+        // manual changes glide over one block instead of clicking at the boundary.
         const bool agcOn = agcEnabled;
-        float effectiveGain = currentGainFactor;
-        if (agcOn) effectiveGain *= localAgcMult;
-        if (appliedGain < 0.0f) appliedGain = effectiveGain;
-        // Ramp linearly from last block's gain to this block's target: AGC steps and manual gain
-        // changes glide over 64 ms instead of producing a click at the block boundary.
-        float g = appliedGain;
-        const float gStep = (effectiveGain - appliedGain) / (float)capSamples;
+        const float targetGain = currentGainFactor * (agcOn ? localAgcMult : 1.0f);
+        if (appliedGain < 0.0f) appliedGain = targetGain;
 
         // --- output frame: only while streaming; when the pool is exhausted, recycle the OLDEST
         //     queued frame so the receiver gets the freshest audio and latency stays bounded ---
@@ -988,38 +960,16 @@ static void captureTask(void* arg) {
                 xQueueReceive(readyQ, &frame, 0);
             }
         }
-        int16_t* out = frame ? (int16_t*)(frame->data + FRAME_HDR_BYTES) : NULL;
 
-        // --- DSP: HPF -> gain -> clip -> metering, written big-endian straight into the frame ---
-        float peakAbs = 0.0f, sumSquares = 0.0f;
-        bool clipped = false;
-        for (uint16_t i = 0; i < capSamples; i++) {
-            float s = (float)captureBuf[i];
-            if (hpfOn) s = localHpf.process(s);
-            g += gStep;
-            s *= g;
-            float a = fabsf(s);
-            if (a > peakAbs) peakAbs = a;
-            sumSquares += s * s;
-            if (s > 32767.0f)       { s = 32767.0f;  clipped = true; }
-            else if (s < -32768.0f) { s = -32768.0f; clipped = true; }
-            if (out) out[i] = (int16_t)bswap16((uint16_t)(int16_t)s);
-        }
-        appliedGain = effectiveGain;
+        // --- DSP (AudioDsp.h), written big-endian straight into the frame ---
+        const BlockStats st = processBlock(captureBuf, capSamples, dc, hpfOn ? &localHpf : NULL,
+                                           appliedGain, targetGain,
+                                           frame ? frame->data + FRAME_HDR_BYTES : NULL);
+        appliedGain = targetGain;
 
-        // --- AGC ---
         if (agcOn) {
-            float rms = sqrtf(sumSquares / (float)capSamples) / 32767.0f;
-            if (rms > 0.001f) {  // Don't adjust on silence
-                float ratio = AGC_TARGET_RMS / rms;
-                if (ratio < 1.0f) {
-                    localAgcMult += (ratio - 1.0f) * AGC_ATTACK_RATE * localAgcMult;   // fast attack
-                } else {
-                    localAgcMult += (ratio - 1.0f) * AGC_RELEASE_RATE * localAgcMult;  // slow release
-                }
-                if (localAgcMult < AGC_MIN_MULT) localAgcMult = AGC_MIN_MULT;
-                if (localAgcMult > AGC_MAX_MULT) localAgcMult = AGC_MAX_MULT;
-            }
+            const float rms = sqrtf(st.sumSquares / (float)capSamples) / 32767.0f;
+            localAgcMult = agcUpdate(localAgcMult, rms, (float)capSamples / (float)rate);
             agcMultiplier = localAgcMult;
         } else {
             localAgcMult = 1.0f;
@@ -1055,35 +1005,26 @@ static void captureTask(void* arg) {
         }
 
         // --- metering for the Web UI ---
-        if (peakAbs > 32767.0f) peakAbs = 32767.0f;
+        const float peakAbs = st.peak > 32767.0f ? 32767.0f : st.peak;
         lastPeakAbs16 = (uint16_t)peakAbs;
-        audioClippedLastBlock = clipped;
-        if (clipped) audioClipCount++;
+        audioClippedLastBlock = st.clipped;
+        if (st.clipped) audioClipCount++;
         const unsigned long now = millis();
         if (lastPeakAbs16 > peakHoldAbs16) {
             peakHoldAbs16 = lastPeakAbs16;
-            peakHoldUntilMs = now + 3000UL;
-        } else if (peakHoldAbs16 > 0 && now > peakHoldUntilMs) {
+            peakHoldSinceMs = now;
+        } else if (peakHoldAbs16 > 0 && now - peakHoldSinceMs > 3000UL) {
             peakHoldAbs16 = 0;
         }
 
         // --- LED (~10 Hz, only redrawn when the colour changes) ---
         if (now - lastLedUpdate > 100) {
             lastLedUpdate = now;
-            uint32_t c = ledColorFor(streaming, clipped, peakAbs / 32767.0f);
+            uint32_t c = ledColorFor(streaming, st.clipped, peakAbs / 32767.0f);
             if (c != lastLed) {
                 ledShow(c);
                 lastLed = c;
             }
-        }
-
-        // --- periodic serial stats (no heap use) ---
-        if (streaming && now - lastStatsLog > 30000) {
-            lastStatsLog = now;
-            Serial.printf("[Capture] sent=%u dropped=%u i2s_ovf=%u q=%u/%u hw=%u stall_max=%ums clip=%u agc=%.2f\n",
-                          audioPacketsSent, framesDroppedQueueFull, i2sOverruns,
-                          (unsigned)uxQueueMessagesWaiting(readyQ), framePoolCount, queueHighWater,
-                          sendStallMaxMs, audioClipCount, localAgcMult);
         }
     }
 }
@@ -1113,7 +1054,8 @@ static void resumeCapture() {
 
 static void startCaptureTask() {
     if (captureTaskHandle) return;
-    BaseType_t ok = xTaskCreatePinnedToCore(captureTask, "AudioCapture", 8192, NULL, 20,
+    lastCaptureOkMs = millis();
+    BaseType_t ok = xTaskCreatePinnedToCore(captureTask, "AudioCapture", 4096, NULL, 20,
                                             &captureTaskHandle, 1);
     if (ok != pdPASS) {
         captureTaskHandle = NULL;
@@ -1554,6 +1496,13 @@ void setup() {
     Serial.setTxBufferSize(1024);
     Serial.begin(115200);
 
+    // The NS4168 speaker amplifier shares the PDM clock line with the microphone. Hold its bit
+    // clock and data inputs low so it never sees a usable I2S stream and stays idle.
+    pinMode(SPK_BCLK_PIN, OUTPUT);
+    digitalWrite(SPK_BCLK_PIN, LOW);
+    pinMode(SPK_DATA_PIN, OUTPUT);
+    digitalWrite(SPK_DATA_PIN, LOW);
+
     // The first write also sets up the RMT channel, here on the loop task (core 1); the capture
     // task takes over the LED once it runs.
     ledShow(LED_STARTUP);
@@ -1685,6 +1634,19 @@ void loop() {
     if (millis() - lastWiFiCheck >= 1000) {
         lastWiFiCheck = millis();
         checkWiFi();
+    }
+
+    // Session statistics on serial every 30 s. Printed here, not by the capture task: a full
+    // UART buffer would block a priority-20 task that has only ~100 ms of DMA slack at 32 kHz.
+    static unsigned long lastStatsLog = 0;
+    if (isStreaming && millis() - lastStatsLog >= 30000) {
+        lastStatsLog = millis();
+        Serial.printf("[Stream] sent=%u dropped=%u i2s_ovf=%u q=%u/%u peak=%u stall_max=%ums clip=%u "
+                      "agc=%.2f stack_free capture=%u sender=%u\n",
+                      audioPacketsSent, framesDroppedQueueFull, i2sOverruns, streamQueueDepth(),
+                      framePoolCount, queueHighWater, sendStallMaxMs, audioClipCount, agcMultiplier,
+                      captureTaskHandle ? (unsigned)uxTaskGetStackHighWaterMark(captureTaskHandle) : 0,
+                      senderTaskHandle ? (unsigned)uxTaskGetStackHighWaterMark(senderTaskHandle) : 0);
     }
 
     checkScheduledReset();
