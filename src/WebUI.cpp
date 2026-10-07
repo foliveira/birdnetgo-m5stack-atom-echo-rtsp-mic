@@ -462,6 +462,7 @@ static void httpUpdateDone() {
         return;
     }
     simplePrintln("Firmware update written; restarting into it");
+    noteFirmwareUpdateInstalled();
     sendOk();
     scheduleReboot(RebootKind::Plain, 1000, "firmware update");
 }

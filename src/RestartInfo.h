@@ -14,5 +14,9 @@ const char* restartReason();
 // xtensa-esp32-elf-addr2line against this build's firmware.elf. Empty otherwise.
 const char* restartCrashDetails();
 
+// The bootloader went back to this firmware because the update installed before this boot
+// restarted before confirming itself: say so in front of the reason.
+void restartInfoMarkRollback();
+
 // Restart now and report `why` as the reason on the next boot.
 [[noreturn]] void restartWithNote(const char* why);

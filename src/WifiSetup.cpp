@@ -1,5 +1,7 @@
 #include "WifiSetup.h"
 
+#include "RestartInfo.h"
+
 #include <DNSServer.h>
 #include <WebServer.h>
 #include <WiFi.h>
@@ -231,7 +233,7 @@ static const char PAGE_HEAD[] =
             if (WiFi.status() == WL_CONNECTED) {
                 Serial.printf("[Setup] joined, address %s; restarting\n", WiFi.localIP().toString().c_str());
                 delay(500);
-                esp_restart();
+                restartWithNote("joined a network from the setup portal");
             }
             Serial.println("[Setup] join failed");
             error = String("Could not join \"") + pendSsid + "\". Check the password and that it is a 2.4 GHz network.";
@@ -253,8 +255,7 @@ static const char PAGE_HEAD[] =
             }
             if (WiFi.status() == WL_CONNECTED) {
                 Serial.println("[Setup] stored network reachable again; restarting");
-                delay(100);
-                esp_restart();
+                restartWithNote("setup portal: stored network is back");
             }
             WiFi.disconnect();   // stop the retries so the access point keeps a steady channel
             lastRetry = millis();
@@ -262,8 +263,7 @@ static const char PAGE_HEAD[] =
 
         if (idleTimeoutMs && millis() - lastActivity > idleTimeoutMs) {
             Serial.println("[Setup] idle, restarting to retry the stored network");
-            delay(100);
-            esp_restart();
+            restartWithNote("setup portal idle for 3 minutes");
         }
         delay(5);
     }

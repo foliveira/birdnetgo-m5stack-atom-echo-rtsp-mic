@@ -88,3 +88,4 @@ void clearThermalLatch();
 enum class RebootKind { Plain, RestoreDefaults, ForgetWifi };
 void scheduleReboot(RebootKind kind, uint32_t delayMs, const char* why);   // why: a string literal
 bool requestStreamStop(const char* reason);
+void noteFirmwareUpdateInstalled();   // right before restarting into a firmware update

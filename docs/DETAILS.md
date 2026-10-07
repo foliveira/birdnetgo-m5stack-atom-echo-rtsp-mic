@@ -63,7 +63,7 @@ A capture watchdog in `loop()` reinstalls the I2S driver when the capture task h
 Controllable consumers, largest first: the WiFi receiver with power save off (~80 to 100 mA), CPU 160 vs 80 MHz (~10 mA), transmit power (a few mA at this duty cycle), the LED (<2 mA at the brightness used). The internal temperature sensor is uncalibrated and reads high; thermal protection therefore requires three consecutive readings, one per minute, at or over the limit.
 
 ### Restart reasons and crash reports
-The Device card and the boot log show why the device last restarted: power on, reset pin, brownout, crash, watchdog, or the note the firmware left before restarting itself (`scheduled reboot`, `Web UI reboot`, `defaults restored from the Web UI`, `firmware update`, `WiFi network forgotten from the Web UI`, `WiFi network forgotten (button)`, `recovery: WiFi down for 10 min`, `recovery: sender task stuck`). Restarts by the setup portal show as `software restart`.
+The Device card and the boot log show why the device last restarted: power on, reset pin, brownout, crash, watchdog, or the note the firmware left before restarting itself (`scheduled reboot`, `Web UI reboot`, `defaults restored from the Web UI`, `firmware update`, `WiFi network forgotten from the Web UI`, `WiFi network forgotten (button)`, `recovery: WiFi down for 10 min`, `recovery: sender task stuck`, `joined a network from the setup portal`, `setup portal: stored network is back`, `setup portal idle for 3 minutes`).
 
 After a crash or watchdog reset the panic handler has written a core dump to flash. The boot log then has a line like
 ```
@@ -76,7 +76,7 @@ Decode it against the ELF file of the exact same build (releases include `firmwa
 ```
 
 ### Firmware updates
-`POST /api/update` writes the uploaded image to the other OTA slot with the core's Update library. The boot slot changes only after the whole image has been verified (checksum, SHA-256, chip type), so a truncated or wrong file leaves the running firmware in place. The new firmware boots in the "pending verify" state and the sketch confirms it after it has run for a minute with WiFi. If it restarts before that, the bootloader marks it invalid and boots the previous firmware. Rollback needs a bootloader built with rollback support; the one in this project's releases (Arduino-ESP32 2.0.17) has it, and only a USB flash replaces the bootloader.
+`POST /api/update` writes the uploaded image to the other OTA slot with the core's Update library. The boot slot changes only after the whole image has been verified (checksum, SHA-256, chip type), so a truncated or wrong file leaves the running firmware in place. The new firmware boots in the "pending verify" state and the sketch confirms it after it has run for a minute with WiFi. If it restarts before that, the bootloader marks it invalid and boots the previous firmware, which then reports `update rolled back after <reason>` as its last restart. Rollback needs a bootloader built with rollback support; the one in this project's releases (Arduino-ESP32 2.0.17) has it, and only a USB flash replaces the bootloader.
 
 ## Audio Tuning
 

@@ -16,7 +16,7 @@ This repository is a fork of [stedrow/birdnetgo-m5stack-atom-echo-rtsp-mic](http
 - RTP sequence numbers and timestamps advance for every captured frame, so a frame that does get dropped reaches BirdNET-Go as a gap instead of a click.
 - 32 kHz by default, which carries the whole 0 to 15 kHz band BirdNET analyses. A DC blocker, a 2nd-order high-pass filter (300 Hz by default), manual gain applied live with a per-sample ramp, and optional automatic gain control.
 - Web UI: signal level, stream and WiFi diagnostics, settings with validation, the log, and firmware updates. One 9 KB page, English only.
-- Firmware updates over WiFi. A new version that restarts within its first minute is rolled back to the previous one.
+- Firmware updates over WiFi. A new version that restarts before it has run for a minute with WiFi is rolled back to the previous one.
 - Prometheus metrics at `/metrics`: frames sent and dropped, stalls, WiFi drops, RSSI, temperature, signal level.
 - WiFi setup through a built-in captive portal; joins the strongest access point for the network name (mesh systems, repeaters).
 - Reports why the device last restarted, including the task and backtrace after a crash, why WiFi last dropped, and a microphone that stopped delivering signal.
@@ -49,7 +49,7 @@ vlc rtsp://atomecho.local:8554/audio
 
 **Web UI**: `http://atomecho.local/`
 
-If your computer does not resolve `.local` names, use the IP address from your router or from the serial log.
+BirdNET-Go running in Docker usually cannot resolve `.local` names. Use the device's IP address there (the Web UI and the serial log show it) and reserve that address for the device in your router's DHCP settings, so it does not change.
 
 ## Recommended Settings
 
@@ -95,7 +95,7 @@ Download `firmware.bin` from the [releases page](https://github.com/foliveira/bi
 ```bash
 curl -F firmware=@firmware.bin http://atomecho.local/api/update
 ```
-The device checks the whole image before switching to it. The new version then has to keep WiFi for a minute; if it restarts before that (a crash, or a WiFi join that fails), the device goes back to the previous version.
+The device checks the whole image before switching to it. The new version then has to keep WiFi for a minute; if it restarts before that (a crash, or a WiFi join that fails), the device goes back to the previous version and shows "update rolled back" as its last restart.
 
 ## Monitoring
 

@@ -9,7 +9,7 @@
 RTC_NOINIT_ATTR static uint32_t noteMagic;
 RTC_NOINIT_ATTR static char note[40];
 
-static char reason[64] = "unknown";
+static char reason[96] = "unknown";
 static char crash[200] = "";
 
 static const char* resetReasonName(esp_reset_reason_t r) {
@@ -60,6 +60,12 @@ void restartInfoInit() {
 }
 
 const char* restartReason() { return reason; }
+
+void restartInfoMarkRollback() {
+    char was[sizeof(reason)];
+    strlcpy(was, reason, sizeof(was));
+    snprintf(reason, sizeof(reason), "update rolled back after %s", was);
+}
 
 const char* restartCrashDetails() { return crash; }
 

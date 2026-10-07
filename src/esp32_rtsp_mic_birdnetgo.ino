@@ -1512,6 +1512,32 @@ static void confirmFirmware() {
         esp_ota_mark_app_valid_cancel_rollback();
         simplePrintln("Firmware update confirmed: ran for a minute with WiFi");
     }
+    audioPrefs.begin("audio", false);
+    if (audioPrefs.isKey("otaFrom")) audioPrefs.remove("otaFrom");   // can no longer be rolled back
+    audioPrefs.end();
+}
+
+// Before restarting into an update, remember the slot it was installed from. Booting from that
+// slot again while the other one is marked invalid means the bootloader rolled the update back.
+void noteFirmwareUpdateInstalled() {
+    audioPrefs.begin("audio", false);
+    audioPrefs.putString("otaFrom", esp_ota_get_running_partition()->label);
+    audioPrefs.end();
+}
+
+static void checkUpdateRollback() {
+    audioPrefs.begin("audio", false);
+    bool rolledBack = false;
+    if (audioPrefs.isKey("otaFrom")) {
+        char from[17] = "";
+        audioPrefs.getString("otaFrom", from, sizeof(from));
+        if (strcmp(from, esp_ota_get_running_partition()->label) == 0) {
+            audioPrefs.remove("otaFrom");
+            rolledBack = esp_ota_get_last_invalid_partition() != NULL;
+        }
+    }
+    audioPrefs.end();
+    if (rolledBack) restartInfoMarkRollback();
 }
 
 // Web UI is a separate module (WebUI.*)
@@ -1537,6 +1563,7 @@ void setup() {
     Serial.println("\n\n=== ESP32 RTSP Mic Starting ===");
     Serial.println("Board: M5Stack Atom Echo");
     restartInfoInit();
+    checkUpdateRollback();
     simplePrintln(String("Firmware ") + FW_VERSION + ", last restart: " + restartReason());
     if (restartCrashDetails()[0]) {
         simplePrintln(String("Crash: ") + restartCrashDetails());
