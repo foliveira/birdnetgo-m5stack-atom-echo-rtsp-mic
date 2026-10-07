@@ -1,0 +1,390 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Atom Echo RTSP Mic</title>
+<style>
+:root{--bg:#f4f6f8;--card:#fff;--fg:#1c2430;--muted:#5f6b7a;--line:#dde3ea;--acc:#1f6feb;--ok:#1a7f37;--warn:#b35900;--bad:#cf222e;--meter:#e6eaef;--field:#fff}
+@media (prefers-color-scheme:dark){:root{--bg:#0d1117;--card:#161b22;--fg:#e6edf3;--muted:#8b949e;--line:#30363d;--acc:#4493f8;--ok:#3fb950;--warn:#d29922;--bad:#f85149;--meter:#21262d;--field:#0d1117}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+main{max-width:1040px;margin:0 auto;padding:16px}
+header{display:flex;flex-wrap:wrap;gap:8px 16px;align-items:center;justify-content:space-between;margin-bottom:12px}
+h1{font-size:19px;margin:0}
+h2{font-size:13px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin:0 0 10px}
+.ver{color:var(--muted);font-size:13px;margin-left:6px}
+.url{display:flex;gap:6px;align-items:center;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:13px}
+.pill{display:inline-block;padding:3px 10px;border-radius:99px;font-size:13px;font-weight:600;border:1px solid var(--line)}
+.pill.ok{color:var(--ok);border-color:var(--ok)}.pill.warn{color:var(--warn);border-color:var(--warn)}.pill.bad{color:var(--bad);border-color:var(--bad)}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:12px;margin-bottom:12px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px}
+dl{display:grid;grid-template-columns:minmax(110px,40%) 1fr;gap:6px 12px;margin:0}
+dt{color:var(--muted)}dd{margin:0;font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
+.ok{color:var(--ok)}.warn{color:var(--warn)}.bad{color:var(--bad)}.muted{color:var(--muted)}
+.meter{height:14px;background:var(--meter);border-radius:7px;overflow:hidden;margin:4px 0 8px}
+.meter>div{height:100%;width:0;background:var(--ok);transition:width .25s}
+.lvl{display:flex;flex-wrap:wrap;gap:4px 18px;font-variant-numeric:tabular-nums}
+.alert{border:1px solid var(--bad);color:var(--bad);border-radius:10px;padding:10px 14px;margin-bottom:12px;display:none}
+.alert button{margin-left:8px}
+form label{display:block;margin:0 0 12px}
+form label>span{display:block;font-weight:600;margin-bottom:3px}
+form label.check{display:flex;gap:8px;align-items:center}
+form label.check>span{display:inline;margin:0}
+small{display:block;color:var(--muted);font-size:12.5px;margin-top:3px}
+input,select,button{font:inherit;color:inherit}
+input[type=number],select{width:100%;max-width:260px;padding:6px 8px;border:1px solid var(--line);border-radius:6px;background:var(--field)}
+input[type=checkbox]{width:18px;height:18px;margin:0}
+.dirty{outline:2px solid var(--warn);outline-offset:1px}
+button{padding:7px 14px;border-radius:6px;border:1px solid var(--line);background:var(--card);cursor:pointer}
+button:hover:not(:disabled){border-color:var(--acc)}
+button.primary{background:var(--acc);border-color:var(--acc);color:#fff}
+button:disabled{opacity:.5;cursor:default}
+button.small{padding:2px 8px;font-size:12.5px}
+.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+.msg{font-size:13px;min-height:1.2em;margin-top:8px}
+footer{margin:16px 0 8px;text-align:center;font-size:13px;color:var(--muted)}
+a{color:var(--acc)}
+details summary{cursor:pointer;font-weight:600}
+pre{margin:10px 0 0;max-height:50vh;overflow:auto;white-space:pre-wrap;word-break:break-word;font:12px/1.5 ui-monospace,Menlo,Consolas,monospace;background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:8px}
+#offline{position:fixed;left:50%;top:10px;transform:translateX(-50%);background:var(--bad);color:#fff;padding:6px 14px;border-radius:99px;font-size:13px;display:none;z-index:5}
+#overlay{position:fixed;inset:0;background:rgba(0,0,0,.55);display:none;align-items:center;justify-content:center;z-index:9}
+#overlay div{background:var(--card);border-radius:10px;padding:18px 24px}
+</style>
+</head>
+<body>
+<div id="offline">Device not responding, retrying…</div>
+<div id="overlay"><div id="overlayMsg">Restarting…</div></div>
+<main>
+<header>
+  <div><h1>Atom Echo RTSP Mic<span class="ver" id="fw"></span></h1>
+    <div class="url"><span id="url">rtsp://…</span><button class="small" type="button" id="copyUrl">Copy</button></div></div>
+  <span class="pill" id="status">Loading…</span>
+</header>
+
+<div class="alert" id="thermalAlert"><span id="thermalAlertText"></span><button type="button" data-action="clear_thermal">Resume streaming</button></div>
+
+<section class="card" style="margin-bottom:12px">
+  <h2>Signal level</h2>
+  <div class="meter"><div id="meter"></div></div>
+  <div class="lvl"><span id="lvlText">–</span><span id="clipText"></span><span id="agcText"></span></div>
+  <small>Loudest peak in the last 3 s, measured after gain. Aim for 30–70 %; clipping distorts calls.</small>
+</section>
+
+<div class="grid">
+<section class="card"><h2>Stream</h2><dl>
+  <dt>Client</dt><dd id="client">–</dd>
+  <dt>Session</dt><dd id="session">–</dd>
+  <dt>Audio</dt><dd id="format">–</dd>
+  <dt>Send queue</dt><dd id="queue">–</dd>
+  <dt>Dropped frames</dt><dd id="dropped">–</dd>
+  <dt>I2S overruns</dt><dd id="overruns">–</dd>
+  <dt>Longest stall</dt><dd id="stall">–</dd>
+  <dt>Frames sent</dt><dd id="sent">–</dd>
+  <dt>Connections</dt><dd id="conns">–</dd>
+</dl><small>Dropped frames mean the network could not keep up for longer than the send queue holds. I2S overruns should always be 0.</small></section>
+
+<section class="card"><h2>Device</h2><dl>
+  <dt>Uptime</dt><dd id="uptime">–</dd>
+  <dt>WiFi</dt><dd id="wifi">–</dd>
+  <dt>IP address</dt><dd id="ip">–</dd>
+  <dt>Power save</dt><dd id="psState">–</dd>
+  <dt>Free memory</dt><dd id="heap">–</dd>
+  <dt>CPU</dt><dd id="cpu">–</dd>
+  <dt>Temperature</dt><dd id="temp">–</dd>
+  <dt>Thermal guard</dt><dd id="thermal">–</dd>
+</dl><small>The ESP32's internal sensor is uncalibrated and usually reads above the real temperature; compare readings over time rather than trusting the absolute value.</small></section>
+</div>
+
+<div class="grid">
+<section class="card"><h2>Audio</h2>
+<form data-settings>
+  <label><span>Sample rate</span><select name="rate">
+    <option value="16000">16 kHz</option>
+    <option value="22050">22.05 kHz</option>
+    <option value="24000">24 kHz</option>
+    <option value="32000">32 kHz (recommended)</option>
+    <option value="44100">44.1 kHz</option>
+    <option value="48000">48 kHz</option>
+  </select><small>Sound is captured up to half the sample rate. BirdNET analyses up to 15 kHz, so 32 kHz keeps every band it uses; 16 kHz cuts everything above 8 kHz. Changing it restarts the stream.</small></label>
+  <label><span>Frame size</span><select name="buffer">
+    <option value="256">256</option><option value="512">512</option><option value="1024">1024</option><option value="2048">2048</option><option value="4096">4096</option>
+  </select><small>Samples per RTP packet. Larger frames mean fewer packets; the send queue protects against WiFi stalls either way.</small></label>
+  <label><span>Gain</span><input type="number" name="gain" min="0.1" max="100" step="any"><small>Digital gain applied live. 3× suits most outdoor setups.</small></label>
+  <label class="check"><input type="checkbox" name="hpf"><span>High-pass filter</span></label>
+  <label><span>High-pass cutoff (Hz)</span><input type="number" name="hpf_hz" min="10" max="10000" step="1"><small>Cuts wind and traffic rumble below the cutoff. A few birds call lower than 300 Hz (large owls, bitterns); lower the cutoff if they matter to you.</small></label>
+  <label class="check"><input type="checkbox" name="agc"><span>Automatic gain control</span></label>
+  <small>Adjusts gain to the level of the scene on top of the gain above. Off gives BirdNET a constant level.</small>
+  <div class="row" style="margin-top:12px"><button class="primary" type="submit" disabled>Save</button><button type="reset" disabled>Undo</button></div>
+  <div class="msg"></div>
+</form></section>
+
+<section class="card"><h2>WiFi and power</h2>
+<form data-settings>
+  <label><span>WiFi transmit power (dBm)</span><select name="tx">
+    <option>-1</option><option>2</option><option>5</option><option>7</option><option>8.5</option><option>11</option><option>13</option><option>15</option><option>17</option><option>18.5</option><option>19</option><option>19.5</option>
+  </select><small>Lower only if the access point is close; weak links retransmit more.</small></label>
+  <label class="check"><input type="checkbox" name="ps"><span>WiFi power save</span></label>
+  <small>Lets the radio sleep between beacons, the largest heat saving. TCP then gets acknowledgements only once per beacon, which is enough for 16 kHz with an access point DTIM period of 1 but not for higher rates. Switched off automatically if the stream drops frames.</small>
+  <label style="margin-top:12px"><span>CPU clock</span><select name="cpu"><option value="80">80 MHz</option><option value="160">160 MHz</option><option value="240">240 MHz</option></select><small>80 MHz handles 48 kHz and runs coolest.</small></label>
+  <label><span>LED</span><select name="led"><option value="0">Off</option><option value="1">Status colour</option><option value="2">Signal level</option></select></label>
+  <div class="row"><button class="primary" type="submit" disabled>Save</button><button type="reset" disabled>Undo</button></div>
+  <div class="msg"></div>
+</form></section>
+
+<section class="card"><h2>Protection and maintenance</h2>
+<form data-settings>
+  <label class="check"><input type="checkbox" name="oh"><span>Thermal protection</span></label>
+  <small>Stops the RTSP server after 3 consecutive minutes at or above the limit, until you resume it here.</small>
+  <label style="margin-top:12px"><span>Temperature limit (°C)</span><select name="oh_limit"></select></label>
+  <label class="check"><input type="checkbox" name="sched"><span>Scheduled reboot</span></label>
+  <label style="margin-top:12px"><span>Reboot every (hours)</span><input type="number" name="sched_h" min="1" max="168" step="1"></label>
+  <div class="row"><button class="primary" type="submit" disabled>Save</button><button type="reset" disabled>Undo</button></div>
+  <div class="msg"></div>
+</form></section>
+
+</div>
+
+<section class="card" style="margin-bottom:12px"><h2>Actions</h2>
+  <div class="row">
+    <button type="button" data-action="restart_audio">Restart audio</button>
+    <button type="button" data-action="server_off" id="serverBtn">Stop RTSP server</button>
+    <button type="button" data-action="reboot">Reboot</button>
+    <button type="button" data-action="defaults">Restore defaults</button>
+  </div>
+  <div class="msg" id="actionMsg"></div>
+  <small>Restore defaults resets audio and device settings and reboots. WiFi credentials are kept.</small>
+</section>
+
+<section class="card">
+<details id="logBox"><summary>Log <span class="muted" style="font-weight:400">(times in UTC, + marks time since boot)</span></summary>
+  <div class="row" style="margin-top:8px"><button class="small" type="button" id="copyLog">Copy</button></div>
+  <pre id="log"></pre>
+</details>
+</section>
+<footer><a href="https://github.com/foliveira/birdnetgo-m5stack-atom-echo-rtsp-mic" target="_blank" rel="noopener">Project page and documentation</a></footer>
+</main>
+
+<script>
+'use strict';
+const $ = (id) => document.getElementById(id);
+const forms = [...document.querySelectorAll('form[data-settings]')];
+let st = null, logSeq = 0, timer = 0, clipsSeen = null, clipUntil = 0;
+
+for (let c = 30; c <= 95; c += 5) document.querySelector('[name=oh_limit]').add(new Option(c, c));
+
+function dur(s) {
+  if (s == null) return '–';
+  const d = Math.floor(s / 86400), h = Math.floor(s / 3600) % 24, m = Math.floor(s / 60) % 60;
+  if (d) return d + 'd ' + h + 'h';
+  if (h) return h + 'h ' + m + 'm';
+  if (m) return m + 'm ' + (s % 60) + 's';
+  return s + 's';
+}
+const num = (n) => Number(n).toLocaleString('en-US');
+function set(id, text, cls) { const e = $(id); e.textContent = text; e.className = cls || ''; }
+
+async function api(path, body) {
+  const r = await fetch(path, body ? { method: 'POST', body: new URLSearchParams(body) } : { cache: 'no-store' });
+  if (!r.ok) {
+    let msg = 'HTTP ' + r.status;
+    try { msg = (await r.json()).error || msg; } catch (e) { /* not JSON */ }
+    throw new Error(msg);
+  }
+  return r;
+}
+
+function setField(el, v) {
+  if (el.type === 'checkbox') { el.checked = !!v; return; }
+  const val = String(v);
+  if (el.tagName === 'SELECT' && ![...el.options].some((o) => o.value === val)) el.add(new Option(val, val));
+  el.value = val;
+}
+
+function frameLabels() {
+  const form = document.querySelector('[name=buffer]').form;
+  const rate = Number(form.rate.value) || 32000;
+  for (const o of form.buffer.options) o.textContent = o.value + ' samples (' + Math.round(o.value / rate * 1000) + ' ms)';
+}
+
+function render(s) {
+  st = s;
+  const L = s.live, C = s.cfg;
+  $('fw').textContent = 'v' + s.fw;
+  $('url').textContent = 'rtsp://' + L.ip + ':8554/audio';
+
+  let pill = ['Waiting for a client', ''];
+  if (L.oh_latched) pill = ['Stopped: thermal protection', 'bad'];
+  else if (!L.server) pill = ['RTSP server stopped', 'warn'];
+  else if (L.streaming) pill = ['Streaming', 'ok'];
+  $('status').textContent = pill[0];
+  $('status').className = 'pill ' + pill[1];
+  $('thermalAlert').style.display = L.oh_latched ? 'block' : 'none';
+  $('thermalAlertText').textContent = L.oh_note || 'Thermal protection stopped the stream.';
+
+  // Level: 3 s peak hold, so a 1 s poll still shows short calls.
+  const pct = Math.max(0, Math.min(100, L.hold_pct));
+  if (clipsSeen !== null && L.clips > clipsSeen) clipUntil = Date.now() + 5000;
+  clipsSeen = L.clips;
+  const clipping = Date.now() < clipUntil;
+  const bar = $('meter');
+  bar.style.width = pct.toFixed(1) + '%';
+  bar.style.background = clipping || pct >= 90 ? 'var(--bad)' : pct >= 70 ? 'var(--warn)' : pct >= 5 ? 'var(--ok)' : 'var(--muted)';
+  set('lvlText', pct > 0 ? pct.toFixed(0) + ' %  (' + (20 * Math.log10(pct / 100)).toFixed(1) + ' dBFS)' : 'silent');
+  set('clipText', clipping ? 'Clipping: lower the gain' : 'Clipped blocks: ' + num(L.clips), clipping ? 'bad' : 'muted');
+  set('agcText', C.agc ? 'AGC ×' + L.agc_x.toFixed(2) + ' (total ×' + (C.gain * L.agc_x).toFixed(1) + ')' : '', 'muted');
+
+  set('client', L.client || (L.server ? 'none' : 'server stopped'));
+  set('session', L.streaming ? dur(L.session_s) : L.end_reason ? 'ended: ' + L.end_reason : '–');
+  set('format', (L.rate / 1000) + ' kHz, 16-bit mono, ' + Math.round(L.rate * 16 / 1000) + ' kbit/s');
+  const cap = L.queue_cap * L.frame_ms / 1000;
+  set('queue', L.queue + ' of ' + L.queue_cap + ' frames (peak ' + L.queue_peak + '), holds ' + cap.toFixed(1) + ' s', L.queue_peak >= L.queue_cap ? 'warn' : '');
+  set('dropped', num(L.dropped), L.dropped ? 'warn' : '');
+  set('overruns', num(L.overruns) + (L.read_errors ? ', read errors ' + num(L.read_errors) : ''), L.overruns || L.read_errors ? 'bad' : '');
+  set('stall', L.stall_max_ms + ' ms (' + num(L.stalls) + ' stalls)', L.stall_max_ms > cap * 1000 ? 'warn' : '');
+  set('sent', num(L.sent));
+  set('conns', L.connects + ' connections, ' + L.plays + ' streams since boot');
+
+  set('uptime', dur(L.uptime));
+  const q = L.rssi >= -60 ? ['excellent', 'ok'] : L.rssi >= -70 ? ['good', 'ok'] : L.rssi >= -80 ? ['fair', 'warn'] : ['weak', 'bad'];
+  set('wifi', L.ssid + ', ' + L.rssi + ' dBm (' + q[0] + ')' + (L.wifi_drops ? ', ' + L.wifi_drops + (L.wifi_drops === 1 ? ' drop' : ' drops') + ' since boot' : ''), q[1]);
+  set('ip', L.ip);
+  set('psState', C.ps ? (L.ps_suspended ? 'suspended until reboot (frames dropped)' : 'on') : 'off', L.ps_suspended ? 'warn' : '');
+  set('heap', L.heap_kb + ' KB free (lowest ' + L.heap_min_kb + ' KB)', L.heap_min_kb < 40 ? 'warn' : '');
+  set('cpu', L.cpu_mhz + ' MHz');
+  set('temp', L.temp_c == null ? 'sensor unavailable' : L.temp_c.toFixed(1) + ' °C (peak ' + L.temp_max_c.toFixed(1) + ' °C)');
+  set('thermal', L.oh_sensor_fault ? 'paused: no sensor reading' : C.oh ? 'on, limit ' + C.oh_limit + ' °C' : 'off', L.oh_latched ? 'bad' : L.oh_sensor_fault ? 'warn' : '');
+
+  const sb = $('serverBtn');
+  sb.dataset.action = L.server ? 'server_off' : 'server_on';
+  sb.textContent = L.server ? 'Stop RTSP server' : 'Start RTSP server';
+
+  for (const form of forms) {
+    for (const el of form.elements) {
+      if (el.name && el.name in C && !el.classList.contains('dirty')) setField(el, C[el.name]);
+    }
+  }
+  frameLabels();
+}
+
+function dirtyFields(form) { return [...form.elements].filter((el) => el.classList.contains('dirty')); }
+function updateButtons(form) {
+  const n = dirtyFields(form).length;
+  for (const b of form.querySelectorAll('button')) b.disabled = n === 0;
+}
+
+for (const form of forms) {
+  const onEdit = (e) => {
+    const el = e.target;
+    if (!el.name || !st) return;
+    const now = el.type === 'checkbox' ? el.checked : el.value;
+    const was = st.cfg[el.name];
+    const same = el.type === 'checkbox' ? now === !!was : Number(now) === Number(was);
+    el.classList.toggle('dirty', !same);
+    updateButtons(form);
+    if (el.name === 'rate') frameLabels();
+  };
+  form.addEventListener('input', onEdit);
+  form.addEventListener('change', onEdit);
+  form.addEventListener('reset', (e) => {
+    e.preventDefault();
+    for (const el of dirtyFields(form)) el.classList.remove('dirty');
+    updateButtons(form);
+    render(st);
+  });
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const msg = form.querySelector('.msg');
+    const body = {};
+    for (const el of dirtyFields(form)) body[el.name] = el.type === 'checkbox' ? (el.checked ? '1' : '0') : el.value;
+    if (('rate' in body || 'buffer' in body) && !confirm('This restarts the audio pipeline; the RTSP client reconnects. Continue?')) return;
+    for (const b of form.querySelectorAll('button')) b.disabled = true;
+    msg.textContent = 'Saving…'; msg.className = 'msg muted';
+    try {
+      const s = await (await api('/api/settings', body)).json();
+      for (const el of dirtyFields(form)) el.classList.remove('dirty');
+      render(s);
+      msg.textContent = 'Saved.'; msg.className = 'msg ok';
+    } catch (err) {
+      msg.textContent = 'Not saved: ' + err.message; msg.className = 'msg bad';
+    }
+    updateButtons(form);
+    setTimeout(() => { if (msg.textContent === 'Saved.') msg.textContent = ''; }, 3000);
+  });
+}
+
+const confirmText = {
+  restart_audio: 'Restart the audio pipeline? The RTSP client reconnects.',
+  server_off: 'Stop the RTSP server? Streaming ends until you start it again.',
+  reboot: 'Reboot the device?',
+  defaults: 'Restore default settings and reboot? WiFi credentials are kept.',
+};
+document.addEventListener('click', async (e) => {
+  const b = e.target.closest('button[data-action]');
+  if (!b) return;
+  const name = b.dataset.action;
+  if (confirmText[name] && !confirm(confirmText[name])) return;
+  const msg = $('actionMsg');
+  b.disabled = true;
+  try {
+    await api('/api/action', { name });
+    if (name === 'reboot' || name === 'defaults') { waitForReboot(); return; }
+    msg.textContent = ''; poll();
+  } catch (err) {
+    msg.textContent = 'Failed: ' + err.message; msg.className = 'msg bad';
+  } finally { b.disabled = false; }
+});
+
+function waitForReboot() {
+  clearTimeout(timer);
+  $('overlayMsg').textContent = 'Restarting… this page reloads when the device is back.';
+  $('overlay').style.display = 'flex';
+  const tick = () => fetch('/api/state', { cache: 'no-store' }).then((r) => r.ok ? location.reload() : setTimeout(tick, 2000)).catch(() => setTimeout(tick, 2000));
+  setTimeout(tick, 5000);
+}
+
+function copyText(text, btn) {
+  const done = () => { const t = btn.textContent; btn.textContent = 'Copied'; setTimeout(() => { btn.textContent = t; }, 1200); };
+  if (navigator.clipboard && window.isSecureContext) { navigator.clipboard.writeText(text).then(done); return; }
+  const ta = document.createElement('textarea');   // plain-http fallback
+  ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+  document.body.appendChild(ta); ta.select();
+  try { document.execCommand('copy'); done(); } catch (e) { /* ignore */ }
+  ta.remove();
+}
+$('copyUrl').onclick = () => copyText($('url').textContent, $('copyUrl'));
+$('copyLog').onclick = () => copyText($('log').textContent, $('copyLog'));
+
+async function loadLogs() {
+  const r = await api('/api/logs?since=' + logSeq);
+  const text = await r.text();
+  const seq = Number(r.headers.get('X-Log-Seq'));
+  const pre = $('log');
+  if (seq < logSeq) pre.textContent = '';   // the device restarted: line numbers began again
+  logSeq = seq;
+  if (!text) return;
+  const atBottom = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 4;
+  pre.textContent = (pre.textContent + text).split('\n').slice(-400).join('\n');
+  if (atBottom) pre.scrollTop = pre.scrollHeight;
+}
+$('logBox').addEventListener('toggle', () => {
+  if ($('logBox').open) { logSeq = 0; $('log').textContent = ''; loadLogs().catch(() => {}); }
+});
+
+async function poll() {
+  clearTimeout(timer);
+  try {
+    const s = await (await api('/api/state')).json();
+    $('offline').style.display = 'none';
+    render(s);
+    if ($('logBox').open && s.live.log_seq !== logSeq) await loadLogs();
+  } catch (e) {
+    $('offline').style.display = 'block';
+  }
+  if (!document.hidden) timer = setTimeout(poll, 1000);
+}
+document.addEventListener('visibilitychange', () => { if (!document.hidden) poll(); });
+poll();
+</script>
+</body>
+</html>

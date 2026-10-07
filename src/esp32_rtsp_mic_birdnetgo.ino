@@ -6,6 +6,8 @@
 #include <errno.h>
 #include <lwip/sockets.h>
 #include <esp_heap_caps.h>
+#include <esp_timer.h>
+#include "App.h"
 #include "AudioDsp.h"
 #include "WebUI.h"
 #include "WifiSetup.h"
@@ -43,7 +45,7 @@ static TxFrame*  framePool[MAX_QUEUE_FRAMES];
 static uint16_t  framePoolCount = 0;
 static uint32_t  frameSlotBytes = 0;
 volatile uint16_t pipelineSamples = 0;   // samples per packet the pool is sized for; changes only while capture is parked
-static uint32_t appliedSampleRate = 0;   // what the I2S driver actually runs (for reverting a failed reconfiguration)
+uint32_t appliedSampleRate = 0;          // what the I2S driver actually runs (for reverting a failed reconfiguration)
 static uint16_t appliedBufferSize = 0;
 static QueueHandle_t freeQ = NULL;
 static QueueHandle_t readyQ = NULL;
@@ -93,9 +95,6 @@ const char* FW_VERSION_STR = FW_VERSION;
 // Thermal protection defaults
 #define DEFAULT_OVERHEAT_PROTECTION true
 #define DEFAULT_OVERHEAT_LIMIT_C 80
-#define OVERHEAT_MIN_LIMIT_C 30
-#define OVERHEAT_MAX_LIMIT_C 95
-#define OVERHEAT_LIMIT_STEP_C 5
 #define OVERHEAT_CONSECUTIVE_READINGS 3  // readings (1/min) at/above the limit before tripping
 
 // -- Pins (M5Stack Atom Echo: SPM1423 PDM microphone, NS4168 speaker amplifier)
@@ -129,15 +128,13 @@ uint8_t rtspParseBuffer[1024];
 int rtspParseBufferPos = 0;
 
 // -- Global state
-unsigned long lastStatsReset = 0;
-bool rtspServerEnabled = true;
+bool rtspServerEnabled = false;   // set by setRtspServer()
 
 // -- Audio parameters (runtime configurable)
 uint32_t currentSampleRate = DEFAULT_SAMPLE_RATE;
 float currentGainFactor = DEFAULT_GAIN_FACTOR;
 uint16_t currentBufferSize = DEFAULT_BUFFER_SIZE;
-// PDM microphones (like SPM1423 on Atom Echo) output decimated 16-bit samples; no shift is applied.
-uint8_t i2sShiftBits = 0;  // Always 0 for the PDM microphone on M5Stack Atom Echo (read-only in UI)
+// The PDM decoder delivers 16-bit samples; they are used as they are, with no bit shift.
 
 // -- Audio metering / clipping diagnostics
 volatile uint16_t lastPeakAbs16 = 0;       // last block peak absolute value (0..32767)
@@ -163,41 +160,28 @@ volatile uint32_t hpfVersion = 0;        // bumped on every coefficient update
 // -- Preferences for persistent settings
 Preferences audioPrefs;
 
-// -- Diagnostics, auto-recovery and temperature monitoring
+// -- Diagnostics and temperature monitoring
 unsigned long lastMemoryCheck = 0;
-unsigned long lastPerformanceCheck = 0;
-unsigned long lastWiFiCheck = 0;
 unsigned long lastTempCheck = 0;
-uint32_t minFreeHeap = 0xFFFFFFFF;
-uint32_t maxPacketRate = 0;
-uint32_t minPacketRate = 0xFFFFFFFF;
-bool autoRecoveryEnabled = false;
-bool autoThresholdEnabled = true; // auto compute minAcceptableRate from sample rate and buffer size
-// Deferred reboot scheduling (to restart safely outside HTTP context)
-volatile bool scheduledFactoryReset = false;
-volatile unsigned long scheduledRebootAt = 0;
-unsigned long bootTime = 0;
+// Deferred reboot (requested from an HTTP handler, carried out by loop() after the reply is out)
+bool scheduledFactoryReset = false;
+bool rebootScheduled = false;
+unsigned long rebootRequestedAt = 0;
+uint32_t rebootDelayMs = 0;
 unsigned long lastI2SReset = 0;
 float maxTemperature = 0.0f;
 float lastTemperatureC = 0.0f;
 bool lastTemperatureValid = false;
 bool overheatProtectionEnabled = DEFAULT_OVERHEAT_PROTECTION;
 float overheatShutdownC = (float)DEFAULT_OVERHEAT_LIMIT_C;
-bool overheatLockoutActive = false;
-float overheatTripTemp = 0.0f;
-unsigned long overheatTriggeredAt = 0;
 String overheatLastReason = "";
-String overheatLastTimestamp = "";
 bool overheatSensorFault = false;
-bool overheatLatched = false;
+bool overheatLatched = false;          // set by a trip, kept across reboots until cleared in the Web UI
 
 // -- Scheduled reset
 bool scheduledResetEnabled = false;
 uint32_t resetIntervalHours = 24; // Default 24 hours
 
-// -- Configurable thresholds
-uint32_t minAcceptableRate = 50;        // Minimum acceptable packet rate (restart below this)
-uint32_t performanceCheckInterval = 15; // Check interval in minutes
 uint8_t cpuFrequencyMhz = DEFAULT_CPU_MHZ;
 
 // -- WiFi TX power / power save (configurable)
@@ -211,7 +195,6 @@ volatile uint8_t wifiDropReason = 0;
 uint32_t wifiDrops = 0;                        // link losses since boot
 
 // -- RTSP connect/PLAY statistics
-unsigned long lastRtspClientConnectMs = 0;
 unsigned long lastRtspPlayMs = 0;
 uint32_t rtspConnectCount = 0;
 uint32_t rtspPlayCount = 0;
@@ -235,7 +218,7 @@ float snapWifiTxDbm(float dbm) {
 
 // Apply the configured transmit power unless the driver already uses it (it falls back to its
 // default whenever the station interface restarts). Logs only if log is set and it changed.
-void applyWifiTxPower(bool log = true) {
+void applyWifiTxPower(bool log) {
     const wifi_power_t desired = (wifi_power_t)lroundf(snapWifiTxDbm(wifiTxPowerDbm) * 4.0f);
     if (WiFi.getTxPower() == desired) return;
     WiFi.setTxPower(desired);
@@ -244,7 +227,7 @@ void applyWifiTxPower(bool log = true) {
 
 // Apply WiFi modem power save. MIN_MODEM lets the radio sleep between DTIM beacons, which is the
 // single largest power (heat) lever on this board, at the cost of delayed ACKs from the AP.
-void applyWifiPowerSave(bool log = true) {
+void applyWifiPowerSave(bool log) {
     wifiPsSuspended = false;
     WiFi.setSleep(wifiPowerSave);
     if (log) {
@@ -269,6 +252,15 @@ void updateHighpassCoeffs() {
     portEXIT_CRITICAL(&hpfMux);
 }
 
+// Seconds since boot. esp_timer is 64-bit, so this does not wrap after 49 days like millis().
+uint32_t uptimeSeconds() {
+    return (uint32_t)(esp_timer_get_time() / 1000000);
+}
+
+bool isSupportedSampleRate(uint32_t hz) {
+    return hz == 16000 || hz == 22050 || hz == 24000 || hz == 32000 || hz == 44100 || hz == 48000;
+}
+
 // Uptime -> "Xd Yh Zm Ts"
 String formatUptime(unsigned long seconds) {
     unsigned long days = seconds / 86400;
@@ -286,13 +278,6 @@ String formatUptime(unsigned long seconds) {
     return result;
 }
 
-// Format "X ago" for events based on millis()
-String formatSince(unsigned long eventMs) {
-    if (eventMs == 0) return String("never");
-    unsigned long seconds = (millis() - eventMs) / 1000;
-    return formatUptime(seconds) + " ago";
-}
-
 static bool isTemperatureValid(float temp) {
     if (isnan(temp) || isinf(temp)) return false;
     if (temp < -20.0f || temp > 130.0f) return false;
@@ -302,21 +287,26 @@ static bool isTemperatureValid(float temp) {
 static void persistOverheatNote() {
     audioPrefs.begin("audio", false);
     audioPrefs.putString("ohReason", overheatLastReason);
-    audioPrefs.putString("ohStamp", overheatLastTimestamp);
-    audioPrefs.putFloat("ohTripC", overheatTripTemp);
     audioPrefs.putBool("ohLatched", overheatLatched);
     audioPrefs.end();
 }
 
 void recordOverheatTrip(float temp) {
-    unsigned long uptimeSeconds = (millis() - bootTime) / 1000;
-    overheatTripTemp = temp;
-    overheatTriggeredAt = millis();
-    overheatLastTimestamp = formatUptime(uptimeSeconds);
-    overheatLastReason = String("Thermal shutdown: ") + String(temp, 1) + " C reached (limit " +
-                         String(overheatShutdownC, 1) + " C). Stream disabled; acknowledge in UI.";
+    char when[40];
+    time_t now;
+    time(&now);
+    if (now > 1600000000) {   // SNTP has synced
+        struct tm ti;
+        gmtime_r(&now, &ti);
+        strftime(when, sizeof(when), "on %Y-%m-%d at %H:%M UTC", &ti);
+    } else {
+        snprintf(when, sizeof(when), "after %s of uptime", formatUptime(uptimeSeconds()).c_str());
+    }
+    overheatLastReason = "Thermal protection stopped the stream " + String(when) + ": " + String(temp, 1) +
+                         " °C for " + String(OVERHEAT_CONSECUTIVE_READINGS) + " minutes (limit " +
+                         String(overheatShutdownC, 0) + " °C).";
     overheatLatched = true;
-    simplePrintln("THERMAL PROTECTION: " + overheatLastReason);
+    simplePrintln(overheatLastReason);
     simplePrintln("TIP: The ESP32 internal sensor reads high. Try WiFi power save, 80 MHz CPU, or a higher limit.");
     persistOverheatNote();
 }
@@ -328,17 +318,11 @@ void recordOverheatTrip(float temp) {
 void checkTemperature() {
     static uint8_t overLimitCount = 0;
     float temp = temperatureRead(); // ESP32 internal sensor (approximate)
-    bool tempValid = isTemperatureValid(temp);
-    if (!tempValid) {
+    if (!isTemperatureValid(temp)) {
         lastTemperatureValid = false;
         overLimitCount = 0;
         if (!overheatSensorFault) {
             overheatSensorFault = true;
-            overheatLastReason = "Thermal protection disabled: temperature sensor unavailable.";
-            overheatLastTimestamp = "";
-            overheatTripTemp = 0.0f;
-            overheatTriggeredAt = 0;
-            persistOverheatNote();
             simplePrintln("WARNING: Temperature sensor unavailable. Thermal protection paused.");
         }
         return;
@@ -346,90 +330,66 @@ void checkTemperature() {
 
     lastTemperatureC = temp;
     lastTemperatureValid = true;
-
     if (overheatSensorFault) {
         overheatSensorFault = false;
-        overheatLastReason = "Thermal protection restored: temperature sensor reading valid.";
-        overheatLastTimestamp = formatUptime((millis() - bootTime) / 1000);
-        persistOverheatNote();
         simplePrintln("Temperature sensor restored. Thermal protection active again.");
     }
-
     if (temp > maxTemperature) {
         maxTemperature = temp;
     }
 
-    bool protectionActive = overheatProtectionEnabled && !overheatSensorFault;
-    if (protectionActive) {
-        if (!overheatLockoutActive && temp >= overheatShutdownC) {
-            overLimitCount++;
-            if (overLimitCount >= OVERHEAT_CONSECUTIVE_READINGS) {
-                overLimitCount = 0;
-                overheatLockoutActive = true;
-                recordOverheatTrip(temp);
-                requestStreamStop("overheat");
-                rtspServerEnabled = false;
-                rtspServer.stop();
-            } else {
-                simplePrintln("Temperature " + String(temp, 1) + " C at/above limit (" +
-                              String(overLimitCount) + "/" + String(OVERHEAT_CONSECUTIVE_READINGS) + ")");
-            }
-        } else {
+    // Once latched the server stays off until the latch is cleared in the Web UI.
+    if (overheatProtectionEnabled && !overheatLatched && temp >= overheatShutdownC) {
+        overLimitCount++;
+        if (overLimitCount >= OVERHEAT_CONSECUTIVE_READINGS) {
             overLimitCount = 0;
-            if (overheatLockoutActive && temp <= (overheatShutdownC - OVERHEAT_LIMIT_STEP_C)) {
-                // Allow re-arming after we cool down by at least one step
-                overheatLockoutActive = false;
-            }
+            recordOverheatTrip(temp);
+            setRtspServer(false);
+        } else {
+            simplePrintln("Temperature " + String(temp, 1) + " °C at/above limit (" +
+                          String(overLimitCount) + "/" + String(OVERHEAT_CONSECUTIVE_READINGS) + ")");
         }
     } else {
         overLimitCount = 0;
-        overheatLockoutActive = false;
     }
 
     // Only warn occasionally on high temperature; no periodic logging
     static unsigned long lastTempWarn = 0;
     float warnThreshold = max(overheatShutdownC - 5.0f, (float)OVERHEAT_MIN_LIMIT_C);
     if (temp > warnThreshold && (millis() - lastTempWarn) > 600000UL) { // 10 min cooldown
-        simplePrintln("WARNING: High temperature detected (" + String(temp, 1) + " C). Approaching shutdown limit.");
+        simplePrintln("WARNING: High temperature detected (" + String(temp, 1) + " °C). Approaching shutdown limit.");
         lastTempWarn = millis();
     }
 }
 
-// Performance diagnostics
-void checkPerformance() {
-    uint32_t currentHeap = ESP.getFreeHeap();
-    if (currentHeap < minFreeHeap) {
-        minFreeHeap = currentHeap;
-    }
-
-    if (isStreaming && (millis() - lastStatsReset) > 30000) {
-        // Cooldown: skip performance check for 2 minutes after last I2S reset
-        if (lastI2SReset > 0 && (millis() - lastI2SReset) < 120000) {
-            return;
+// Start or stop the RTSP listener. Stopping ends the current session and drops a client that is
+// still negotiating. Starting is refused (returns false) while the thermal latch is set.
+bool setRtspServer(bool on) {
+    if (on) {
+        if (overheatLatched) return false;
+        if (!rtspServerEnabled) {
+            rtspServer.begin();
+            rtspServer.setNoDelay(true);
+            rtspServerEnabled = true;
         }
-
-        uint32_t runtime = millis() - lastStatsReset;
-        uint32_t currentRate = (audioPacketsSent * 1000) / runtime;
-
-        if (currentRate > maxPacketRate) maxPacketRate = currentRate;
-        if (currentRate < minPacketRate) minPacketRate = currentRate;
-
-        static uint8_t consecutiveLowCount = 0;
-        if (currentRate < minAcceptableRate) {
-            consecutiveLowCount++;
-            simplePrintln("Low packet rate: " + String(currentRate) + " < " + String(minAcceptableRate) + " pkt/s (" + String(consecutiveLowCount) + "/3)");
-
-            if (consecutiveLowCount >= 3 && autoRecoveryEnabled) {
-                simplePrintln("AUTO-RECOVERY: 3 consecutive failures, restarting I2S...");
-                consecutiveLowCount = 0;
-                restartI2S();
-                lastStatsReset = millis();
-                lastI2SReset = millis();
-            }
-        } else {
-            consecutiveLowCount = 0;
-        }
+        return true;
     }
+    rtspServerEnabled = false;
+    rtspServer.stop();
+    requestStreamStop("server stopped");   // if the sender does not confirm, loop() keeps trying
+    if (!senderTaskHandle && rtspClient) {
+        rtspClient.stop();
+        rtspParseBufferPos = 0;
+    }
+    return true;
+}
+
+void clearThermalLatch() {
+    if (!overheatLatched) return;
+    overheatLatched = false;
+    overheatLastReason = "";
+    persistOverheatNote();
+    setRtspServer(true);
 }
 
 static void onWifiEvent(arduino_event_id_t event, arduino_event_info_t info) {
@@ -480,8 +440,7 @@ static void checkWiFi() {
 void checkScheduledReset() {
     if (!scheduledResetEnabled) return;
 
-    unsigned long uptimeHours = (millis() - bootTime) / 3600000;
-    if (uptimeHours >= resetIntervalHours) {
+    if (uptimeSeconds() / 3600 >= resetIntervalHours) {
         simplePrintln("SCHEDULED RESET: " + String(resetIntervalHours) + " hours reached");
         delay(1000);
         ESP.restart();
@@ -494,14 +453,8 @@ void loadAudioSettings() {
     currentSampleRate = audioPrefs.getUInt("sampleRate", DEFAULT_SAMPLE_RATE);
     currentGainFactor = audioPrefs.getFloat("gainFactor", DEFAULT_GAIN_FACTOR);
     currentBufferSize = audioPrefs.getUShort("bufferSize", DEFAULT_BUFFER_SIZE);
-    // i2sShiftBits is ALWAYS 0 for PDM microphones - not configurable
-    i2sShiftBits = 0;
-    autoRecoveryEnabled = audioPrefs.getBool("autoRecovery", false);
     scheduledResetEnabled = audioPrefs.getBool("schedReset", false);
     resetIntervalHours = audioPrefs.getUInt("resetHours", 24);
-    minAcceptableRate = audioPrefs.getUInt("minRate", 50);
-    performanceCheckInterval = audioPrefs.getUInt("checkInterval", 15);
-    autoThresholdEnabled = audioPrefs.getBool("thrAuto", true);
     cpuFrequencyMhz = audioPrefs.getUChar("cpuFreq", DEFAULT_CPU_MHZ);
     if (cpuFrequencyMhz != 80 && cpuFrequencyMhz != 160 && cpuFrequencyMhz != 240) {
         cpuFrequencyMhz = DEFAULT_CPU_MHZ;   // 2.3.x could store 120 (rejected by the PLL) or 40 (breaks WiFi)
@@ -520,22 +473,16 @@ void loadAudioSettings() {
     ohLimit = OVERHEAT_MIN_LIMIT_C + ((ohLimit - OVERHEAT_MIN_LIMIT_C) / OVERHEAT_LIMIT_STEP_C) * OVERHEAT_LIMIT_STEP_C;
     overheatShutdownC = (float)ohLimit;
     overheatLastReason = audioPrefs.getString("ohReason", "");
-    overheatLastTimestamp = audioPrefs.getString("ohStamp", "");
-    overheatTripTemp = audioPrefs.getFloat("ohTripC", 0.0f);
     overheatLatched = audioPrefs.getBool("ohLatched", false);
     audioPrefs.end();
 
-    // Sanity clamps (corrupted flash must not produce an unusable pipeline)
-    if (currentSampleRate < 8000 || currentSampleRate > 48000) currentSampleRate = DEFAULT_SAMPLE_RATE;
+    // Sanity clamps (corrupted flash, or a value older versions accepted, must not produce an
+    // unusable pipeline). 8 kHz was allowed before but clocks the microphone below its range.
+    if (!isSupportedSampleRate(currentSampleRate)) currentSampleRate = DEFAULT_SAMPLE_RATE;
     if (currentBufferSize < 256 || currentBufferSize > 8192) currentBufferSize = DEFAULT_BUFFER_SIZE;
     if (!(currentGainFactor >= 0.1f && currentGainFactor <= 100.0f)) currentGainFactor = DEFAULT_GAIN_FACTOR;
-
-    if (autoThresholdEnabled) {
-        minAcceptableRate = computeRecommendedMinRate();
-    }
-    if (overheatLatched) {
-        rtspServerEnabled = false;
-    }
+    if (resetIntervalHours < 1 || resetIntervalHours > 168) resetIntervalHours = 24;
+    if (highpassCutoffHz < 10 || highpassCutoffHz > 10000) highpassCutoffHz = DEFAULT_HPF_CUTOFF_HZ;
     // Log the configured TX dBm (not the current enum), snapped for clarity
     float txShown = snapWifiTxDbm(wifiTxPowerDbm);
     simplePrintln("Loaded settings: Rate=" + String(currentSampleRate) +
@@ -554,13 +501,8 @@ void saveAudioSettings() {
     audioPrefs.putUInt("sampleRate", currentSampleRate);
     audioPrefs.putFloat("gainFactor", currentGainFactor);
     audioPrefs.putUShort("bufferSize", currentBufferSize);
-    audioPrefs.putUChar("shiftBits", i2sShiftBits);
-    audioPrefs.putBool("autoRecovery", autoRecoveryEnabled);
     audioPrefs.putBool("schedReset", scheduledResetEnabled);
     audioPrefs.putUInt("resetHours", resetIntervalHours);
-    audioPrefs.putUInt("minRate", minAcceptableRate);
-    audioPrefs.putUInt("checkInterval", performanceCheckInterval);
-    audioPrefs.putBool("thrAuto", autoThresholdEnabled);
     audioPrefs.putUChar("cpuFreq", cpuFrequencyMhz);
     audioPrefs.putFloat("wifiTxDbm", wifiTxPowerDbm);
     audioPrefs.putBool("wifiPs", wifiPowerSave);
@@ -574,27 +516,19 @@ void saveAudioSettings() {
     if (ohLimit > OVERHEAT_MAX_LIMIT_C) ohLimit = OVERHEAT_MAX_LIMIT_C;
     audioPrefs.putUInt("ohThresh", ohLimit);
     audioPrefs.putString("ohReason", overheatLastReason);
-    audioPrefs.putString("ohStamp", overheatLastTimestamp);
-    audioPrefs.putFloat("ohTripC", overheatTripTemp);
     audioPrefs.putBool("ohLatched", overheatLatched);
     audioPrefs.end();
 
     simplePrintln("Settings saved to flash");
 }
 
-// Schedule a safe reboot (optionally with factory reset) after delayMs
+// Reboot (optionally restoring defaults first) from loop() once delayMs has passed, so an HTTP
+// handler can send its reply before the device goes away.
 void scheduleReboot(bool factoryReset, uint32_t delayMs) {
     scheduledFactoryReset = factoryReset;
-    scheduledRebootAt = millis() + delayMs;
-}
-
-// Compute recommended minimum packet-rate threshold based on current sample rate and buffer size
-uint32_t computeRecommendedMinRate() {
-    uint32_t buf = max((uint16_t)1, currentBufferSize);
-    float expectedPktPerSec = (float)currentSampleRate / (float)buf;
-    uint32_t rec = (uint32_t)(expectedPktPerSec * 0.5f + 0.5f); // 50% safety margin
-    if (rec < 5) rec = 5;
-    return rec;
+    rebootRequestedAt = millis();
+    rebootDelayMs = delayMs;
+    rebootScheduled = true;
 }
 
 // Restore application settings to safe defaults and persist
@@ -610,14 +544,8 @@ void resetToDefaultSettings() {
     currentSampleRate = DEFAULT_SAMPLE_RATE;
     currentGainFactor = DEFAULT_GAIN_FACTOR;
     currentBufferSize = DEFAULT_BUFFER_SIZE;
-    i2sShiftBits = 0;  // Default for PDM microphone on M5Stack Atom Echo
-
-    autoRecoveryEnabled = false;
-    autoThresholdEnabled = true;
     scheduledResetEnabled = false;
     resetIntervalHours = 24;
-    minAcceptableRate = computeRecommendedMinRate();
-    performanceCheckInterval = 15;
     cpuFrequencyMhz = DEFAULT_CPU_MHZ;
     wifiTxPowerDbm = DEFAULT_WIFI_TX_DBM;
     wifiPowerSave = DEFAULT_WIFI_POWER_SAVE;
@@ -628,15 +556,8 @@ void resetToDefaultSettings() {
     ledMode = 1;
     overheatProtectionEnabled = DEFAULT_OVERHEAT_PROTECTION;
     overheatShutdownC = (float)DEFAULT_OVERHEAT_LIMIT_C;
-    overheatLockoutActive = false;
-    overheatTripTemp = 0.0f;
-    overheatTriggeredAt = 0;
     overheatLastReason = "";
-    overheatLastTimestamp = "";
-    overheatSensorFault = false;
     overheatLatched = false;
-    lastTemperatureC = 0.0f;
-    lastTemperatureValid = false;
 
     saveAudioSettings();
 
@@ -656,7 +577,7 @@ static String logTimestamp() {
         strftime(buf, sizeof(buf), "[%H:%M:%SZ] ", &ti);
         return String(buf);
     }
-    unsigned long s = (millis() - bootTime) / 1000;
+    unsigned long s = uptimeSeconds();
     unsigned long h = s / 3600; s %= 3600;
     unsigned long m = s / 60; s %= 60;
     snprintf(buf, sizeof(buf), "[+%02lu:%02lu:%02lu] ", h, m, s);
@@ -670,7 +591,7 @@ void simplePrint(String message) {
 void simplePrintln(String message) {
     String stamped = logTimestamp() + message;
     Serial.println(stamped);
-    webui_pushLog(stamped);
+    webui_pushLog(stamped.c_str());
 }
 
 // ================== AUDIO PIPELINE: FRAME POOL ==================
@@ -740,6 +661,13 @@ static void flushReadyQueue() {
     while (readyQ && xQueueReceive(readyQ, &f, 0) == pdTRUE) {
         xQueueSend(freeQ, &f, 0);
     }
+}
+
+// The RTSP client's address while one is connected (negotiating or streaming), else "". Never
+// touches the socket during a session: the sender task owns it then.
+const char* currentRtspClient() {
+    if (senderTaskHandle) return rtspClientIp.c_str();
+    return rtspClient.connected() ? rtspClientIp.c_str() : "";
 }
 
 uint16_t streamQueueDepth() {
@@ -1253,7 +1181,6 @@ static bool startStreamSession(WiFiClient& client) {
     queueHighWater = 0;
     sendStallMaxMs = 0;
     sendStallCount = 0;
-    lastStatsReset = millis();
     lastRtspPlayMs = millis();
     rtspPlayCount++;
     streamEndReason = "";
@@ -1307,7 +1234,6 @@ static void revertAudioConfig(uint32_t rate, uint16_t buf, const char* why) {
     if (rate != 0 && buf != 0 && (currentSampleRate != rate || currentBufferSize != buf)) {
         currentSampleRate = rate;
         currentBufferSize = buf;
-        if (autoThresholdEnabled) minAcceptableRate = computeRecommendedMinRate();
         saveAudioSettings();
     }
     simplePrintln(String("Audio reconfiguration aborted (") + why + "); keeping " +
@@ -1335,8 +1261,6 @@ void restartI2S() {
         if (!allocFramePool()) simplePrintln("Frame pool still unavailable: PLAY will be refused until reboot");
     }
     updateHighpassCoeffs();
-    maxPacketRate = 0;
-    minPacketRate = 0xFFFFFFFF;
     resumeCapture();
     simplePrintln("Audio pipeline restarted");
 }
@@ -1509,8 +1433,6 @@ void setup() {
     senderExitSem = xSemaphoreCreateBinary();
 
     randomSeed((uint32_t)micros() ^ (uint32_t)(ESP.getEfuseMac() & 0xFFFFFFFF));
-
-    bootTime = millis(); // Store boot time
     rtpSSRC = (uint32_t)random(1, 0x7FFFFFFF);
 
     // Load settings from flash
@@ -1559,39 +1481,19 @@ void setup() {
     updateHighpassCoeffs();
     startCaptureTask();
 
-    if (!overheatLatched) {
-        rtspServer.begin();
-        rtspServer.setNoDelay(true);
-        rtspServerEnabled = true;
-    } else {
-        rtspServerEnabled = false;
-        rtspServer.stop();
-    }
+    setRtspServer(true);   // stays off while the thermal latch is set
     // Web UI
     webui_begin();
 
-    lastStatsReset = millis();
     lastRTSPActivity = millis();
     lastMemoryCheck = millis();
-    lastPerformanceCheck = millis();
-    lastWiFiCheck = millis();
-    minFreeHeap = ESP.getFreeHeap();
     float initialTemp = temperatureRead();
     if (isTemperatureValid(initialTemp)) {
         maxTemperature = initialTemp;
         lastTemperatureC = initialTemp;
         lastTemperatureValid = true;
-        overheatSensorFault = false;
     } else {
-        maxTemperature = 0.0f;
-        lastTemperatureC = 0.0f;
-        lastTemperatureValid = false;
         overheatSensorFault = true;
-        overheatLastReason = "Thermal protection disabled: temperature sensor unavailable.";
-        overheatLastTimestamp = "";
-        overheatTripTemp = 0.0f;
-        overheatTriggeredAt = 0;
-        persistOverheatNote();
         simplePrintln("WARNING: Temperature sensor unavailable at startup. Thermal protection paused.");
     }
 
@@ -1616,17 +1518,11 @@ void loop() {
 
     // Heap monitoring (every 10 minutes — useful for detecting leaks in long deployments)
     if (millis() - lastMemoryCheck > 600000) { // 10 min
-        uint32_t currentHeap = ESP.getFreeHeap();
-        if (currentHeap < minFreeHeap) minFreeHeap = currentHeap;
-        Serial.printf("[Heap] Current: %u KB, Min: %u KB\n", currentHeap / 1024, minFreeHeap / 1024);
+        Serial.printf("[Heap] Current: %u KB, Min: %u KB\n", ESP.getFreeHeap() / 1024, ESP.getMinFreeHeap() / 1024);
         lastMemoryCheck = millis();
     }
 
-    if (millis() - lastPerformanceCheck > (performanceCheckInterval * 60000UL)) {
-        checkPerformance();
-        lastPerformanceCheck = millis();
-    }
-
+    static unsigned long lastWiFiCheck = 0;
     if (millis() - lastWiFiCheck >= 1000) {
         lastWiFiCheck = millis();
         checkWiFi();
@@ -1678,7 +1574,7 @@ void loop() {
         }
     }
     if (senderTaskHandle && stopStreamRequested && stopRequestedAt != 0 &&
-        millis() - stopRequestedAt > SENDER_JOIN_LIMIT_MS && scheduledRebootAt == 0) {
+        millis() - stopRequestedAt > SENDER_JOIN_LIMIT_MS && !rebootScheduled) {
         simplePrintln("Sender task did not exit for 30 s; rebooting to recover");
         scheduleReboot(false, 200);
     }
@@ -1705,7 +1601,6 @@ void loop() {
                     rtspClientIp = rtspClient.remoteIP().toString();
                     rtspParseBufferPos = 0;
                     lastRTSPActivity = millis();
-                    lastRtspClientConnectMs = millis();
                     rtspConnectCount++;
                     simplePrintln("New RTSP client: " + rtspClientIp);
                 }
@@ -1721,7 +1616,7 @@ void loop() {
     }
 
     // Handle deferred reboot/reset safely here
-    if (scheduledRebootAt != 0 && millis() >= scheduledRebootAt) {
+    if (rebootScheduled && millis() - rebootRequestedAt >= rebootDelayMs) {
         if (scheduledFactoryReset) {
             resetToDefaultSettings();
         }
