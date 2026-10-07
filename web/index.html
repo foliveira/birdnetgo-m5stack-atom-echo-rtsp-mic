@@ -33,6 +33,7 @@ form label.check{display:flex;gap:8px;align-items:center}
 form label.check>span{display:inline;margin:0}
 small{display:block;color:var(--muted);font-size:12.5px;margin-top:3px}
 input,select,button{font:inherit;color:inherit}
+input[type=file]{max-width:100%}
 input[type=number],input[type=text],select{width:100%;max-width:260px;padding:6px 8px;border:1px solid var(--line);border-radius:6px;background:var(--field)}
 input[type=checkbox]{width:18px;height:18px;margin:0}
 .dirty{outline:2px solid var(--warn);outline-offset:1px}
@@ -162,6 +163,16 @@ pre{margin:10px 0 0;max-height:50vh;overflow:auto;white-space:pre-wrap;word-brea
   <small>Restore defaults resets audio and device settings and reboots; the WiFi network is kept. Change WiFi network forgets it and restarts into the setup portal: join the <b>ESP32-RTSP-Mic-AP</b> network to pick another. Holding the device's button for 5 s does the same.</small>
 </section>
 
+<section class="card" style="margin-bottom:12px"><h2>Firmware update</h2>
+  <div class="row">
+    <input type="file" id="fwFile" accept=".bin,application/octet-stream">
+    <button type="button" id="fwInstall" disabled>Install</button>
+  </div>
+  <div class="meter" id="fwBar" hidden><div id="fwProgress"></div></div>
+  <div class="msg" id="fwMsg"></div>
+  <small>Install a <b>firmware.bin</b> from the <a href="https://github.com/foliveira/birdnetgo-m5stack-atom-echo-rtsp-mic/releases" target="_blank" rel="noopener">releases page</a>. The device checks the whole image before switching to it, and if the new version restarts before it has kept WiFi for a minute, the device goes back to the current one.</small>
+</section>
+
 <section class="card">
 <details id="logBox"><summary>Log <span class="muted" style="font-weight:400">(times in UTC, + marks time since boot)</span></summary>
   <div class="row" style="margin-top:8px"><button class="small" type="button" id="copyLog">Copy</button></div>
@@ -175,7 +186,7 @@ pre{margin:10px 0 0;max-height:50vh;overflow:auto;white-space:pre-wrap;word-brea
 'use strict';
 const $ = (id) => document.getElementById(id);
 const forms = [...document.querySelectorAll('form[data-settings]')];
-let st = null, logSeq = 0, timer = 0, clipsSeen = null, clipUntil = 0;
+let st = null, logSeq = 0, timer = 0, clipsSeen = null, clipUntil = 0, uploading = false;
 
 for (let c = 30; c <= 95; c += 5) document.querySelector('[name=oh_limit]').add(new Option(c, c));
 
@@ -368,6 +379,38 @@ function copyText(text, btn) {
   try { document.execCommand('copy'); done(); } catch (e) { /* ignore */ }
   ta.remove();
 }
+$('fwFile').onchange = () => { $('fwInstall').disabled = !$('fwFile').files.length; };
+$('fwInstall').onclick = () => {
+  const file = $('fwFile').files[0];
+  if (!file || !confirm('Install ' + file.name + ' and restart? Streaming stops during the update.')) return;
+  const msg = $('fwMsg');
+  const done = (text) => {
+    uploading = false;
+    msg.textContent = text; msg.className = 'msg bad';
+    $('fwInstall').disabled = false; $('fwBar').hidden = true;
+    poll();
+  };
+  const body = new FormData();
+  body.append('firmware', file, file.name);
+  const xhr = new XMLHttpRequest();   // fetch() cannot report upload progress
+  xhr.upload.onprogress = (e) => { if (e.lengthComputable) $('fwProgress').style.width = (e.loaded / e.total * 100).toFixed(1) + '%'; };
+  xhr.onload = () => {
+    if (xhr.status === 200) { uploading = false; waitForReboot(); return; }
+    let err = 'HTTP ' + xhr.status;
+    try { err = JSON.parse(xhr.responseText).error || err; } catch (e) { /* not JSON */ }
+    done('Not installed: ' + err);
+  };
+  xhr.onerror = () => done('Upload failed: the connection dropped.');
+  uploading = true;
+  clearTimeout(timer);
+  $('fwInstall').disabled = true;
+  $('fwProgress').style.width = '0';
+  $('fwBar').hidden = false;
+  msg.textContent = 'Uploading…'; msg.className = 'msg muted';
+  xhr.open('POST', '/api/update');
+  xhr.send(body);
+};
+
 $('copyUrl').onclick = () => copyText($('url').textContent, $('copyUrl'));
 $('copyLog').onclick = () => copyText($('log').textContent, $('copyLog'));
 
@@ -389,6 +432,7 @@ $('logBox').addEventListener('toggle', () => {
 
 async function poll() {
   clearTimeout(timer);
+  if (uploading) return;   // the device serves one request at a time; let the upload have it
   try {
     const s = await (await api('/api/state')).json();
     $('offline').style.display = 'none';

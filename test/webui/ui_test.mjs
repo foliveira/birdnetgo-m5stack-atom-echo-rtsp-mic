@@ -60,6 +60,14 @@ async function openPage() {
   };
   await send('Page.enable');
   await send('Runtime.enable');
+  // Accept confirm() dialogs as a user would; a dialog left open blocks the page's script.
+  const dialogs = [];
+  listeners.push((msg) => {
+    if (msg.method === 'Page.javascriptDialogOpening') {
+      dialogs.push(msg.params.message);
+      send('Page.handleJavaScriptDialog', { accept: true });
+    }
+  });
   // Record every request the page makes, so checks can see what was sent.
   const requests = [];
   await send('Network.enable');
@@ -70,7 +78,7 @@ async function openPage() {
     }
   });
   const close = async () => { ws.close(); await fetch(CDP + '/json/close/' + target.id); };
-  return { send, once, evaluate, requests, close };
+  return { send, once, evaluate, requests, dialogs, close };
 }
 
 async function load(page, url, width = 1280, height = 900, mobile = false) {
@@ -78,7 +86,6 @@ async function load(page, url, width = 1280, height = 900, mobile = false) {
   const loaded = page.once('Page.loadEventFired');
   await page.send('Page.navigate', { url });
   await loaded;
-  await page.evaluate('window.confirm = () => true');   // a real dialog would block the page
   await waitFor(page, "document.getElementById('status').textContent !== 'Loading…'", 'first render');
 }
 
@@ -214,9 +221,30 @@ async function streamingScenario(base) {
   check(overflow <= 0, 'no horizontal scrolling at 390 px', overflow);
   await screenshot(page, 'mobile');
 
+  // Firmware upload: a file that is not an ESP32 image is refused with the device's reason.
+  const pick = (bytes) => page.evaluate(`(() => {
+    const dt = new DataTransfer();
+    dt.items.add(new File([new Uint8Array(${JSON.stringify(bytes)})], 'firmware.bin'));
+    const input = document.getElementById('fwFile');
+    input.files = dt.files;
+    input.dispatchEvent(new Event('change'));
+  })()`);
+  await pick([0x00, 0x01, 0x02, 0x03]);
+  check(await page.evaluate("!document.getElementById('fwInstall').disabled"), 'Install enabled once a file is picked');
+  await page.evaluate("document.getElementById('fwInstall').click()");
+  await waitFor(page, "document.getElementById('fwMsg').textContent.startsWith('Not installed')", 'upload refusal');
+  check(await text(page, 'fwMsg') === 'Not installed: Wrong Magic Byte', 'device reason shown', await text(page, 'fwMsg'));
+  await pick([0xe9, 0x06, 0x02, 0x20, 0x00, 0x00]);
+  await page.evaluate("document.getElementById('fwInstall').click()");
+  await waitFor(page, "getComputedStyle(document.getElementById('overlay')).display === 'flex'", 'restart overlay after an update');
+  await waitFor(page, "getComputedStyle(document.getElementById('overlay')).display !== 'flex'", 'page reloaded after the update', 15000);
+
   // Reboot shows the overlay and the page reloads when the device answers again.
   await page.evaluate("document.querySelector('[data-action=reboot]').click()");
   await waitFor(page, "getComputedStyle(document.getElementById('overlay')).display === 'flex'", 'reboot overlay');
+  check(page.dialogs.includes('Reboot the device?'), 'reboot asked for confirmation', page.dialogs);
+  check(page.dialogs.includes('Install firmware.bin and restart? Streaming stops during the update.'), 'update asked for confirmation', page.dialogs);
+  check(page.dialogs.some((d) => d.startsWith('This restarts the audio pipeline')), 'frame size change asked for confirmation', page.dialogs);
   await page.close();
 }
 

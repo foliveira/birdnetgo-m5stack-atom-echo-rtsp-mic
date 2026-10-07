@@ -7,6 +7,7 @@
 #include <errno.h>
 #include <lwip/sockets.h>
 #include <esp_heap_caps.h>
+#include <esp_ota_ops.h>
 #include <esp_timer.h>
 #include "App.h"
 #include "AudioDsp.h"
@@ -1491,6 +1492,28 @@ static void checkButton() {
     }
 }
 
+// Firmware updates run on probation. The core calls this before setup(); returning true keeps a
+// freshly written image in the "pending verify" state instead of accepting it at once, so if it
+// restarts (crash, watchdog, a failed WiFi join ending in the portal's restart) before
+// confirmFirmware() accepts it, the bootloader goes back to the previous firmware.
+extern "C" bool verifyRollbackLater() {
+    return true;
+}
+
+// Accept the running firmware once it has kept WiFi for a minute (a no-op unless it was just
+// installed by an update).
+static void confirmFirmware() {
+    static bool done = false;
+    if (done || !wifiLinkUp || uptimeSeconds() < 60) return;
+    done = true;
+    esp_ota_img_states_t state;
+    if (esp_ota_get_state_partition(esp_ota_get_running_partition(), &state) == ESP_OK &&
+        state == ESP_OTA_IMG_PENDING_VERIFY) {
+        esp_ota_mark_app_valid_cancel_rollback();
+        simplePrintln("Firmware update confirmed: ran for a minute with WiFi");
+    }
+}
+
 // Web UI is a separate module (WebUI.*)
 
 void setup() {
@@ -1632,6 +1655,7 @@ void loop() {
 
     checkScheduledReset();
     checkButton();
+    confirmFirmware();
 
     // The capture task (higher priority, same core) stamps these at any moment. Read them before
     // millis(): the other order can pair a newer stamp with an older "now", and the unsigned

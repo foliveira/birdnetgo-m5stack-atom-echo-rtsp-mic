@@ -133,6 +133,18 @@ createServer(async (req, res) => {
       downUntil = Date.now() + 60000;
     } else { json(res, 400, { error: 'unknown action' }); return; }
     json(res, 200, { ok: true });
+  } else if (req.method === 'POST' && url.pathname === '/api/update') {
+    if (crossSite(req)) { json(res, 403, { error: 'cross-site request refused' }); return; }
+    // Multipart body: the file's bytes start after the part's header block.
+    const chunks = [];
+    for await (const c of req) chunks.push(c);
+    const raw = Buffer.concat(chunks);
+    const start = raw.indexOf('\r\n\r\n');
+    if (start < 0 || raw.length <= start + 4) { json(res, 400, { error: 'no firmware file in the request' }); return; }
+    if (raw[start + 4] !== 0xe9) { log('Firmware update failed: Wrong Magic Byte'); json(res, 400, { error: 'Wrong Magic Byte' }); return; }
+    log('Firmware update written; restarting into it');
+    downUntil = Date.now() + 4000;
+    json(res, 200, { ok: true });
   } else if (req.method === 'GET' && url.pathname === '/api/logs') {
     const end = logs.length;
     let first = Number.parseInt(url.searchParams.get('since') || '0', 10) || 0;

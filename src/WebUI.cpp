@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include <Update.h>
 #include <WiFi.h>
 #include <WebServer.h>
 #include <math.h>
@@ -14,6 +15,7 @@
 //   GET  /api/state      settings ("cfg") and live status ("live"); the page polls it every second
 //   POST /api/settings   any subset of the cfg keys; all are validated before any is applied
 //   POST /api/action     name=restart_audio|server_on|server_off|clear_thermal|reboot|defaults|forget_wifi
+//   POST /api/update     multipart upload of a firmware .bin; the device restarts into it
 //   GET  /api/logs?since=N  log lines after line N as text; X-Log-Seq holds the newest line number
 //   GET  /metrics        Prometheus text format; counters are totals since boot
 
@@ -197,10 +199,15 @@ static void httpMetrics() {
 }
 
 // Browsers attach Origin to cross-site POSTs. Refusing those keeps other web pages open in the
-// same browser from changing settings or rebooting the device; curl and scripts send no Origin.
-static bool fromThisPage() {
+// same browser from changing settings, uploading firmware or rebooting the device; curl and
+// scripts send no Origin.
+static bool crossSite() {
     const String origin = web.header("Origin");
-    if (origin.length() == 0 || origin == "http://" + web.hostHeader()) return true;
+    return origin.length() != 0 && origin != "http://" + web.hostHeader();
+}
+
+static bool fromThisPage() {
+    if (!crossSite()) return true;
     sendError(403, "cross-site request refused");
     return false;
 }
@@ -409,6 +416,57 @@ static void httpAction() {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Firmware update. WebServer calls the upload handler for every chunk of the multipart body, then
+// the request handler to reply. Update writes to the other OTA slot and switches the boot slot
+// only after esp_ota_set_boot_partition() has verified the whole image (checksum and SHA-256),
+// so a truncated or foreign file leaves the running firmware in place. The new firmware then
+// runs on probation until confirmFirmware() in the sketch accepts it.
+
+static String updateError;
+static bool updateStarted = false;
+
+static void httpUpdateUpload() {
+    HTTPUpload& up = web.upload();
+    if (up.status == UPLOAD_FILE_START) {
+        updateError = "";
+        updateStarted = false;
+        if (crossSite()) {
+            updateError = "cross-site request refused";
+            return;
+        }
+        simplePrintln("Firmware update: receiving " + up.filename);
+        requestStreamStop("firmware update");   // flash writes stall the capture task; end the session cleanly
+        if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
+            updateError = Update.errorString();
+            return;
+        }
+        updateStarted = true;
+    } else if (up.status == UPLOAD_FILE_WRITE) {
+        if (updateStarted && updateError.length() == 0 && Update.write(up.buf, up.currentSize) != up.currentSize) {
+            updateError = Update.errorString();
+        }
+    } else if (up.status == UPLOAD_FILE_END) {
+        if (updateStarted && updateError.length() == 0 && !Update.end(true)) updateError = Update.errorString();
+    } else if (up.status == UPLOAD_FILE_ABORTED) {
+        updateError = "upload interrupted";
+    }
+}
+
+static void httpUpdateDone() {
+    if (!fromThisPage()) return;
+    if (!updateStarted && updateError.length() == 0) updateError = "no firmware file in the request";
+    if (updateError.length()) {
+        Update.abort();   // frees the buffer; a half-written slot is never made bootable
+        simplePrintln("Firmware update failed: " + updateError);
+        sendError(400, updateError.c_str());
+        return;
+    }
+    simplePrintln("Firmware update written; restarting into it");
+    sendOk();
+    scheduleReboot(RebootKind::Plain, 1000, "firmware update");
+}
+
+// ---------------------------------------------------------------------------------------------
 
 static void httpIndex() {
     web.sendHeader("Content-Encoding", "gzip");
@@ -425,6 +483,7 @@ void webui_begin() {
     web.on("/api/action", HTTP_POST, httpAction);
     web.on("/api/logs", HTTP_GET, httpLogs);
     web.on("/metrics", HTTP_GET, httpMetrics);
+    web.on("/api/update", HTTP_POST, httpUpdateDone, httpUpdateUpload);
     web.onNotFound([]() { web.send(404, "text/plain", "Not found"); });
     web.begin();
 }
