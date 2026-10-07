@@ -85,5 +85,6 @@ float snapWifiTxDbm(float dbm);
 void setDeviceName(const char* name);
 bool setRtspServer(bool on);   // false: refused because the thermal latch is set
 void clearThermalLatch();
-void scheduleReboot(bool factoryReset, uint32_t delayMs, const char* why);   // why: a string literal
+enum class RebootKind { Plain, RestoreDefaults, ForgetWifi };
+void scheduleReboot(RebootKind kind, uint32_t delayMs, const char* why);   // why: a string literal
 bool requestStreamStop(const char* reason);

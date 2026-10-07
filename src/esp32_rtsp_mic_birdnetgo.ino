@@ -110,6 +110,8 @@ const char* FW_VERSION_STR = FW_VERSION;
 #define SPK_BCLK_PIN    19  // amplifier bit clock: unused, held low
 #define SPK_DATA_PIN    22  // amplifier data: unused, held low
 #define LED_PIN         27  // SK6812 RGB LED
+#define BUTTON_PIN      39  // front button: low while pressed (external pull-up)
+#define BUTTON_FORGET_WIFI_MS 5000  // hold this long to forget the WiFi network
 
 // -- Network identity
 #define DEFAULT_DEVICE_NAME "atomecho"        // DHCP and mDNS name (atomecho.local); a setting
@@ -172,7 +174,7 @@ Preferences audioPrefs;
 unsigned long lastMemoryCheck = 0;
 unsigned long lastTempCheck = 0;
 // Deferred reboot (requested from an HTTP handler, carried out by loop() after the reply is out)
-bool scheduledFactoryReset = false;
+RebootKind rebootKind = RebootKind::Plain;
 bool rebootScheduled = false;
 unsigned long rebootRequestedAt = 0;
 uint32_t rebootDelayMs = 0;
@@ -564,11 +566,11 @@ void saveAudioSettings() {
     simplePrintln("Settings saved to flash");
 }
 
-// Reboot (optionally restoring defaults first) from loop() once delayMs has passed, so an HTTP
-// handler can send its reply before the device goes away. `why` is shown as the restart reason
-// after the reboot; it must be a string literal.
-void scheduleReboot(bool factoryReset, uint32_t delayMs, const char* why) {
-    scheduledFactoryReset = factoryReset;
+// Reboot (after restoring defaults or forgetting the WiFi network, if asked) from loop() once
+// delayMs has passed, so an HTTP handler can send its reply before the device goes away. `why` is
+// shown as the restart reason after the reboot; it must be a string literal.
+void scheduleReboot(RebootKind kind, uint32_t delayMs, const char* why) {
+    rebootKind = kind;
     rebootRequestedAt = millis();
     rebootDelayMs = delayMs;
     rebootNote = why;
@@ -812,8 +814,11 @@ static void ledShow(uint32_t c) {
     neopixelWrite(LED_PIN, (uint8_t)(c >> 16), (uint8_t)(c >> 8), (uint8_t)c);   // core RMT driver
 }
 
+volatile bool buttonHeld = false;   // held long enough to show that a WiFi reset is coming
+
 // Faults (thermal latch, no WiFi) show even with the LED set to off: then it is the only sign.
 static uint32_t ledColorFor(bool streaming, bool clipped, float pct) {
+    if (buttonHeld)      return LED_SETUP;                            // cyan: release now or the WiFi setup opens
     if (overheatLatched) return rgb(10, 0, 0);                        // red: thermal latch
     if (!wifiLinkUp)     return LED_STARTUP;                          // yellow: no WiFi, as while joining at boot
     if (!streaming) return (ledMode > 0) ? rgb(0, 0, 10) : 0;         // blue: ready
@@ -1463,6 +1468,29 @@ void processRTSP(WiFiClient &client) {
 }
 
 
+// Holding the button for BUTTON_FORGET_WIFI_MS forgets the WiFi network and restarts into the setup
+// portal: the way to move the device to another network without the Web UI. After 1 s the LED
+// turns cyan so the hold is visibly registering.
+static void checkButton() {
+    static unsigned long downSince = 0;
+    if (digitalRead(BUTTON_PIN) != LOW) {
+        downSince = 0;
+        buttonHeld = false;
+        return;
+    }
+    const unsigned long now = millis();
+    if (downSince == 0) {
+        downSince = now ? now : 1;
+        return;
+    }
+    buttonHeld = now - downSince >= 1000;
+    if (now - downSince >= BUTTON_FORGET_WIFI_MS) {
+        simplePrintln("Button held for 5 s: forgetting the WiFi network, restarting into the setup portal");
+        wifiForgetCredentials();
+        restartWithNote("WiFi network forgotten (button)");
+    }
+}
+
 // Web UI is a separate module (WebUI.*)
 
 void setup() {
@@ -1477,6 +1505,7 @@ void setup() {
     digitalWrite(SPK_BCLK_PIN, LOW);
     pinMode(SPK_DATA_PIN, OUTPUT);
     digitalWrite(SPK_DATA_PIN, LOW);
+    pinMode(BUTTON_PIN, INPUT);   // input-only pin; the board pulls it up
 
     // The first write also sets up the RMT channel, here on the loop task (core 1); the capture
     // task takes over the LED once it runs.
@@ -1602,6 +1631,7 @@ void loop() {
     }
 
     checkScheduledReset();
+    checkButton();
 
     // The capture task (higher priority, same core) stamps these at any moment. Read them before
     // millis(): the other order can pair a newer stamp with an older "now", and the unsigned
@@ -1651,7 +1681,7 @@ void loop() {
     if (senderTaskHandle && stopStreamRequested && stopRequestedAt != 0 &&
         millis() - stopRequestedAt > SENDER_JOIN_LIMIT_MS && !rebootScheduled) {
         simplePrintln("Sender task did not exit for 30 s; rebooting to recover");
-        scheduleReboot(false, 200, "recovery: sender task stuck");
+        scheduleReboot(RebootKind::Plain, 200, "recovery: sender task stuck");
     }
 
     // RTSP idle timeout — disconnect clients that connect but never stream (60s)
@@ -1693,9 +1723,8 @@ void loop() {
 
     // Handle deferred reboot/reset safely here
     if (rebootScheduled && millis() - rebootRequestedAt >= rebootDelayMs) {
-        if (scheduledFactoryReset) {
-            resetToDefaultSettings();
-        }
+        if (rebootKind == RebootKind::RestoreDefaults) resetToDefaultSettings();
+        if (rebootKind == RebootKind::ForgetWifi) wifiForgetCredentials();   // the next boot opens the setup portal
         restartWithNote(rebootNote);
     }
 

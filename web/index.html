@@ -156,9 +156,10 @@ pre{margin:10px 0 0;max-height:50vh;overflow:auto;white-space:pre-wrap;word-brea
     <button type="button" data-action="server_off" id="serverBtn">Stop RTSP server</button>
     <button type="button" data-action="reboot">Reboot</button>
     <button type="button" data-action="defaults">Restore defaults</button>
+    <button type="button" data-action="forget_wifi">Change WiFi network</button>
   </div>
   <div class="msg" id="actionMsg"></div>
-  <small>Restore defaults resets audio and device settings and reboots. WiFi credentials are kept.</small>
+  <small>Restore defaults resets audio and device settings and reboots; the WiFi network is kept. Change WiFi network forgets it and restarts into the setup portal: join the <b>ESP32-RTSP-Mic-AP</b> network to pick another. Holding the device's button for 5 s does the same.</small>
 </section>
 
 <section class="card">
@@ -327,6 +328,7 @@ const confirmText = {
   server_off: 'Stop the RTSP server? Streaming ends until you start it again.',
   reboot: 'Reboot the device?',
   defaults: 'Restore default settings and reboot? WiFi credentials are kept.',
+  forget_wifi: 'Forget this WiFi network and restart into the setup portal? The device stays offline until you pick a network from the ESP32-RTSP-Mic-AP network.',
 };
 document.addEventListener('click', async (e) => {
   const b = e.target.closest('button[data-action]');
@@ -338,16 +340,21 @@ document.addEventListener('click', async (e) => {
   try {
     await api('/api/action', { name });
     if (name === 'reboot' || name === 'defaults') { waitForReboot(); return; }
+    if (name === 'forget_wifi') { showOverlay('The device is restarting into its WiFi setup portal. Join the ESP32-RTSP-Mic-AP network to choose a new network.'); return; }
     msg.textContent = ''; poll();
   } catch (err) {
     msg.textContent = 'Failed: ' + err.message; msg.className = 'msg bad';
   } finally { b.disabled = false; }
 });
 
-function waitForReboot() {
+function showOverlay(text) {
   clearTimeout(timer);
-  $('overlayMsg').textContent = 'Restarting… this page reloads when the device is back.';
+  $('overlayMsg').textContent = text;
   $('overlay').style.display = 'flex';
+}
+
+function waitForReboot() {
+  showOverlay('Restarting… this page reloads when the device is back.');
   const tick = () => fetch('/api/state', { cache: 'no-store' }).then((r) => r.ok ? location.reload() : setTimeout(tick, 2000)).catch(() => setTimeout(tick, 2000));
   setTimeout(tick, 5000);
 }

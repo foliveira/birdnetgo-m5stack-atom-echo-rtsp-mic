@@ -13,7 +13,7 @@
 //   GET  /               the page (gzip)
 //   GET  /api/state      settings ("cfg") and live status ("live"); the page polls it every second
 //   POST /api/settings   any subset of the cfg keys; all are validated before any is applied
-//   POST /api/action     name=restart_audio|server_on|server_off|clear_thermal|reboot|defaults
+//   POST /api/action     name=restart_audio|server_on|server_off|clear_thermal|reboot|defaults|forget_wifi
 //   GET  /api/logs?since=N  log lines after line N as text; X-Log-Seq holds the newest line number
 //   GET  /metrics        Prometheus text format; counters are totals since boot
 
@@ -394,10 +394,13 @@ static void httpAction() {
         clearThermalLatch();
     } else if (name == "reboot") {
         simplePrintln("Web UI: reboot");
-        scheduleReboot(false, 500, "Web UI reboot");
+        scheduleReboot(RebootKind::Plain, 500, "Web UI reboot");
     } else if (name == "defaults") {
         simplePrintln("Web UI: restore defaults and reboot");
-        scheduleReboot(true, 500, "defaults restored from the Web UI");
+        scheduleReboot(RebootKind::RestoreDefaults, 500, "defaults restored from the Web UI");
+    } else if (name == "forget_wifi") {
+        simplePrintln("Web UI: forget the WiFi network and restart into the setup portal");
+        scheduleReboot(RebootKind::ForgetWifi, 500, "WiFi network forgotten from the Web UI");
     } else {
         sendError(400, "unknown action");
         return;

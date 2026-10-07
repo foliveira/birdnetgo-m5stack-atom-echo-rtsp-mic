@@ -231,6 +231,11 @@ async function latchedScenario(base) {
   await page.evaluate("document.querySelector('#thermalAlert button').click()");
   await waitFor(page, "getComputedStyle(document.getElementById('thermalAlert')).display === 'none'", 'alert cleared');
   check(await text(page, 'status') === 'Waiting for a client', 'server back after Resume', await text(page, 'status'));
+
+  // Change WiFi network: the device leaves the network, so the page explains instead of waiting for it.
+  await page.evaluate("document.querySelector('[data-action=forget_wifi]').click()");
+  await waitFor(page, "getComputedStyle(document.getElementById('overlay')).display === 'flex'", 'portal overlay');
+  check((await text(page, 'overlayMsg')).includes('ESP32-RTSP-Mic-AP'), 'overlay names the setup network', await text(page, 'overlayMsg'));
   await page.close();
 }
 

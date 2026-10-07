@@ -128,6 +128,9 @@ createServer(async (req, res) => {
       log(name === 'reboot' ? 'Web UI: reboot' : 'Web UI: restore defaults and reboot');
       if (name === 'defaults') cfg = { ...defaults };
       downUntil = Date.now() + 4000;
+    } else if (name === 'forget_wifi') {
+      log('Web UI: forget the WiFi network and restart into the setup portal');
+      downUntil = Date.now() + 60000;
     } else { json(res, 400, { error: 'unknown action' }); return; }
     json(res, 200, { ok: true });
   } else if (req.method === 'GET' && url.pathname === '/api/logs') {
