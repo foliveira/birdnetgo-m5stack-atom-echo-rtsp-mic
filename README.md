@@ -8,7 +8,7 @@ Firmware that turns an **M5Stack Atom Echo** into a network microphone: it strea
 
 **Buy**: [M5Stack Store](https://shop.m5stack.com/products/atom-echo-smart-speaker-dev-kit) | [Amazon](https://www.amazon.com/M5Stack-Atom-Echo-Smart-Speaker/dp/B0C7QSVPB2)
 
-This repository is a fork of [stedrow/birdnetgo-m5stack-atom-echo-rtsp-mic](https://github.com/stedrow/birdnetgo-m5stack-atom-echo-rtsp-mic), which did the Atom Echo port, the Web UI, the browser flasher and the release automation. Version 3.0.0 rewrote the streaming core on top of that work and 3.1.0 replaced the Web UI and the WiFi setup. Thank you, [@stedrow](https://github.com/stedrow).
+This repository is a fork of [stedrow/birdnetgo-m5stack-atom-echo-rtsp-mic](https://github.com/stedrow/birdnetgo-m5stack-atom-echo-rtsp-mic), which did the Atom Echo port, the Web UI, the browser flasher and the release automation. Version 3.0.0 rewrote the streaming core on top of that work and 4.0.0 replaced the Web UI and the WiFi setup. Thank you, [@stedrow](https://github.com/stedrow).
 
 ## Features
 
@@ -86,14 +86,14 @@ Hold the front button for 5 s to forget the WiFi network and restart into the se
 ## Updating
 
 ### From 3.0.x or 2.x
-Versions before 3.1.0 cannot install firmware over WiFi, so install 3.1.0 once over USB. WiFi credentials and settings are kept.
+Versions before 4.0.0 cannot install firmware over WiFi, so install 4.0.0 once over USB. WiFi credentials and settings are kept.
 
 - Stored settings win over the new defaults. A device that ran 16 kHz keeps it; choose 32 kHz in the Audio card (or press Restore defaults) to get the band above 8 kHz. A stored 8 kHz is replaced by 32 kHz, because 8 kHz clocks the microphone below its specified range.
 - The HTTP API changed. The old `/api/*` endpoints are gone; see [the API reference](docs/DETAILS.md#http-api).
 - The auto recovery setting is gone; a capture watchdog replaces it.
 - Yellow LED now also means the WiFi link is down.
 
-### From 3.1.0 on
+### From 4.0.0 on
 Download `firmware.bin` from the [releases page](https://github.com/foliveira/birdnetgo-m5stack-atom-echo-rtsp-mic/releases) and install it in the Web UI's Firmware update card, or from a shell:
 ```bash
 curl -F firmware=@firmware.bin http://atomecho.local/api/update

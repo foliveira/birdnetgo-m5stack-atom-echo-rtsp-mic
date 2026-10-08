@@ -40,7 +40,7 @@ function state() {
   const peak = 15 + Math.random() * 40;
   if (Math.random() < 0.05) clips++;
   return {
-    fw: '3.1.0',
+    fw: '4.0.0',
     cfg: { ...cfg, tx: snapTx(cfg.tx) },
     live: {
       uptime: up + uptimeBase, restart_reason: restartReason, ip: '192.168.1.50', ssid: 'Garden "AP"',

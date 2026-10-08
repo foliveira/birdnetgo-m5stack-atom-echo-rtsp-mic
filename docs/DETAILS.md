@@ -1,6 +1,6 @@
 # Architecture & Troubleshooting Guide
 
-This is a fork of [stedrow/birdnetgo-m5stack-atom-echo-rtsp-mic](https://github.com/stedrow/birdnetgo-m5stack-atom-echo-rtsp-mic). The Atom Echo port, PDM microphone support and thermal protection described below come from that project; v3.0.0 rewrote the streaming pipeline on top of it and v3.1.0 the Web UI and WiFi handling.
+This is a fork of [stedrow/birdnetgo-m5stack-atom-echo-rtsp-mic](https://github.com/stedrow/birdnetgo-m5stack-atom-echo-rtsp-mic). The Atom Echo port, PDM microphone support and thermal protection described below come from that project; v3.0.0 rewrote the streaming pipeline on top of it and v4.0.0 the Web UI and WiFi handling.
 
 ## Hardware
 
@@ -80,7 +80,7 @@ Decode it against the ELF file of the exact same build (releases include `firmwa
 ```
 
 ### Firmware updates
-`POST /api/update` writes the uploaded image to the other OTA slot with the core's Update library. The boot slot changes only after the whole image has been verified (checksum, SHA-256, chip type), so a truncated or wrong file leaves the running firmware in place. The new firmware boots in the "pending verify" state and the sketch confirms it after it has run for a minute with WiFi. If it restarts before that, the bootloader marks it invalid and boots the previous firmware, which then reports `update rolled back after <reason>` as its last restart. Rollback needs a bootloader built with rollback support; the ones in this project's releases (Arduino-ESP32 2.0.17 up to v3.0.0, 3.3.12 from v3.1.0) have it, and only a USB flash replaces the bootloader.
+`POST /api/update` writes the uploaded image to the other OTA slot with the core's Update library. The boot slot changes only after the whole image has been verified (checksum, SHA-256, chip type), so a truncated or wrong file leaves the running firmware in place. The new firmware boots in the "pending verify" state and the sketch confirms it after it has run for a minute with WiFi. If it restarts before that, the bootloader marks it invalid and boots the previous firmware, which then reports `update rolled back after <reason>` as its last restart. Rollback needs a bootloader built with rollback support; the ones in this project's releases (Arduino-ESP32 2.0.17 up to v3.0.0, 3.3.12 from v4.0.0) have it, and only a USB flash replaces the bootloader.
 
 ## Audio Tuning
 
@@ -134,7 +134,7 @@ A page from another site can still make a browser send a GET to the device's add
 
 ### `GET /api/state`
 ```json
-{"fw": "3.1.0", "cfg": {...}, "live": {...}}
+{"fw": "4.0.0", "cfg": {...}, "live": {...}}
 ```
 `cfg` holds the settings, with the same keys `/api/settings` accepts:
 
@@ -254,7 +254,7 @@ Check "Last restart" in the Device card or the boot log. After a crash, decode t
 
 v2.3.0 and earlier are [@stedrow](https://github.com/stedrow)'s releases of the upstream project, listed here because the firmware still builds on that work. v3.0.0 onwards are this fork.
 
-### v3.1.0
+### v4.0.0
 Settings and WiFi credentials are preserved; see "Updating" in the README.
 - Web UI rewritten: English only, one gzipped 11 KB page, a single JSON state endpoint polled once a second, settings validated before they are applied, cross-site POSTs and foreign host names (DNS rebinding) refused. The old `/api/*` endpoints are removed.
 - Listen to the microphone in the Web UI with a live spectrogram, beside the RTSP stream (`/api/listen`)

@@ -8,12 +8,12 @@ static void testShapeAndTypes() {
     char buf[256];
     JsonOut j(buf, sizeof(buf));
     j.open();
-    j.s("fw", "3.1.0").i("rssi", -61).u("sent", 4000000000UL).b("on", true);
+    j.s("fw", "4.0.0").i("rssi", -61).u("sent", 4000000000UL).b("on", true);
     j.open("audio").u("rate", 32000).f("gain", 3.0, 2).close();
     j.f("temp", NAN, 1).f("inf", INFINITY, 1).null("client").s("none", nullptr);
     j.close();
     CHECK(!j.overflow());
-    CHECK(strcmp(buf, "{\"fw\":\"3.1.0\",\"rssi\":-61,\"sent\":4000000000,\"on\":true,"
+    CHECK(strcmp(buf, "{\"fw\":\"4.0.0\",\"rssi\":-61,\"sent\":4000000000,\"on\":true,"
                       "\"audio\":{\"rate\":32000,\"gain\":3.00},\"temp\":null,\"inf\":null,"
                       "\"client\":null,\"none\":null}") == 0);
     CHECK_EQ(j.length(), strlen(buf));
