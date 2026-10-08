@@ -11,7 +11,7 @@ See `README.md` for project documentation and usage, and `docs/DETAILS.md` for t
 - `src/RestartInfo.cpp` / `RestartInfo.h` — Restart reason, RTC note for the firmware's own restarts, core dump summary after a crash
 - `src/AudioDsp.h`, `src/RtspRequest.h`, `src/JsonOut.h`, `src/PromOut.h`, `src/HostCheck.h`, `src/ImprovSerial.h` — Plain C++ (no Arduino), unit-tested on the host in `test/host`
 - `test/webui/` — Mock device, browser test and API key check for the page
-- `platformio.ini` — Build configuration; the platform is pinned
+- `platformio.ini` — Build configuration; the platform is pinned (pioarduino: Arduino-ESP32 3.3.12 on ESP-IDF 5.5.5)
 
 ## Critical Rules
 
@@ -26,7 +26,7 @@ See `README.md` for project documentation and usage, and `docs/DETAILS.md` for t
 - `loop()` is the only user of the `WiFiClient` object. It closes the client only after the sender has confirmed exit via `senderExitSem`. To stop a session from `loop()` (HTTP handlers run inside it) call `requestStreamStop(reason)`; on an unconfirmed exit it returns false and tears NOTHING down (socket stays open, handle stays set, reboot after 30 s). Never close the socket or touch the frame pool while `senderTaskHandle != NULL`.
 - Sample rate / frame size changes go through `restartI2S()`: it ends the session, parks the capture task (`pauseCapture()`), reinstalls I2S, reallocates the frame pool, resumes, and puts the previous values back if the pool does not fit. Gain/HPF/AGC/LED changes need no restart (read live by the capture task; HPF coefficients hand off under `hpfMux`).
 - The frame pool is allocated frame by frame (the heap's largest block is far smaller than its total): target `TARGET_QUEUE_MS` (3 s), cap 128 KB, stop when 80 KB of heap is left.
-- The capture task is the only LED writer after `setup()`. The LED is driven with the core's `neopixelWrite()`.
+- The capture task is the only LED writer after `setup()`. The LED is driven with the core's `rgbLedWrite()`.
 - Live listening (`/api/listen`) is a separate path: the capture task copies blocks into `listenFeed` (a FreeRTOS stream buffer, one writer, one reader) and a listener task on core 0 owns that HTTP socket while it runs. `loop()` keeps the `WiFiClient`, closes it only after the task has set `exited`, and deletes the buffer only after `captureBlocks` has moved on since the feed was cut. Listening never touches the frame pool or the RTSP socket.
 
 ### Cross-Core Safety
@@ -53,8 +53,9 @@ See `README.md` for project documentation and usage, and `docs/DETAILS.md` for t
 ### Do Not Reintroduce
 - `WiFiClient::write()` in the streaming path (it blocks up to 1 s per retry, 10 retries).
 - Multiple TCP writes per RTP packet or "dropping" a partially written frame.
-- `WiFiClient::flush()` after a write (on arduino-esp32 it discards the receive buffer).
-- Tiny I2S DMA rings (`dma_buf_len=60`): the ring is 8 x 512 frames on purpose, and the I2S event queue must stay much deeper than `dma_buf_count` (RX_DONE events fill it and hide the overrun event).
+- `WiFiClient::clear()` after a write: it discards the receive buffer (`flush()` did on Arduino-ESP32 2.x).
+- Tiny I2S DMA rings (`dma_frame_num` 60): the ring is 8 x 512 frames on purpose. Overruns are counted by the driver's `on_recv_q_ovf` callback (`onI2sRxOverflow`, in IRAM because the core sets `CONFIG_I2S_ISR_IRAM_SAFE`).
+- The legacy I2S driver (`driver/i2s.h`): deprecated in ESP-IDF 5, removed in 6. The microphone uses the PDM RX channel API (`driver/i2s_pdm.h`), right slot.
 - `CORE_DEBUG_LEVEL` above 1 in `platformio.ini` for release builds.
 - CPU frequency options other than 80/160/240 (120 is not a valid PLL setting on ESP32).
 - Sample rates below 16 kHz: the PDM clock (64 x rate) would fall below the SPM1423's 1.0 MHz minimum.
@@ -79,7 +80,7 @@ See `README.md` for project documentation and usage, and `docs/DETAILS.md` for t
 
 ### If System is Unstable or Hot
 1. The ESP32 internal temperature sensor is uncalibrated and reads high; thermal protection trips only after 3 consecutive minutes at/above the limit.
-2. Heat levers, largest first: WiFi power save ON (Network and power card; keeps up only with 16 kHz and an AP with DTIM period 1, because the TCP send window is 5760 B; the firmware suspends it until reboot after 10 dropped frames), CPU 80 MHz, LED off.
+2. Heat levers, largest first: WiFi power save ON (Network and power card; keeps up only with 16 kHz and an AP with DTIM period 1, because the TCP send buffer is 5744 B; the firmware suspends it until reboot after 10 dropped frames), CPU 80 MHz, LED off.
 3. Check WiFi RSSI (should be > -70 dBm) and free heap (should stay near the 80 KB the frame pool leaves).
 
 ## Build, Test & Release

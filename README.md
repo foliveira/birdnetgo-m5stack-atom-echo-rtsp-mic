@@ -125,6 +125,8 @@ sh test/host/run.sh          # Unit tests of the DSP, RTSP parsing, JSON and met
 node test/webui/check_keys.mjs  # Checks that the page, the firmware and the mock device use the same API keys
 ```
 
+The first build installs pioarduino's ESP32 platform (Arduino-ESP32 3.3.12 on ESP-IDF 5.5.5), about 5 GB.
+
 `web/index.html` is the Web UI; the build gzips it into the firmware. To work on it without a device, run `node test/webui/mock_server.mjs` and open `http://localhost:8080/`.
 
 ## Documentation

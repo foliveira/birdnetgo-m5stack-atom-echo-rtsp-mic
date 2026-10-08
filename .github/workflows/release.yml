@@ -48,6 +48,7 @@ jobs:
         with:
           path: |
             ~/.platformio
+            !~/.platformio/.cache
             ~/.cache/pip
           key: ${{ runner.os }}-pio-${{ hashFiles('platformio.ini') }}
           restore-keys: |

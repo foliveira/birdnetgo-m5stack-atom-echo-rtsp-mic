@@ -4,7 +4,7 @@
 // instead of linking against the wrong type.
 #include <Arduino.h>
 
-class WiFiClient;
+#include <WiFiClient.h>
 
 extern const char* FW_VERSION_STR;
 

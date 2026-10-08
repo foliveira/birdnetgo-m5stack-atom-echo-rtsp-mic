@@ -1,7 +1,7 @@
 #include <WiFi.h>
 #include <ESPmDNS.h>
 #include <mdns.h>
-#include "driver/i2s.h"
+#include <driver/i2s_pdm.h>
 #include <Preferences.h>
 #include <math.h>
 #include <errno.h>
@@ -36,7 +36,7 @@ struct TxFrame {
 };
 #define FRAME_HDR_BYTES   16
 #define I2S_DMA_BUF_COUNT 8
-#define I2S_DMA_BUF_LEN   512    // frames per DMA buffer; one buffer is lost per RX_Q_OVF event
+#define I2S_DMA_BUF_LEN   512    // frames per DMA buffer; one buffer is lost per queue overflow
 #define TARGET_QUEUE_MS   3000   // software buffer in front of the socket; one lwIP retransmission timeout is >= 1.5 s
 #define MIN_QUEUE_FRAMES  4
 #define MAX_QUEUE_FRAMES  256
@@ -56,7 +56,8 @@ uint32_t appliedSampleRate = 0;          // what the I2S driver actually runs (f
 static uint16_t appliedBufferSize = 0;
 static QueueHandle_t freeQ = NULL;
 static QueueHandle_t readyQ = NULL;
-static QueueHandle_t i2sEventQueue = NULL;
+static i2s_chan_handle_t i2sRx = NULL;        // PDM RX channel; replaced only while capture is parked
+static volatile uint32_t i2sLostBufs = 0;     // DMA buffers the driver discarded (ISR counter, never reset)
 
 TaskHandle_t captureTaskHandle = NULL;
 TaskHandle_t senderTaskHandle = NULL;
@@ -78,7 +79,7 @@ volatile uint32_t i2sReadErrors = 0;
 volatile uint16_t queueHighWater = 0;
 volatile uint32_t sendStallMaxMs = 0;
 volatile uint32_t sendStallCount = 0;
-volatile uint32_t lastCaptureOkMs = 0;         // last successful i2s_read (capture watchdog)
+volatile uint32_t lastCaptureOkMs = 0;         // last complete I2S read (capture watchdog)
 volatile uint32_t lastMicSignalMs = 0;         // last block whose raw samples were not all identical
 bool micFlat = false;                          // no signal from the microphone for MIC_FLAT_MS
 #define MIC_FLAT_MS 10000
@@ -227,8 +228,8 @@ static const wifi_power_t WIFI_TX_STEPS[] = {
 
 // Nearest supported transmit power step, in dBm.
 float snapWifiTxDbm(float dbm) {
-    float best = WIFI_TX_STEPS[0] * 0.25f;
-    for (wifi_power_t s : WIFI_TX_STEPS) {
+    float best = (int)WIFI_TX_STEPS[0] * 0.25f;
+    for (const int s : WIFI_TX_STEPS) {
         if (fabsf(s * 0.25f - dbm) < fabsf(best - dbm)) best = s * 0.25f;
     }
     return best;
@@ -240,7 +241,7 @@ void applyWifiTxPower(bool log) {
     const wifi_power_t desired = (wifi_power_t)lroundf(snapWifiTxDbm(wifiTxPowerDbm) * 4.0f);
     if (WiFi.getTxPower() == desired) return;
     WiFi.setTxPower(desired);
-    if (log) simplePrintln("WiFi TX power set to " + String(desired * 0.25f, 1) + " dBm");
+    if (log) simplePrintln("WiFi TX power set to " + String((int)desired * 0.25f, 1) + " dBm");
 }
 
 // Apply WiFi modem power save. MIN_MODEM lets the radio sleep between DTIM beacons, which is the
@@ -266,7 +267,7 @@ void updateHighpassCoeffs() {
 
     portENTER_CRITICAL(&hpfMux);
     hpf.b0 = c.b0; hpf.b1 = c.b1; hpf.b2 = c.b2; hpf.a1 = c.a1; hpf.a2 = c.a2;
-    hpfVersion++;
+    hpfVersion = hpfVersion + 1;
     portEXIT_CRITICAL(&hpfMux);
 }
 
@@ -736,60 +737,56 @@ uint16_t streamQueueFrames() {
 }
 
 // ================== I2S (PDM microphone) ==================
+// Called from the driver's DMA interrupt when a buffer finishes while the queue of finished
+// buffers is full: the driver has just discarded the oldest one. The core is built with
+// CONFIG_I2S_ISR_IRAM_SAFE, so the callback must be in IRAM.
+static bool IRAM_ATTR onI2sRxOverflow(i2s_chan_handle_t, i2s_event_data_t*, void*) {
+    i2sLostBufs = i2sLostBufs + 1;
+    return false;
+}
+
 void setup_i2s_driver() {
-    static bool installed = false;
-    if (installed) i2s_driver_uninstall(I2S_NUM_0);
-    i2sEventQueue = NULL;
-
-    // Hardware ring: 8 buffers x 512 frames. The driver keeps one buffer in flight, so 7 x 512 =
-    // 3584 samples (112 ms at 32 kHz, 224 ms at 16 kHz) can wait for the capture task before
-    // samples are lost. (Buffer bytes stay well under the driver's 4092-byte limit.)
-    i2s_config_t i2s_config = {
-        // PDM mode required for SPM1423 microphone on Atom Echo
-        .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX | I2S_MODE_PDM),
-        .sample_rate = currentSampleRate,
-        .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
-        .channel_format = I2S_CHANNEL_FMT_ALL_RIGHT,
-#if ESP_IDF_VERSION > ESP_IDF_VERSION_VAL(4, 1, 0)
-        .communication_format = I2S_COMM_FORMAT_STAND_I2S,
-#else
-        .communication_format = I2S_COMM_FORMAT_I2S,
-#endif
-        .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-        .dma_buf_count = I2S_DMA_BUF_COUNT,
-        .dma_buf_len = I2S_DMA_BUF_LEN,
-        .use_apll = false,
-        .tx_desc_auto_clear = false,
-        .fixed_mclk = 0,
-        .mclk_multiple = I2S_MCLK_MULTIPLE_DEFAULT,
-        .bits_per_chan = I2S_BITS_PER_CHAN_DEFAULT
-    };
-
-    // PDM RX needs only the clock (on WS) and data in. M5's example also routes the speaker's
-    // bit clock and data because it shares the config with playback; a microphone does not.
-    i2s_pin_config_t pin_config = {
-#if (ESP_IDF_VERSION > ESP_IDF_VERSION_VAL(4, 3, 0))
-        .mck_io_num = I2S_PIN_NO_CHANGE,
-#endif
-        .bck_io_num = I2S_PIN_NO_CHANGE,
-        .ws_io_num = I2S_CLK_PIN,
-        .data_out_num = I2S_PIN_NO_CHANGE,
-        .data_in_num = I2S_DATA_IN_PIN
-    };
-
-    // Event queue lets the capture task count DMA overruns (I2S_EVENT_RX_Q_OVF). The driver also
-    // posts one RX_DONE per finished DMA buffer with no fullness check, so the queue must hold far
-    // more than dma_buf_count events or the OVF event itself gets lost: 40 slots covers a 1.2 s
-    // stall at 16 kHz and the queue is drained before and after every read.
-    esp_err_t err = i2s_driver_install(I2S_NUM_0, &i2s_config, 40, &i2sEventQueue);
-    installed = (err == ESP_OK);
-    if (installed) appliedSampleRate = currentSampleRate;
-    if (err != ESP_OK) {
-        simplePrintln("ERROR: i2s_driver_install failed: " + String((int)err));
-        i2sEventQueue = NULL;
+    if (i2sRx) {
+        i2s_channel_disable(i2sRx);
+        i2s_del_channel(i2sRx);
+        i2sRx = NULL;
     }
-    i2s_set_pin(I2S_NUM_0, &pin_config);
-    i2s_set_clk(I2S_NUM_0, currentSampleRate, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_MONO);
+
+    // Hardware ring: 8 buffers x 512 frames. The driver queues up to 7 finished buffers for the
+    // capture task, so 7 x 512 = 3584 samples (112 ms at 32 kHz, 224 ms at 16 kHz) can wait
+    // before samples are lost. A read that stops inside a buffer gives up the rest of that buffer
+    // one buffer earlier (the driver skips it rather than read it while the DMA overwrites it).
+    i2s_chan_config_t chanCfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
+    chanCfg.dma_desc_num = I2S_DMA_BUF_COUNT;
+    chanCfg.dma_frame_num = I2S_DMA_BUF_LEN;
+
+    // PDM RX needs only the clock and data in. M5's example also routes the speaker's bit clock
+    // and data because it shares the config with playback; a microphone does not. The SPM1423 is
+    // on the right slot (the legacy driver's ALL_RIGHT); the PDM clock is 64 x the sample rate.
+    i2s_pdm_rx_config_t pdmCfg = {
+        .clk_cfg = I2S_PDM_RX_CLK_DEFAULT_CONFIG(currentSampleRate),
+        .slot_cfg = I2S_PDM_RX_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO),
+        .gpio_cfg = {},
+    };
+    pdmCfg.slot_cfg.slot_mask = I2S_PDM_SLOT_RIGHT;
+    pdmCfg.gpio_cfg.clk = (gpio_num_t)I2S_CLK_PIN;
+    pdmCfg.gpio_cfg.din = (gpio_num_t)I2S_DATA_IN_PIN;
+
+    i2s_event_callbacks_t callbacks = {};
+    callbacks.on_recv_q_ovf = onI2sRxOverflow;
+
+    esp_err_t err = i2s_new_channel(&chanCfg, NULL, &i2sRx);
+    if (err == ESP_OK) err = i2s_channel_init_pdm_rx_mode(i2sRx, &pdmCfg);
+    if (err == ESP_OK) err = i2s_channel_register_event_callback(i2sRx, &callbacks, NULL);
+    if (err == ESP_OK) err = i2s_channel_enable(i2sRx);
+    if (err != ESP_OK) {
+        // appliedSampleRate keeps the last rate that ran; the capture watchdog retries the setup.
+        simplePrintln("ERROR: I2S setup failed: " + String((int)err));
+        if (i2sRx) i2s_del_channel(i2sRx);
+        i2sRx = NULL;
+        return;
+    }
+    appliedSampleRate = currentSampleRate;
 
     simplePrintln("I2S ready (PDM mode): " + String(currentSampleRate) + " Hz, " +
                   String(currentBufferSize) + " samples/packet, DMA slack " +
@@ -802,13 +799,12 @@ void setup_i2s_driver() {
 // It is also the only LED writer after setup(), which removes the LED ownership race.
 
 // Returns the number of DMA buffers the driver discarded since the last call.
-static inline uint32_t drainI2sEvents() {
-    if (!i2sEventQueue) return 0;
-    i2s_event_t evt;
-    uint32_t lost = 0;
-    while (xQueueReceive(i2sEventQueue, &evt, 0) == pdTRUE) {
-        if (evt.type == I2S_EVENT_RX_Q_OVF) { i2sOverruns++; lost++; }
-    }
+static inline uint32_t takeLostI2sBufs() {
+    static uint32_t seen = 0;
+    const uint32_t total = i2sLostBufs;
+    const uint32_t lost = total - seen;
+    seen = total;
+    if (lost) i2sOverruns += lost;
     return lost;
 }
 
@@ -821,7 +817,7 @@ static inline uint32_t rgb(uint8_t r, uint8_t g, uint8_t b) {
 #define LED_SETUP   rgb(0, 10, 10)    // cyan: WiFi setup portal
 
 static void ledShow(uint32_t c) {
-    neopixelWrite(LED_PIN, (uint8_t)(c >> 16), (uint8_t)(c >> 8), (uint8_t)c);   // core RMT driver
+    rgbLedWrite(LED_PIN, (uint8_t)(c >> 16), (uint8_t)(c >> 8), (uint8_t)c);   // core RMT driver
 }
 
 volatile bool buttonHeld = false;   // held long enough to show that a WiFi reset is coming
@@ -877,7 +873,8 @@ static void captureTask(void* arg) {
             localHpfVersion = 0xFFFFFFFF;  // sample rate may have changed: refetch coefficients
             localHpf.reset();
             dcRate = 0;
-            lastCaptureOkMs = lastMicSignalMs = millis();
+            lastCaptureOkMs = millis();
+            lastMicSignalMs = lastCaptureOkMs;
             continue;
         }
 
@@ -894,7 +891,8 @@ static void captureTask(void* arg) {
             }
         }
         const uint32_t rate = appliedSampleRate;   // changes only while this task is parked
-        if (rate == 0) { vTaskDelay(pdMS_TO_TICKS(100)); continue; }   // I2S driver not installed
+        const i2s_chan_handle_t rx = i2sRx;        // likewise
+        if (rate == 0 || !rx) { vTaskDelay(pdMS_TO_TICKS(100)); continue; }   // I2S not set up
         if (rate != dcRate) {
             dc.design((float)rate, DC_BLOCK_HZ);
             dc.reset();
@@ -902,17 +900,16 @@ static void captureTask(void* arg) {
         }
 
         // --- one packet worth of samples (blocks in the driver until the DMA has them) ---
-        uint32_t lostBufs = drainI2sEvents();
         size_t bytesRead = 0;
         const size_t want = (size_t)capSamples * sizeof(int16_t);
-        esp_err_t r = i2s_read(I2S_NUM_0, captureBuf, want, &bytesRead, pdMS_TO_TICKS(1000));
-        lostBufs += drainI2sEvents();   // RX_DONE events from this read must not sit in the queue during a stall
+        esp_err_t r = i2s_channel_read(rx, captureBuf, want, &bytesRead, 1000);
+        const uint32_t lostBufs = takeLostI2sBufs();
         if (isStreaming && lostBufs) {
             // Audio the DMA discarded still happened: keep the RTP clock honest.
             rtpTimestamp += lostBufs * I2S_DMA_BUF_LEN;
         }
         if (r != ESP_OK || bytesRead != want) {
-            i2sReadErrors++;
+            i2sReadErrors = i2sReadErrors + 1;
             if (isStreaming) {                  // account for the packet we did not get
                 rtpTimestamp += (uint32_t)((want - bytesRead) / sizeof(int16_t));
                 rtpSequence++;
@@ -948,7 +945,7 @@ static void captureTask(void* arg) {
         const bool streaming = isStreaming;
         if (streaming && freeQ) {
             if (xQueueReceive(freeQ, &frame, 0) != pdTRUE) {
-                framesDroppedQueueFull++;   // either the recycled oldest frame or (never, with >= 2 frames) nothing
+                framesDroppedQueueFull = framesDroppedQueueFull + 1;   // either the recycled oldest frame or (never, with >= 2 frames) nothing
                 xQueueReceive(readyQ, &frame, 0);
             }
         }
@@ -1006,7 +1003,7 @@ static void captureTask(void* arg) {
                 frame->seq = rtpSequence;
                 if (xQueueSend(readyQ, &frame, 0) != pdTRUE) {
                     xQueueSend(freeQ, &frame, 0);
-                    framesDroppedQueueFull++;
+                    framesDroppedQueueFull = framesDroppedQueueFull + 1;
                 }
                 UBaseType_t depth = uxQueueMessagesWaiting(readyQ);
                 if (depth > queueHighWater) queueHighWater = (uint16_t)depth;
@@ -1021,7 +1018,7 @@ static void captureTask(void* arg) {
         const float peakAbs = st.peak > 32767.0f ? 32767.0f : st.peak;
         lastPeakAbs16 = (uint16_t)peakAbs;
         audioClippedLastBlock = st.clipped;
-        if (st.clipped) audioClipCount++;
+        if (st.clipped) audioClipCount = audioClipCount + 1;
         const unsigned long now = millis();
         if (!st.flat) lastMicSignalMs = now;
         if (lastPeakAbs16 > peakHoldAbs16) {
@@ -1040,7 +1037,7 @@ static void captureTask(void* arg) {
                 lastLed = c;
             }
         }
-        captureBlocks++;
+        captureBlocks = captureBlocks + 1;
     }
 }
 
@@ -1069,7 +1066,8 @@ static void resumeCapture() {
 
 static void startCaptureTask() {
     if (captureTaskHandle) return;
-    lastCaptureOkMs = lastMicSignalMs = millis();
+    lastCaptureOkMs = millis();
+    lastMicSignalMs = lastCaptureOkMs;
     BaseType_t ok = xTaskCreatePinnedToCore(captureTask, "AudioCapture", 4096, NULL, 20,
                                             &captureTaskHandle, 1);
     if (ok != pdPASS) {
@@ -1226,7 +1224,7 @@ static void senderTask(void* arg) {
         }
 
         // Send buffer full (WiFi retransmits, slow client, sleeping AP...). Wait, bounded.
-        if (!stallStart) { stallStart = now; sendStallCount++; }
+        if (!stallStart) { stallStart = now; sendStallCount = sendStallCount + 1; }
         if (now - lastProgress > SEND_STALL_LIMIT_MS) { reason = "client stalled"; break; }
         fd_set ws; FD_ZERO(&ws); FD_SET(fd, &ws);
         struct timeval tv = { 0, 50000 };
@@ -1931,7 +1929,7 @@ void loop() {
     const uint32_t captureOkAt = lastCaptureOkMs, micSignalAt = lastMicSignalMs;
     const uint32_t nowMs = millis();
 
-    // Capture watchdog. i2s_read gives up after 1 s, so CAPTURE_STALL_MS without one complete block
+    // Capture watchdog. A read gives up after 1 s, so CAPTURE_STALL_MS without one complete block
     // means the driver stopped delivering; reinstalling it ends any session (the client reconnects).
     if (captureTaskHandle && !capturePauseRequested && appliedSampleRate != 0 &&
         nowMs - captureOkAt > CAPTURE_STALL_MS && nowMs - lastI2SReset > 30000) {
@@ -1991,7 +1989,7 @@ void loop() {
             lastRtspPoll = millis();
             // Phase: accept a new client (never while a previous sender is still being joined)
             if (!rtspClient || !rtspClient.connected()) {
-                WiFiClient newClient = rtspServer.available();
+                WiFiClient newClient = rtspServer.accept();
                 if (newClient) {
                     rtspClient = newClient;
                     rtspClient.setNoDelay(true);   // snappy negotiation; switched off for streaming
