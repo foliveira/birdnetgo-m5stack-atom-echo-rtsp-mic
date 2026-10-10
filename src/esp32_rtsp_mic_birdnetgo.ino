@@ -39,8 +39,8 @@ struct TxFrame {
 #define I2S_DMA_BUF_LEN   512    // frames per DMA buffer; one buffer is lost per queue overflow
 #define TARGET_QUEUE_MS   3000   // software buffer in front of the socket; one lwIP retransmission timeout is >= 1.5 s
 #define MIN_QUEUE_FRAMES  4
-#define MAX_QUEUE_FRAMES  256
-#define MAX_POOL_BYTES    (128 * 1024) // cap on the frame pool regardless of rate/buffer choice
+#define MAX_QUEUE_FRAMES  384    // 3 s of 256-sample frames at 32 kHz is 375
+#define MAX_POOL_BYTES    (196 * 1024) // cap on the frame pool regardless of rate/buffer choice; holds 3 s at 32 kHz
 #define HEAP_HEADROOM_BYTES (80 * 1024) // free heap left to WiFi/lwIP/HTTP once the pool is allocated
 #define CAPTURE_STALL_MS  3000   // no complete I2S block for this long -> reinstall the driver
 #define SEND_STALL_LIMIT_MS 10000 // no byte accepted by the socket for this long -> drop the client
@@ -448,9 +448,8 @@ static void onWifiEvent(arduino_event_id_t event, arduino_event_info_t info) {
 // WiFi link supervision, once a second from loop(). The core reconnects by itself for most
 // disconnect reasons; this logs the transitions and nudges it if the link stays down. A running
 // RTSP session is left to the sender: a disconnection clears the station's address and lwIP then
-// aborts every TCP connection on it (the core is built without
-// CONFIG_LWIP_TCP_KEEP_CONNECTION_WHEN_IP_CHANGES), so the sender's next send fails and the
-// session ends; the client reconnects once the link is back.
+// aborts every TCP connection on it (ESP-IDF 5.5 has no option to keep them), so the sender's
+// next send fails and the session ends; the client reconnects once the link is back.
 static void checkWiFi() {
     static bool wasUp = true;
     static unsigned long downSince = 0, lastKick = 0, lastWeakWarn = 0;
@@ -707,7 +706,9 @@ static bool allocFramePool() {
                   " ms of audio), free heap " + String(heapBefore / 1024) + " -> " +
                   String(heap_caps_get_free_size(caps) / 1024) + " KB");
     if (poolMs < TARGET_QUEUE_MS) {
-        simplePrintln("NOTE: frame pool below the " + String(TARGET_QUEUE_MS) + " ms target (memory); WiFi stalls over " +
+        // n == want: a size cap set want below the target; n < want: free heap ran out first.
+        simplePrintln("NOTE: frame pool below the " + String(TARGET_QUEUE_MS) + " ms target (" +
+                      (n < want ? "free heap" : "size cap") + "); WiFi stalls over " +
                       String(poolMs) + " ms drop audio. A lower sample rate lengthens it.");
     }
     return true;
@@ -1605,7 +1606,7 @@ void handleRTSPCommand(WiFiClient &client, const String& request) {
         // Reply first (the sender is not running yet, so the loop still owns the socket).
         client.print(ok + "Session: " + rtspSessionId + "\r\nRange: npt=0.000-\r\nRTP-Info: url=rtsp://" + ip +
                      ":8554/audio/track1;seq=" + String(rtpSequence) + ";rtptime=" + String(rtpTimestamp) + "\r\n\r\n");
-        // (no client.flush(): on arduino-esp32 that discards the receive buffer)
+        // (no client.clear(): it discards the receive buffer)
 
         if (startStreamSession(client)) {
             simplePrintln("STREAMING STARTED for " + rtspClientIp);
@@ -1948,7 +1949,7 @@ void loop() {
                               : "Microphone signal back");
     }
 
-    // WiFi power save can starve the TCP send window (5760 B per beacon-period RTT). If a session
+    // WiFi power save can starve the TCP send window (5744 B per beacon-period RTT). If a session
     // drops frames while it is on, switch it off until reboot rather than keep dropping audio.
     static unsigned long lastPsCheck = 0;
     if (isStreaming && wifiPowerSave && !wifiPsSuspended && millis() - lastPsCheck > 5000) {
