@@ -64,7 +64,7 @@ BirdNET-Go running in Docker usually cannot resolve `.local` names. Use the devi
 | High-pass filter | On, 300 Hz | Removes wind and traffic rumble; lower it for large owls or bitterns |
 | Frame size | 1024 samples | 32 ms per packet at 32 kHz |
 | CPU clock | 80 MHz | Handles 48 kHz and runs coolest |
-| WiFi power save | Off | Cuts heat, but keeps up only with 16 kHz and an access point with DTIM period 1. Switches itself off if the stream drops frames |
+| WiFi power save | Off | Cuts heat. At 32 kHz it should keep up when the access point's DTIM period is 1 or 2. Switches itself off if the stream drops frames |
 
 ## LED
 
@@ -125,7 +125,7 @@ sh test/host/run.sh          # Unit tests of the DSP, RTSP parsing, JSON and met
 node test/webui/check_keys.mjs  # Checks that the page, the firmware and the mock device use the same API keys
 ```
 
-The first build installs pioarduino's ESP32 platform (Arduino-ESP32 3.3.12 on ESP-IDF 5.5.5), about 5 GB.
+The first build installs pioarduino's ESP32 platform (Arduino-ESP32 3.3.12 on ESP-IDF 5.5.5) and rebuilds the core's ESP-IDF libraries with the `custom_sdkconfig` options in `platformio.ini`: about 7 GB of downloads and tools, and about 4 minutes on a 7-core machine. Later builds reuse the libraries as long as `sdkconfig.defaults`, which the build writes, stays in place. PlatformIO shares the libraries between projects, so a project on the same platform version without these options makes them reinstall, and the next build here rebuilds them.
 
 `web/index.html` is the Web UI; the build gzips it into the firmware. To work on it without a device, run `node test/webui/mock_server.mjs` and open `http://localhost:8080/`.
 

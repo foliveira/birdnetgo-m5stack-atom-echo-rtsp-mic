@@ -11,7 +11,7 @@ See `README.md` for project documentation and usage, and `docs/DETAILS.md` for t
 - `src/RestartInfo.cpp` / `RestartInfo.h` — Restart reason, RTC note for the firmware's own restarts, core dump summary after a crash
 - `src/AudioDsp.h`, `src/RtspRequest.h`, `src/JsonOut.h`, `src/PromOut.h`, `src/HostCheck.h`, `src/ImprovSerial.h` — Plain C++ (no Arduino), unit-tested on the host in `test/host`
 - `test/webui/` — Mock device, browser test and API key check for the page
-- `platformio.ini` — Build configuration; the platform is pinned (pioarduino: Arduino-ESP32 3.3.12 on ESP-IDF 5.5.5)
+- `platformio.ini` — Build configuration; the platform is pinned (pioarduino: Arduino-ESP32 3.3.12 on ESP-IDF 5.5.5). Its `custom_sdkconfig` makes pioarduino rebuild the core's ESP-IDF libraries (TCP send buffer 16 KB). The files that build writes (`sdkconfig.*`, `.dummy/`, `managed_components/`) are ignored; CI caches `sdkconfig.defaults`, without which every build reinstalls and rebuilds the libraries
 
 ## Critical Rules
 
@@ -80,8 +80,8 @@ See `README.md` for project documentation and usage, and `docs/DETAILS.md` for t
 
 ### If System is Unstable or Hot
 1. The ESP32 internal temperature sensor is uncalibrated and reads high; thermal protection trips only after 3 consecutive minutes at/above the limit.
-2. Heat levers, largest first: WiFi power save ON (Network and power card; keeps up only with 16 kHz and an AP with DTIM period 1, because the TCP send buffer is 5744 B; the firmware suspends it until reboot after 10 dropped frames), CPU 80 MHz, LED off.
-3. Check WiFi RSSI (should be > -70 dBm) and free heap (should stay near the 80 KB the frame pool leaves).
+2. Heat levers, largest first: WiFi power save ON (Network and power card; the TCP send buffer, 16 KB, is what one DTIM period can carry, so 32 kHz should keep up with DTIM period 1 or 2, which has not been measured; the firmware suspends it until reboot after 10 dropped frames), CPU 80 MHz, LED off.
+3. Check WiFi RSSI (should be > -70 dBm) and free heap (should stay near the 80 KB the frame pool leaves; while the link stalls each TCP connection can hold up to 16 KB of it).
 
 ## Build, Test & Release
 ```bash

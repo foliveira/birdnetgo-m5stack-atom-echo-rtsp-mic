@@ -138,7 +138,7 @@ pre{margin:10px 0 0;max-height:50vh;overflow:auto;white-space:pre-wrap;word-brea
     <option>-1</option><option>2</option><option>5</option><option>7</option><option>8.5</option><option>11</option><option>13</option><option>15</option><option>17</option><option>18.5</option><option>19</option><option>19.5</option>
   </select><small>Lower only if the access point is close; weak links retransmit more.</small></label>
   <label class="check"><input type="checkbox" name="ps"><span>WiFi power save</span></label>
-  <small>Lets the radio sleep between beacons, the largest heat saving. TCP then gets acknowledgements only once per beacon, which is enough for 16 kHz with an access point DTIM period of 1 but not for higher rates. Switched off automatically if the stream drops frames.</small>
+  <small>Lets the radio sleep between beacons, the largest heat saving. TCP then gets acknowledgements only once per beacon, which should be enough for 32 kHz with an access point DTIM period of 1 or 2. Switched off automatically if the stream drops frames.</small>
   <label style="margin-top:12px"><span>CPU clock</span><select name="cpu"><option value="80">80 MHz</option><option value="160">160 MHz</option><option value="240">240 MHz</option></select><small>80 MHz handles 48 kHz and runs coolest.</small></label>
   <label><span>LED</span><select name="led"><option value="0">Off</option><option value="1">Status colour</option><option value="2">Signal level</option></select></label>
   <div class="row"><button class="primary" type="submit" disabled>Save</button><button type="reset" disabled>Undo</button></div>

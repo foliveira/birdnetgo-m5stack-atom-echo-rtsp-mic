@@ -46,10 +46,13 @@ jobs:
         if: steps.check.outputs.exists == 'false'
         uses: actions/cache@v4
         with:
+          # sdkconfig.defaults carries the hash of the ESP-IDF libraries pioarduino rebuilt for
+          # custom_sdkconfig; without it every run reinstalls and rebuilds them.
           path: |
             ~/.platformio
             !~/.platformio/.cache
             ~/.cache/pip
+            sdkconfig.defaults
           key: ${{ runner.os }}-pio-${{ hashFiles('platformio.ini') }}
           restore-keys: |
             ${{ runner.os }}-pio-

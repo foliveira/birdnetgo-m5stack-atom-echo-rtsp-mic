@@ -1949,8 +1949,9 @@ void loop() {
                               : "Microphone signal back");
     }
 
-    // WiFi power save can starve the TCP send window (5744 B per beacon-period RTT). If a session
-    // drops frames while it is on, switch it off until reboot rather than keep dropping audio.
+    // WiFi power save can starve the TCP send window (16 KB per beacon-period RTT, set in
+    // platformio.ini). If a session drops frames while it is on, switch it off until reboot
+    // rather than keep dropping audio.
     static unsigned long lastPsCheck = 0;
     if (isStreaming && wifiPowerSave && !wifiPsSuspended && millis() - lastPsCheck > 5000) {
         lastPsCheck = millis();
