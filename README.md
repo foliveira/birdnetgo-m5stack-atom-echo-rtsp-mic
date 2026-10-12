@@ -19,7 +19,7 @@ This repository is a fork of [stedrow/birdnetgo-m5stack-atom-echo-rtsp-mic](http
 - Listen to the microphone in the browser, with a live spectrogram, while BirdNET-Go keeps streaming.
 - Firmware updates over WiFi. A new version that restarts before it has run for a minute with WiFi is rolled back to the previous one.
 - Prometheus metrics at `/metrics`: frames sent and dropped, stalls, WiFi drops, RSSI, temperature, signal level.
-- WiFi setup from the browser flasher over USB right after installing, or through a built-in captive portal; joins the strongest access point for the network name (mesh systems, repeaters).
+- WiFi setup through a built-in captive portal, or over USB with Improv Wi-Fi; joins the strongest access point for the network name (mesh systems, repeaters).
 - Reports why the device last restarted, including the task and backtrace after a crash, why WiFi last dropped, and a microphone that stopped delivering signal.
 - Recovers by itself: restarts the audio driver if capture stalls, restarts the device after 10 minutes without WiFi.
 - Thermal protection that trips only after 3 consecutive minutes over the limit, and a WiFi power save option.
@@ -32,11 +32,12 @@ This repository is a fork of [stedrow/birdnetgo-m5stack-atom-echo-rtsp-mic](http
 ```bash
 pio run --target upload
 ```
-Or use the browser flasher in `flash/` (published with GitHub Pages), which installs a release over USB from Chrome or Edge.
+Or write the files of a [release](https://github.com/foliveira/birdnetgo-m5stack-atom-echo-rtsp-mic/releases) with [esptool](https://github.com/espressif/esptool) (`pip install esptool`):
+```bash
+esptool.py --chip esp32 write_flash 0x1000 bootloader.bin 0x8000 partitions.bin 0xe000 boot_app0.bin 0x10000 firmware.bin
+```
 
 ### 2. Connect to WiFi
-With the browser flasher, the installer asks for your WiFi network once the firmware is written and sends it to the device over USB. Otherwise:
-
 On first boot the LED turns cyan and the device opens an open WiFi network named `ESP32-RTSP-Mic-AP`. Join it with a phone or laptop; the setup page opens by itself (or browse to `http://192.168.4.1/`). Pick your network and enter its password. The device joins it and restarts. Only 2.4 GHz networks work.
 
 The LED turns blue once the device is on your network and ready.

@@ -171,7 +171,7 @@ static bool joinNewNetwork(const char* ssidIn, const char* passwordIn, Idle idle
 namespace {
 class ImprovLink : public improv::Hooks {
 public:
-    // Firmware name as in the flasher's manifest, so the flasher recognises an installed copy.
+    // Improv device info: firmware name, firmware version, chip, device name.
     const char* infoStrings[4] = {"Atom Echo RTSP Mic for BirdNET-Go", "", "ESP32", ""};
     bool inPortal = false;
 
@@ -182,7 +182,7 @@ public:
     }
     const char* const* info() override { return infoStrings; }
     int networks(improv::Network* out, int max) override {
-        // The flasher asks again 3 s after each answer while its form is open. A scan takes the
+        // ESP Web Tools asks again 3 s after each answer while its form is open. A scan takes the
         // radio off its channel for 1 to 4 s, more than the RTSP frame pool can cover: reuse the
         // last list for 15 s, and for as long as a client streams.
         if (lastScanAt == 0 || (!isStreaming && millis() - lastScanAt > 15000)) {
@@ -380,7 +380,7 @@ static const char PAGE_HEAD[] =
         keepLoopAlive();   // the loop watchdog covers the portal too: its web server can hang
         dns.processNextRequest();
         server.handleClient();
-        if (improvPoll(hostname, firmwareVersion, true)) lastActivity = millis();   // the flasher, over USB
+        if (improvPoll(hostname, firmwareVersion, true)) lastActivity = millis();   // an Improv client, over USB
         if (WiFi.softAPgetStationNum() > 0) lastActivity = millis();   // someone is on the setup network
 
         // Join outside the request handler so the reply above reaches the phone first.

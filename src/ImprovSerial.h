@@ -1,8 +1,8 @@
 #pragma once
-// Improv Wi-Fi over the serial port (https://www.improv-wifi.com/serial/): how ESP Web Tools, the
-// browser flasher, hands WiFi credentials to a device right after flashing it. This is the
-// protocol only; WifiSetup.cpp connects it to the serial port and the WiFi driver. Plain C++,
-// tested on the host by test/host/test_improv.cpp.
+// Improv Wi-Fi over the serial port (https://www.improv-wifi.com/serial/): how ESP Web Tools
+// hands WiFi credentials to a device right after flashing it. This is the protocol only;
+// WifiSetup.cpp connects it to the serial port and the WiFi driver. Plain C++, tested on the
+// host by test/host/test_improv.cpp.
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>

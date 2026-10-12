@@ -13,10 +13,10 @@ bool wifiJoinStored(const char* hostname, uint32_t timeoutMs);
 // anyway after three minutes without anyone using the portal. Answers Improv like wifiImprovPoll.
 [[noreturn]] void wifiRunSetupPortal(const char* apName, const char* hostname, const char* firmwareVersion);
 
-// Improv Wi-Fi over the serial port: right after installing, the browser flasher (ESP Web Tools)
-// asks for the WiFi network, sends it over USB, then links to the Web UI. Reads what has arrived
-// on Serial; call it from loop(). A network joined this way replaces the stored one and the
-// device carries on with it; one that cannot be joined changes nothing.
+// Improv Wi-Fi over the serial port: an Improv client such as ESP Web Tools asks for the WiFi
+// network, sends it over USB, then links to the Web UI. Reads what has arrived on Serial; call it
+// from loop(). A network joined this way replaces the stored one and the device carries on with
+// it; one that cannot be joined changes nothing.
 void wifiImprovPoll(const char* hostname, const char* firmwareVersion);
 
 // True if NVS holds an SSID.
