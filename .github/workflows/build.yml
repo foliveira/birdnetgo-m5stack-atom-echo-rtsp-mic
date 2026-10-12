@@ -13,6 +13,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Host unit tests
+        run: sh test/host/run.sh
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Web UI API keys match the firmware
+        run: node test/webui/check_keys.mjs
+
+      - name: Web UI behaviour (headless Chrome against the mock device)
+        run: |
+          google-chrome --headless=new --no-sandbox --disable-gpu '--remote-allow-origins=*' --remote-debugging-port=9222 about:blank &
+          for i in $(seq 1 30); do curl -sf http://127.0.0.1:9222/json/version >/dev/null && break; sleep 1; done
+          node test/webui/ui_test.mjs
+
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
@@ -20,9 +36,13 @@ jobs:
       - name: Cache PlatformIO
         uses: actions/cache@v4
         with:
+          # sdkconfig.defaults carries the hash of the ESP-IDF libraries pioarduino rebuilt for
+          # custom_sdkconfig; without it every run reinstalls and rebuilds them.
           path: |
             ~/.platformio
+            !~/.platformio/.cache
             ~/.cache/pip
+            sdkconfig.defaults
           key: ${{ runner.os }}-pio-${{ hashFiles('platformio.ini') }}
           restore-keys: |
             ${{ runner.os }}-pio-

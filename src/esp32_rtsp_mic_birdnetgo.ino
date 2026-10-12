@@ -1,14 +1,22 @@
 #include <WiFi.h>
-#include <WiFiManager.h>
 #include <ESPmDNS.h>
-#include "driver/i2s.h"
+#include <mdns.h>
+#include <driver/i2s_pdm.h>
 #include <Preferences.h>
 #include <math.h>
 #include <errno.h>
 #include <lwip/sockets.h>
 #include <esp_heap_caps.h>
-#include <M5Atom.h>
+#include <esp_netif.h>
+#include <esp_ota_ops.h>
+#include <esp_timer.h>
+#include <freertos/stream_buffer.h>
+#include "App.h"
+#include "AudioDsp.h"
+#include "RestartInfo.h"
+#include "RtspRequest.h"
 #include "WebUI.h"
+#include "WifiSetup.h"
 
 // ================== PIPELINE ARCHITECTURE ==================
 // Capture task (core 1, high priority):  I2S DMA -> HPF/gain/AGC -> complete RTP frame -> readyQ
@@ -28,25 +36,28 @@ struct TxFrame {
 };
 #define FRAME_HDR_BYTES   16
 #define I2S_DMA_BUF_COUNT 8
-#define I2S_DMA_BUF_LEN   512    // frames per DMA buffer; one buffer is lost per RX_Q_OVF event
-#define TARGET_QUEUE_MS   1500   // software buffer in front of the socket
+#define I2S_DMA_BUF_LEN   512    // frames per DMA buffer; one buffer is lost per queue overflow
+#define TARGET_QUEUE_MS   3000   // software buffer in front of the socket; one lwIP retransmission timeout is >= 1.5 s
 #define MIN_QUEUE_FRAMES  4
-#define MAX_QUEUE_FRAMES  64
-#define MAX_POOL_BYTES    (64 * 1024)  // cap on the frame pool regardless of rate/buffer choice
-#define HEAP_HEADROOM_BYTES (80 * 1024) // leave this much of the largest free block to WiFi/lwIP/HTTP
+#define MAX_QUEUE_FRAMES  384    // 3 s of 256-sample frames at 32 kHz is 375
+#define MAX_POOL_BYTES    (196 * 1024) // cap on the frame pool regardless of rate/buffer choice; holds 3 s at 32 kHz
+#define HEAP_HEADROOM_BYTES (80 * 1024) // free heap left to WiFi/lwIP/HTTP once the pool is allocated
+#define CAPTURE_STALL_MS  3000   // no complete I2S block for this long -> reinstall the driver
 #define SEND_STALL_LIMIT_MS 10000 // no byte accepted by the socket for this long -> drop the client
 #define SENDER_JOIN_LIMIT_MS 30000 // unconfirmed sender exit for this long -> reboot (never close under it)
 #define WIFI_PS_DROP_LIMIT 10     // dropped frames in a session that suspend WiFi power save until reboot
+#define RTSP_METHODS "OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN, GET_PARAMETER, SET_PARAMETER"
 
-static uint8_t*  framePoolMem = NULL;
+static TxFrame*  framePool[MAX_QUEUE_FRAMES];
 static uint16_t  framePoolCount = 0;
 static uint32_t  frameSlotBytes = 0;
 volatile uint16_t pipelineSamples = 0;   // samples per packet the pool is sized for; changes only while capture is parked
-static uint32_t appliedSampleRate = 0;   // what the I2S driver actually runs (for reverting a failed reconfiguration)
+uint32_t appliedSampleRate = 0;          // what the I2S driver actually runs (for reverting a failed reconfiguration)
 static uint16_t appliedBufferSize = 0;
 static QueueHandle_t freeQ = NULL;
 static QueueHandle_t readyQ = NULL;
-static QueueHandle_t i2sEventQueue = NULL;
+static i2s_chan_handle_t i2sRx = NULL;        // PDM RX channel; replaced only while capture is parked
+static volatile uint32_t i2sLostBufs = 0;     // DMA buffers the driver discarded (ISR counter, never reset)
 
 TaskHandle_t captureTaskHandle = NULL;
 TaskHandle_t senderTaskHandle = NULL;
@@ -68,21 +79,25 @@ volatile uint32_t i2sReadErrors = 0;
 volatile uint16_t queueHighWater = 0;
 volatile uint32_t sendStallMaxMs = 0;
 volatile uint32_t sendStallCount = 0;
+volatile uint32_t lastCaptureOkMs = 0;         // last complete I2S read (capture watchdog)
+volatile uint32_t lastMicSignalMs = 0;         // last block whose raw samples were not all identical
+bool micFlat = false;                          // no signal from the microphone for MIC_FLAT_MS
+#define MIC_FLAT_MS 10000
 
 portMUX_TYPE logMux = portMUX_INITIALIZER_UNLOCKED;  // guards the fixed-size log ring (WebUI.cpp)
 portMUX_TYPE hpfMux = portMUX_INITIALIZER_UNLOCKED;  // guards HPF coefficient hand-off
 
 // ================== SETTINGS (ESP32 RTSP Mic for BirdNET-Go) ==================
-#define FW_VERSION "3.0.0"
+#define FW_VERSION "4.0.0"
 // Expose FW version as a global C string for WebUI/API
 const char* FW_VERSION_STR = FW_VERSION;
 
 // -- DEFAULT PARAMETERS (configurable via Web UI / API)
-#define DEFAULT_SAMPLE_RATE 16000  // M5Stack Atom Echo: 16kHz for PDM microphone
+#define DEFAULT_SAMPLE_RATE 32000  // audio up to 16 kHz: BirdNET analyses 0-15 kHz (16 kHz cut it at 8)
 #define DEFAULT_GAIN_FACTOR 3.0f
-#define DEFAULT_BUFFER_SIZE 1024   // 64ms @ 16kHz - good balance for BirdNET-Go
+#define DEFAULT_BUFFER_SIZE 1024   // 32 ms per RTP packet at 32 kHz
 #define DEFAULT_WIFI_TX_DBM 19.5f  // Default WiFi TX power in dBm
-#define DEFAULT_CPU_MHZ 80         // Plenty for 16 kHz DSP + ~260 kbit/s TCP; runs noticeably cooler than 160
+#define DEFAULT_CPU_MHZ 80         // Plenty for 48 kHz DSP + ~800 kbit/s TCP; runs noticeably cooler than 160
 #define DEFAULT_WIFI_POWER_SAVE false
 // High-pass filter defaults (to remove low-frequency rumble)
 #define DEFAULT_HPF_ENABLED true
@@ -91,16 +106,22 @@ const char* FW_VERSION_STR = FW_VERSION;
 // Thermal protection defaults
 #define DEFAULT_OVERHEAT_PROTECTION true
 #define DEFAULT_OVERHEAT_LIMIT_C 80
-#define OVERHEAT_MIN_LIMIT_C 30
-#define OVERHEAT_MAX_LIMIT_C 95
-#define OVERHEAT_LIMIT_STEP_C 5
 #define OVERHEAT_CONSECUTIVE_READINGS 3  // readings (1/min) at/above the limit before tripping
 
-// -- Pins (M5Stack Atom Echo with SPM1423 PDM Microphone)
-#define I2S_BCLK_PIN    19  // Bit Clock
-#define I2S_LRCLK_PIN   33  // Word Select / Left-Right Clock
-#define I2S_DATA_IN_PIN 23  // Microphone Data In
-#define I2S_DATA_OUT_PIN 22 // Speaker Data Out (not used for mic-only)
+// -- Pins (M5Stack Atom Echo: SPM1423 PDM microphone, NS4168 speaker amplifier)
+#define I2S_CLK_PIN     33  // PDM clock to the microphone (also the amplifier's LRCLK)
+#define I2S_DATA_IN_PIN 23  // PDM data from the microphone
+#define SPK_BCLK_PIN    19  // amplifier bit clock: unused, held low
+#define SPK_DATA_PIN    22  // amplifier data: unused, held low
+#define LED_PIN         27  // SK6812 RGB LED
+#define BUTTON_PIN      39  // front button: low while pressed (external pull-up)
+#define BUTTON_FORGET_WIFI_MS 5000  // hold this long to forget the WiFi network
+
+// -- Network identity
+#define DEFAULT_DEVICE_NAME "atomecho"        // DHCP and mDNS name (atomecho.local); a setting
+#define SETUP_AP_NAME "ESP32-RTSP-Mic-AP"     // open access point of the WiFi setup portal
+#define WIFI_JOIN_TIMEOUT_MS 60000            // stored network not joined within this -> setup portal
+#define WIFI_DOWN_RESTART_MS (10UL * 60 * 1000) // link lost this long at runtime -> restart (stuck driver)
 
 // -- Servers
 WiFiServer rtspServer(8554);
@@ -121,158 +142,111 @@ uint8_t rtspParseBuffer[1024];
 int rtspParseBufferPos = 0;
 
 // -- Global state
-unsigned long lastStatsReset = 0;
-bool rtspServerEnabled = true;
+bool rtspServerEnabled = false;   // set by setRtspServer()
 
 // -- Audio parameters (runtime configurable)
 uint32_t currentSampleRate = DEFAULT_SAMPLE_RATE;
 float currentGainFactor = DEFAULT_GAIN_FACTOR;
 uint16_t currentBufferSize = DEFAULT_BUFFER_SIZE;
-// PDM microphones (like SPM1423 on Atom Echo) output decimated 16-bit samples; no shift is applied.
-uint8_t i2sShiftBits = 0;  // Always 0 for the PDM microphone on M5Stack Atom Echo (read-only in UI)
+// The PDM decoder delivers 16-bit samples; they are used as they are, with no bit shift.
 
 // -- Audio metering / clipping diagnostics
 volatile uint16_t lastPeakAbs16 = 0;       // last block peak absolute value (0..32767)
 volatile uint32_t audioClipCount = 0;      // total blocks where clipping occurred
 volatile bool audioClippedLastBlock = false; // clipping occurred in last processed block
 volatile uint16_t peakHoldAbs16 = 0;       // peak hold (recent window)
-unsigned long peakHoldUntilMs = 0; // when to clear hold
+unsigned long peakHoldSinceMs = 0;         // when the held peak was set (cleared after 3 s)
 
 // -- LED mode: 0=off, 1=static, 2=level
 uint8_t ledMode = 1;  // Default: static green during streaming
 
-// -- Automatic Gain Control (AGC)
+// -- Automatic Gain Control (AGC); the control law is agcUpdate() in AudioDsp.h
 bool agcEnabled = false;
 volatile float agcMultiplier = 1.0f;   // Current AGC multiplier (read by WebUI)
-const float AGC_TARGET_RMS = 0.15f;    // Target RMS as fraction of full scale (~-16 dBFS)
-const float AGC_MIN_MULT = 0.1f;
-const float AGC_MAX_MULT = 10.0f;      // With 3.0x base gain, max effective = 30x
-const float AGC_ATTACK_RATE = 0.05f;   // Fast attack (gain reduction) per buffer
-const float AGC_RELEASE_RATE = 0.001f; // Slow release (gain increase) per buffer
 
-// -- High-pass filter (biquad) to cut low-frequency rumble
-struct Biquad {
-    float b0{1.0f}, b1{0.0f}, b2{0.0f}, a1{0.0f}, a2{0.0f};
-    float x1{0.0f}, x2{0.0f}, y1{0.0f}, y2{0.0f};
-    inline float process(float x) {
-        float y = b0 * x + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
-        x2 = x1; x1 = x; y2 = y1; y1 = y;
-        return y;
-    }
-    inline void reset() { x1 = x2 = y1 = y2 = 0.0f; }
-};
+// -- High-pass filter (biquad, AudioDsp.h) to cut low-frequency rumble
 bool highpassEnabled = DEFAULT_HPF_ENABLED;
 uint16_t highpassCutoffHz = DEFAULT_HPF_CUTOFF_HZ;
 Biquad hpf;                              // coefficients published by the loop task (under hpfMux)
 volatile uint32_t hpfVersion = 0;        // bumped on every coefficient update
-uint32_t hpfConfigSampleRate = 0;
-uint16_t hpfConfigCutoff = 0;
+#define DC_BLOCK_HZ 10.0f                // corner of the always-on DC blocker ahead of the HPF
 
 // -- Preferences for persistent settings
 Preferences audioPrefs;
 
-// -- Diagnostics, auto-recovery and temperature monitoring
+// -- Diagnostics and temperature monitoring
 unsigned long lastMemoryCheck = 0;
-unsigned long lastPerformanceCheck = 0;
-unsigned long lastWiFiCheck = 0;
 unsigned long lastTempCheck = 0;
-uint32_t minFreeHeap = 0xFFFFFFFF;
-uint32_t maxPacketRate = 0;
-uint32_t minPacketRate = 0xFFFFFFFF;
-bool autoRecoveryEnabled = false;
-bool autoThresholdEnabled = true; // auto compute minAcceptableRate from sample rate and buffer size
-// Deferred reboot scheduling (to restart safely outside HTTP context)
-volatile bool scheduledFactoryReset = false;
-volatile unsigned long scheduledRebootAt = 0;
-unsigned long bootTime = 0;
+// Deferred reboot (requested from an HTTP handler, carried out by loop() after the reply is out)
+RebootKind rebootKind = RebootKind::Plain;
+bool rebootScheduled = false;
+unsigned long rebootRequestedAt = 0;
+uint32_t rebootDelayMs = 0;
+const char* rebootNote = "";               // reported as the restart reason after the reboot
 unsigned long lastI2SReset = 0;
 float maxTemperature = 0.0f;
 float lastTemperatureC = 0.0f;
 bool lastTemperatureValid = false;
 bool overheatProtectionEnabled = DEFAULT_OVERHEAT_PROTECTION;
 float overheatShutdownC = (float)DEFAULT_OVERHEAT_LIMIT_C;
-bool overheatLockoutActive = false;
-float overheatTripTemp = 0.0f;
-unsigned long overheatTriggeredAt = 0;
 String overheatLastReason = "";
-String overheatLastTimestamp = "";
 bool overheatSensorFault = false;
-bool overheatLatched = false;
+bool overheatLatched = false;          // set by a trip, kept across reboots until cleared in the Web UI
 
 // -- Scheduled reset
 bool scheduledResetEnabled = false;
 uint32_t resetIntervalHours = 24; // Default 24 hours
 
-// -- Configurable thresholds
-uint32_t minAcceptableRate = 50;        // Minimum acceptable packet rate (restart below this)
-uint32_t performanceCheckInterval = 15; // Check interval in minutes
 uint8_t cpuFrequencyMhz = DEFAULT_CPU_MHZ;
+
+char deviceName[33] = DEFAULT_DEVICE_NAME;
 
 // -- WiFi TX power / power save (configurable)
 float wifiTxPowerDbm = DEFAULT_WIFI_TX_DBM;
-wifi_power_t currentWifiPowerLevel = WIFI_POWER_19_5dBm;
 bool wifiPowerSave = DEFAULT_WIFI_POWER_SAVE;  // WIFI_PS_MIN_MODEM when true
 bool wifiPsSuspended = false;                  // power save turned off for this boot because the stream dropped frames
 
+// -- WiFi link state: written by the WiFi event task, acted on (and logged) by loop()
+volatile bool wifiLinkUp = false;
+volatile uint8_t wifiDropReason = 0;
+uint32_t wifiDrops = 0;                        // link losses since boot
+uint8_t wifiLastDropReason = 0;                // reason code of the latest loss (0 = none yet)
+uint32_t wifiLastDropAt = 0;                   // uptime (s) of the latest loss
+
 // -- RTSP connect/PLAY statistics
-unsigned long lastRtspClientConnectMs = 0;
 unsigned long lastRtspPlayMs = 0;
 uint32_t rtspConnectCount = 0;
 uint32_t rtspPlayCount = 0;
 
 // ===============================================
 
-// Helper: convert WiFi power enum to dBm (for logs)
-float wifiPowerLevelToDbm(wifi_power_t lvl) {
-    switch (lvl) {
-        case WIFI_POWER_19_5dBm:    return 19.5f;
-        case WIFI_POWER_19dBm:      return 19.0f;
-        case WIFI_POWER_18_5dBm:    return 18.5f;
-        case WIFI_POWER_17dBm:      return 17.0f;
-        case WIFI_POWER_15dBm:      return 15.0f;
-        case WIFI_POWER_13dBm:      return 13.0f;
-        case WIFI_POWER_11dBm:      return 11.0f;
-        case WIFI_POWER_8_5dBm:     return 8.5f;
-        case WIFI_POWER_7dBm:       return 7.0f;
-        case WIFI_POWER_5dBm:       return 5.0f;
-        case WIFI_POWER_2dBm:       return 2.0f;
-        case WIFI_POWER_MINUS_1dBm: return -1.0f;
-        default:                    return 19.5f;
+// Transmit power steps the radio supports. wifi_power_t values are in 0.25 dBm units.
+static const wifi_power_t WIFI_TX_STEPS[] = {
+    WIFI_POWER_MINUS_1dBm, WIFI_POWER_2dBm, WIFI_POWER_5dBm, WIFI_POWER_7dBm, WIFI_POWER_8_5dBm,
+    WIFI_POWER_11dBm, WIFI_POWER_13dBm, WIFI_POWER_15dBm, WIFI_POWER_17dBm, WIFI_POWER_18_5dBm,
+    WIFI_POWER_19dBm, WIFI_POWER_19_5dBm};
+
+// Nearest supported transmit power step, in dBm.
+float snapWifiTxDbm(float dbm) {
+    float best = (int)WIFI_TX_STEPS[0] * 0.25f;
+    for (const int s : WIFI_TX_STEPS) {
+        if (fabsf(s * 0.25f - dbm) < fabsf(best - dbm)) best = s * 0.25f;
     }
+    return best;
 }
 
-// Helper: pick the highest power level not exceeding requested dBm
-static wifi_power_t pickWifiPowerLevel(float dbm) {
-    if (dbm <= -1.0f) return WIFI_POWER_MINUS_1dBm;
-    if (dbm <= 2.0f)  return WIFI_POWER_2dBm;
-    if (dbm <= 5.0f)  return WIFI_POWER_5dBm;
-    if (dbm <= 7.0f)  return WIFI_POWER_7dBm;
-    if (dbm <= 8.5f)  return WIFI_POWER_8_5dBm;
-    if (dbm <= 11.0f) return WIFI_POWER_11dBm;
-    if (dbm <= 13.0f) return WIFI_POWER_13dBm;
-    if (dbm <= 15.0f) return WIFI_POWER_15dBm;
-    if (dbm <= 17.0f) return WIFI_POWER_17dBm;
-    if (dbm <= 18.5f) return WIFI_POWER_18_5dBm;
-    if (dbm <= 19.0f) return WIFI_POWER_19dBm;
-    return WIFI_POWER_19_5dBm;
-}
-
-// Apply WiFi TX power
-// Logs only when changed; can be muted with log=false
-void applyWifiTxPower(bool log = true) {
-    wifi_power_t desired = pickWifiPowerLevel(wifiTxPowerDbm);
-    if (desired != currentWifiPowerLevel) {
-        WiFi.setTxPower(desired);
-        currentWifiPowerLevel = desired;
-        if (log) {
-            simplePrintln("WiFi TX power set to " + String(wifiPowerLevelToDbm(currentWifiPowerLevel), 1) + " dBm");
-        }
-    }
+// Apply the configured transmit power unless the driver already uses it (it falls back to its
+// default whenever the station interface restarts). Logs only if log is set and it changed.
+void applyWifiTxPower(bool log) {
+    const wifi_power_t desired = (wifi_power_t)lroundf(snapWifiTxDbm(wifiTxPowerDbm) * 4.0f);
+    if (WiFi.getTxPower() == desired) return;
+    WiFi.setTxPower(desired);
+    if (log) simplePrintln("WiFi TX power set to " + String((int)desired * 0.25f, 1) + " dBm");
 }
 
 // Apply WiFi modem power save. MIN_MODEM lets the radio sleep between DTIM beacons, which is the
 // single largest power (heat) lever on this board, at the cost of delayed ACKs from the AP.
-void applyWifiPowerSave(bool log = true) {
+void applyWifiPowerSave(bool log) {
     wifiPsSuspended = false;
     WiFi.setSleep(wifiPowerSave);
     if (log) {
@@ -283,41 +257,49 @@ void applyWifiPowerSave(bool log = true) {
 // Recompute HPF coefficients (2nd-order Butterworth high-pass) and publish them to the capture task.
 // The capture task keeps its own filter state, so changing the cutoff does not reset the filter.
 void updateHighpassCoeffs() {
-    if (!highpassEnabled) {
-        hpfConfigSampleRate = currentSampleRate;
-        hpfConfigCutoff = highpassCutoffHz;
-        return;
-    }
-    float fs = (float)currentSampleRate;
+    if (!highpassEnabled) return;
+    const float fs = (float)currentSampleRate;
     float fc = (float)highpassCutoffHz;
     if (fc < 10.0f) fc = 10.0f;
-    if (fc > fs * 0.45f) fc = fs * 0.45f; // keep reasonable
-
-    const float pi = 3.14159265358979323846f;
-    float w0 = 2.0f * pi * (fc / fs);
-    float cosw0 = cosf(w0);
-    float sinw0 = sinf(w0);
-    float Q = 0.70710678f; // Butterworth-like
-    float alpha = sinw0 / (2.0f * Q);
-
-    float b0 =  (1.0f + cosw0) * 0.5f;
-    float b1 = -(1.0f + cosw0);
-    float b2 =  (1.0f + cosw0) * 0.5f;
-    float a0 =  1.0f + alpha;
-    float a1 = -2.0f * cosw0;
-    float a2 =  1.0f - alpha;
+    if (fc > fs * 0.45f) fc = fs * 0.45f;
+    Biquad c;
+    designHighpass(c, fs, fc);
 
     portENTER_CRITICAL(&hpfMux);
-    hpf.b0 = b0 / a0;
-    hpf.b1 = b1 / a0;
-    hpf.b2 = b2 / a0;
-    hpf.a1 = a1 / a0;
-    hpf.a2 = a2 / a0;
-    hpfVersion++;
+    hpf.b0 = c.b0; hpf.b1 = c.b1; hpf.b2 = c.b2; hpf.a1 = c.a1; hpf.a2 = c.a2;
+    hpfVersion = hpfVersion + 1;
     portEXIT_CRITICAL(&hpfMux);
+}
 
-    hpfConfigSampleRate = currentSampleRate;
-    hpfConfigCutoff = (uint16_t)fc;
+// Seconds since boot. esp_timer is 64-bit, so this does not wrap after 49 days like millis().
+uint32_t uptimeSeconds() {
+    return (uint32_t)(esp_timer_get_time() / 1000000);
+}
+
+bool isSupportedSampleRate(uint32_t hz) {
+    return hz == 16000 || hz == 22050 || hz == 24000 || hz == 32000 || hz == 44100 || hz == 48000;
+}
+
+// A DNS label: 1-31 lowercase letters, digits and hyphens, no hyphen at either end. 31 is what
+// the core's hostname buffer (32 bytes) keeps.
+bool isValidDeviceName(const char* name) {
+    const size_t n = strlen(name);
+    if (n < 1 || n > 31 || name[0] == '-' || name[n - 1] == '-') return false;
+    for (size_t i = 0; i < n; i++) {
+        const char c = name[i];
+        if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-')) return false;
+    }
+    return true;
+}
+
+// Rename the device. mDNS answers to the new name at once; the DHCP client sends it from its next
+// request (lease renewal or reconnect).
+void setDeviceName(const char* name) {
+    strlcpy(deviceName, name, sizeof(deviceName));
+    WiFi.setHostname(deviceName);   // only used when the station interface starts (boot)
+    if (esp_netif_t* sta = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF")) esp_netif_set_hostname(sta, deviceName);
+    mdns_hostname_set(deviceName);
+    simplePrintln(String("Device name: ") + deviceName + " (mDNS " + deviceName + ".local now, DHCP from its next request)");
 }
 
 // Uptime -> "Xd Yh Zm Ts"
@@ -337,13 +319,6 @@ String formatUptime(unsigned long seconds) {
     return result;
 }
 
-// Format "X ago" for events based on millis()
-String formatSince(unsigned long eventMs) {
-    if (eventMs == 0) return String("never");
-    unsigned long seconds = (millis() - eventMs) / 1000;
-    return formatUptime(seconds) + " ago";
-}
-
 static bool isTemperatureValid(float temp) {
     if (isnan(temp) || isinf(temp)) return false;
     if (temp < -20.0f || temp > 130.0f) return false;
@@ -353,24 +328,31 @@ static bool isTemperatureValid(float temp) {
 static void persistOverheatNote() {
     audioPrefs.begin("audio", false);
     audioPrefs.putString("ohReason", overheatLastReason);
-    audioPrefs.putString("ohStamp", overheatLastTimestamp);
-    audioPrefs.putFloat("ohTripC", overheatTripTemp);
     audioPrefs.putBool("ohLatched", overheatLatched);
     audioPrefs.end();
 }
 
 void recordOverheatTrip(float temp) {
-    unsigned long uptimeSeconds = (millis() - bootTime) / 1000;
-    overheatTripTemp = temp;
-    overheatTriggeredAt = millis();
-    overheatLastTimestamp = formatUptime(uptimeSeconds);
-    overheatLastReason = String("Thermal shutdown: ") + String(temp, 1) + " C reached (limit " +
-                         String(overheatShutdownC, 1) + " C). Stream disabled; acknowledge in UI.";
+    char when[40];
+    time_t now;
+    time(&now);
+    if (now > 1600000000) {   // SNTP has synced
+        struct tm ti;
+        gmtime_r(&now, &ti);
+        strftime(when, sizeof(when), "on %Y-%m-%d at %H:%M UTC", &ti);
+    } else {
+        snprintf(when, sizeof(when), "after %s of uptime", formatUptime(uptimeSeconds()).c_str());
+    }
+    overheatLastReason = "Thermal protection stopped the stream " + String(when) + ": " + String(temp, 1) +
+                         " °C for " + String(OVERHEAT_CONSECUTIVE_READINGS) + " minutes (limit " +
+                         String(overheatShutdownC, 0) + " °C).";
     overheatLatched = true;
-    simplePrintln("THERMAL PROTECTION: " + overheatLastReason);
+    simplePrintln(overheatLastReason);
     simplePrintln("TIP: The ESP32 internal sensor reads high. Try WiFi power save, 80 MHz CPU, or a higher limit.");
     persistOverheatNote();
 }
+
+static void stopListening(const char* why);   // LIVE LISTENING
 
 // Temperature monitoring + thermal protection.
 // The ESP32 (classic) die sensor is uncalibrated and typically reads 10-20 C above the real die
@@ -379,17 +361,11 @@ void recordOverheatTrip(float temp) {
 void checkTemperature() {
     static uint8_t overLimitCount = 0;
     float temp = temperatureRead(); // ESP32 internal sensor (approximate)
-    bool tempValid = isTemperatureValid(temp);
-    if (!tempValid) {
+    if (!isTemperatureValid(temp)) {
         lastTemperatureValid = false;
         overLimitCount = 0;
         if (!overheatSensorFault) {
             overheatSensorFault = true;
-            overheatLastReason = "Thermal protection disabled: temperature sensor unavailable.";
-            overheatLastTimestamp = "";
-            overheatTripTemp = 0.0f;
-            overheatTriggeredAt = 0;
-            persistOverheatNote();
             simplePrintln("WARNING: Temperature sensor unavailable. Thermal protection paused.");
         }
         return;
@@ -397,107 +373,118 @@ void checkTemperature() {
 
     lastTemperatureC = temp;
     lastTemperatureValid = true;
-
     if (overheatSensorFault) {
         overheatSensorFault = false;
-        overheatLastReason = "Thermal protection restored: temperature sensor reading valid.";
-        overheatLastTimestamp = formatUptime((millis() - bootTime) / 1000);
-        persistOverheatNote();
         simplePrintln("Temperature sensor restored. Thermal protection active again.");
     }
-
     if (temp > maxTemperature) {
         maxTemperature = temp;
     }
 
-    bool protectionActive = overheatProtectionEnabled && !overheatSensorFault;
-    if (protectionActive) {
-        if (!overheatLockoutActive && temp >= overheatShutdownC) {
-            overLimitCount++;
-            if (overLimitCount >= OVERHEAT_CONSECUTIVE_READINGS) {
-                overLimitCount = 0;
-                overheatLockoutActive = true;
-                recordOverheatTrip(temp);
-                requestStreamStop("overheat");
-                rtspServerEnabled = false;
-                rtspServer.stop();
-            } else {
-                simplePrintln("Temperature " + String(temp, 1) + " C at/above limit (" +
-                              String(overLimitCount) + "/" + String(OVERHEAT_CONSECUTIVE_READINGS) + ")");
-            }
-        } else {
+    // Once latched the server stays off until the latch is cleared in the Web UI.
+    if (overheatProtectionEnabled && !overheatLatched && temp >= overheatShutdownC) {
+        overLimitCount++;
+        if (overLimitCount >= OVERHEAT_CONSECUTIVE_READINGS) {
             overLimitCount = 0;
-            if (overheatLockoutActive && temp <= (overheatShutdownC - OVERHEAT_LIMIT_STEP_C)) {
-                // Allow re-arming after we cool down by at least one step
-                overheatLockoutActive = false;
-            }
+            recordOverheatTrip(temp);
+            setRtspServer(false);
+            stopListening("thermal protection");
+        } else {
+            simplePrintln("Temperature " + String(temp, 1) + " °C at/above limit (" +
+                          String(overLimitCount) + "/" + String(OVERHEAT_CONSECUTIVE_READINGS) + ")");
         }
     } else {
         overLimitCount = 0;
-        overheatLockoutActive = false;
     }
 
     // Only warn occasionally on high temperature; no periodic logging
     static unsigned long lastTempWarn = 0;
     float warnThreshold = max(overheatShutdownC - 5.0f, (float)OVERHEAT_MIN_LIMIT_C);
     if (temp > warnThreshold && (millis() - lastTempWarn) > 600000UL) { // 10 min cooldown
-        simplePrintln("WARNING: High temperature detected (" + String(temp, 1) + " C). Approaching shutdown limit.");
+        simplePrintln("WARNING: High temperature detected (" + String(temp, 1) + " °C). Approaching shutdown limit.");
         lastTempWarn = millis();
     }
 }
 
-// Performance diagnostics
-void checkPerformance() {
-    uint32_t currentHeap = ESP.getFreeHeap();
-    if (currentHeap < minFreeHeap) {
-        minFreeHeap = currentHeap;
+// Start or stop the RTSP listener. Stopping ends the current session and drops a client that is
+// still negotiating. Starting is refused (returns false) while the thermal latch is set.
+bool setRtspServer(bool on) {
+    if (on) {
+        if (overheatLatched) return false;
+        if (!rtspServerEnabled) {
+            rtspServer.begin();
+            rtspServer.setNoDelay(true);
+            rtspServerEnabled = true;
+        }
+        return true;
     }
+    rtspServerEnabled = false;
+    rtspServer.stop();
+    requestStreamStop("server stopped");   // if the sender does not confirm, loop() keeps trying
+    if (!senderTaskHandle && rtspClient) {
+        rtspClient.stop();
+        rtspParseBufferPos = 0;
+    }
+    return true;
+}
 
-    if (isStreaming && (millis() - lastStatsReset) > 30000) {
-        // Cooldown: skip performance check for 2 minutes after last I2S reset
-        if (lastI2SReset > 0 && (millis() - lastI2SReset) < 120000) {
-            return;
-        }
+void clearThermalLatch() {
+    if (!overheatLatched) return;
+    overheatLatched = false;
+    overheatLastReason = "";
+    persistOverheatNote();
+    setRtspServer(true);
+}
 
-        uint32_t runtime = millis() - lastStatsReset;
-        uint32_t currentRate = (audioPacketsSent * 1000) / runtime;
-
-        if (currentRate > maxPacketRate) maxPacketRate = currentRate;
-        if (currentRate < minPacketRate) minPacketRate = currentRate;
-
-        static uint8_t consecutiveLowCount = 0;
-        if (currentRate < minAcceptableRate) {
-            consecutiveLowCount++;
-            simplePrintln("Low packet rate: " + String(currentRate) + " < " + String(minAcceptableRate) + " pkt/s (" + String(consecutiveLowCount) + "/3)");
-
-            if (consecutiveLowCount >= 3 && autoRecoveryEnabled) {
-                simplePrintln("AUTO-RECOVERY: 3 consecutive failures, restarting I2S...");
-                consecutiveLowCount = 0;
-                restartI2S();
-                lastStatsReset = millis();
-                lastI2SReset = millis();
-            }
-        } else {
-            consecutiveLowCount = 0;
-        }
+static void onWifiEvent(arduino_event_id_t event, arduino_event_info_t info) {
+    if (event == ARDUINO_EVENT_WIFI_STA_GOT_IP) {
+        wifiLinkUp = true;
+    } else if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
+        wifiDropReason = info.wifi_sta_disconnected.reason;
+        wifiLinkUp = false;
     }
 }
 
-// WiFi health check
-void checkWiFiHealth() {
-    if (WiFi.status() != WL_CONNECTED) {
-        // Stop streaming before reconnecting — no point sending RTP into a dead radio
-        requestStreamStop("WiFi disconnect");
-        simplePrintln("WiFi disconnected! Reconnecting...");
+// WiFi link supervision, once a second from loop(). The core reconnects by itself for most
+// disconnect reasons; this logs the transitions and nudges it if the link stays down. A running
+// RTSP session is left to the sender: a disconnection clears the station's address and lwIP then
+// aborts every TCP connection on it (ESP-IDF 5.5 has no option to keep them), so the sender's
+// next send fails and the session ends; the client reconnects once the link is back.
+static void checkWiFi() {
+    static bool wasUp = true;
+    static unsigned long downSince = 0, lastKick = 0, lastWeakWarn = 0;
+    const unsigned long now = millis();
+    const bool up = wifiLinkUp;
+    if (up != wasUp) {
+        wasUp = up;
+        if (!up) {
+            downSince = lastKick = now;
+            wifiDrops++;
+            wifiLastDropReason = wifiDropReason;
+            wifiLastDropAt = uptimeSeconds();
+            simplePrintln(String("WiFi lost (") + WiFi.disconnectReasonName((wifi_err_reason_t)wifiDropReason) +
+                          "), reconnecting");
+        } else {
+            simplePrintln("WiFi back after " + String((now - downSince) / 1000) + " s: " +
+                          WiFi.localIP().toString() + ", RSSI " + String(WiFi.RSSI()) + " dBm");
+            applyWifiTxPower(false);
+        }
+    }
+    if (!up && now - lastKick >= 15000) {
+        lastKick = now;
         WiFi.reconnect();
     }
-
-    // Re-apply TX power WITHOUT logging (prevent periodic log spam)
-    applyWifiTxPower(false);
-
-    int32_t rssi = WiFi.RSSI();
-    if (rssi < -85) {
-        simplePrintln("WARNING: Weak WiFi signal: " + String(rssi) + " dBm");
+    if (!up && now - downSince >= WIFI_DOWN_RESTART_MS) {
+        // Nothing streams without the link; a restart also resets a WiFi driver that stopped retrying.
+        simplePrintln("WiFi down for 10 minutes; restarting");
+        restartWithNote("recovery: WiFi down for 10 min");
+    }
+    if (up && now - lastWeakWarn >= 600000) {
+        const int32_t rssi = WiFi.RSSI();
+        if (rssi < -80) {
+            lastWeakWarn = now;
+            simplePrintln("WARNING: weak WiFi signal (" + String(rssi) + " dBm); expect retransmissions and stalls");
+        }
     }
 }
 
@@ -505,11 +492,9 @@ void checkWiFiHealth() {
 void checkScheduledReset() {
     if (!scheduledResetEnabled) return;
 
-    unsigned long uptimeHours = (millis() - bootTime) / 3600000;
-    if (uptimeHours >= resetIntervalHours) {
+    if (uptimeSeconds() / 3600 >= resetIntervalHours) {
         simplePrintln("SCHEDULED RESET: " + String(resetIntervalHours) + " hours reached");
-        delay(1000);
-        ESP.restart();
+        restartWithNote("scheduled reboot");
     }
 }
 
@@ -519,20 +504,16 @@ void loadAudioSettings() {
     currentSampleRate = audioPrefs.getUInt("sampleRate", DEFAULT_SAMPLE_RATE);
     currentGainFactor = audioPrefs.getFloat("gainFactor", DEFAULT_GAIN_FACTOR);
     currentBufferSize = audioPrefs.getUShort("bufferSize", DEFAULT_BUFFER_SIZE);
-    // i2sShiftBits is ALWAYS 0 for PDM microphones - not configurable
-    i2sShiftBits = 0;
-    autoRecoveryEnabled = audioPrefs.getBool("autoRecovery", false);
     scheduledResetEnabled = audioPrefs.getBool("schedReset", false);
     resetIntervalHours = audioPrefs.getUInt("resetHours", 24);
-    minAcceptableRate = audioPrefs.getUInt("minRate", 50);
-    performanceCheckInterval = audioPrefs.getUInt("checkInterval", 15);
-    autoThresholdEnabled = audioPrefs.getBool("thrAuto", true);
     cpuFrequencyMhz = audioPrefs.getUChar("cpuFreq", DEFAULT_CPU_MHZ);
     if (cpuFrequencyMhz != 80 && cpuFrequencyMhz != 160 && cpuFrequencyMhz != 240) {
         cpuFrequencyMhz = DEFAULT_CPU_MHZ;   // 2.3.x could store 120 (rejected by the PLL) or 40 (breaks WiFi)
     }
     wifiTxPowerDbm = audioPrefs.getFloat("wifiTxDbm", DEFAULT_WIFI_TX_DBM);
     wifiPowerSave = audioPrefs.getBool("wifiPs", DEFAULT_WIFI_POWER_SAVE);
+    if (audioPrefs.isKey("hostname")) audioPrefs.getString("hostname", deviceName, sizeof(deviceName));
+    if (!isValidDeviceName(deviceName)) strlcpy(deviceName, DEFAULT_DEVICE_NAME, sizeof(deviceName));
     highpassEnabled = audioPrefs.getBool("hpEnable", DEFAULT_HPF_ENABLED);
     highpassCutoffHz = (uint16_t)audioPrefs.getUInt("hpCutoff", DEFAULT_HPF_CUTOFF_HZ);
     agcEnabled = audioPrefs.getBool("agcEnable", false);
@@ -545,24 +526,18 @@ void loadAudioSettings() {
     ohLimit = OVERHEAT_MIN_LIMIT_C + ((ohLimit - OVERHEAT_MIN_LIMIT_C) / OVERHEAT_LIMIT_STEP_C) * OVERHEAT_LIMIT_STEP_C;
     overheatShutdownC = (float)ohLimit;
     overheatLastReason = audioPrefs.getString("ohReason", "");
-    overheatLastTimestamp = audioPrefs.getString("ohStamp", "");
-    overheatTripTemp = audioPrefs.getFloat("ohTripC", 0.0f);
     overheatLatched = audioPrefs.getBool("ohLatched", false);
     audioPrefs.end();
 
-    // Sanity clamps (corrupted flash must not produce an unusable pipeline)
-    if (currentSampleRate < 8000 || currentSampleRate > 48000) currentSampleRate = DEFAULT_SAMPLE_RATE;
+    // Sanity clamps (corrupted flash, or a value older versions accepted, must not produce an
+    // unusable pipeline). 8 kHz was allowed before but clocks the microphone below its range.
+    if (!isSupportedSampleRate(currentSampleRate)) currentSampleRate = DEFAULT_SAMPLE_RATE;
     if (currentBufferSize < 256 || currentBufferSize > 8192) currentBufferSize = DEFAULT_BUFFER_SIZE;
     if (!(currentGainFactor >= 0.1f && currentGainFactor <= 100.0f)) currentGainFactor = DEFAULT_GAIN_FACTOR;
-
-    if (autoThresholdEnabled) {
-        minAcceptableRate = computeRecommendedMinRate();
-    }
-    if (overheatLatched) {
-        rtspServerEnabled = false;
-    }
+    if (resetIntervalHours < 1 || resetIntervalHours > 168) resetIntervalHours = 24;
+    if (highpassCutoffHz < 10 || highpassCutoffHz > 10000) highpassCutoffHz = DEFAULT_HPF_CUTOFF_HZ;
     // Log the configured TX dBm (not the current enum), snapped for clarity
-    float txShown = wifiPowerLevelToDbm(pickWifiPowerLevel(wifiTxPowerDbm));
+    float txShown = snapWifiTxDbm(wifiTxPowerDbm);
     simplePrintln("Loaded settings: Rate=" + String(currentSampleRate) +
                   ", Gain=" + String(currentGainFactor, 1) +
                   ", Buffer=" + String(currentBufferSize) +
@@ -579,16 +554,12 @@ void saveAudioSettings() {
     audioPrefs.putUInt("sampleRate", currentSampleRate);
     audioPrefs.putFloat("gainFactor", currentGainFactor);
     audioPrefs.putUShort("bufferSize", currentBufferSize);
-    audioPrefs.putUChar("shiftBits", i2sShiftBits);
-    audioPrefs.putBool("autoRecovery", autoRecoveryEnabled);
     audioPrefs.putBool("schedReset", scheduledResetEnabled);
     audioPrefs.putUInt("resetHours", resetIntervalHours);
-    audioPrefs.putUInt("minRate", minAcceptableRate);
-    audioPrefs.putUInt("checkInterval", performanceCheckInterval);
-    audioPrefs.putBool("thrAuto", autoThresholdEnabled);
     audioPrefs.putUChar("cpuFreq", cpuFrequencyMhz);
     audioPrefs.putFloat("wifiTxDbm", wifiTxPowerDbm);
     audioPrefs.putBool("wifiPs", wifiPowerSave);
+    audioPrefs.putString("hostname", deviceName);
     audioPrefs.putBool("hpEnable", highpassEnabled);
     audioPrefs.putUInt("hpCutoff", (uint32_t)highpassCutoffHz);
     audioPrefs.putBool("agcEnable", agcEnabled);
@@ -599,27 +570,21 @@ void saveAudioSettings() {
     if (ohLimit > OVERHEAT_MAX_LIMIT_C) ohLimit = OVERHEAT_MAX_LIMIT_C;
     audioPrefs.putUInt("ohThresh", ohLimit);
     audioPrefs.putString("ohReason", overheatLastReason);
-    audioPrefs.putString("ohStamp", overheatLastTimestamp);
-    audioPrefs.putFloat("ohTripC", overheatTripTemp);
     audioPrefs.putBool("ohLatched", overheatLatched);
     audioPrefs.end();
 
     simplePrintln("Settings saved to flash");
 }
 
-// Schedule a safe reboot (optionally with factory reset) after delayMs
-void scheduleReboot(bool factoryReset, uint32_t delayMs) {
-    scheduledFactoryReset = factoryReset;
-    scheduledRebootAt = millis() + delayMs;
-}
-
-// Compute recommended minimum packet-rate threshold based on current sample rate and buffer size
-uint32_t computeRecommendedMinRate() {
-    uint32_t buf = max((uint16_t)1, currentBufferSize);
-    float expectedPktPerSec = (float)currentSampleRate / (float)buf;
-    uint32_t rec = (uint32_t)(expectedPktPerSec * 0.5f + 0.5f); // 50% safety margin
-    if (rec < 5) rec = 5;
-    return rec;
+// Reboot (after restoring defaults or forgetting the WiFi network, if asked) from loop() once
+// delayMs has passed, so an HTTP handler can send its reply before the device goes away. `why` is
+// shown as the restart reason after the reboot; it must be a string literal.
+void scheduleReboot(RebootKind kind, uint32_t delayMs, const char* why) {
+    rebootKind = kind;
+    rebootRequestedAt = millis();
+    rebootDelayMs = delayMs;
+    rebootNote = why;
+    rebootScheduled = true;
 }
 
 // Restore application settings to safe defaults and persist
@@ -635,14 +600,8 @@ void resetToDefaultSettings() {
     currentSampleRate = DEFAULT_SAMPLE_RATE;
     currentGainFactor = DEFAULT_GAIN_FACTOR;
     currentBufferSize = DEFAULT_BUFFER_SIZE;
-    i2sShiftBits = 0;  // Default for PDM microphone on M5Stack Atom Echo
-
-    autoRecoveryEnabled = false;
-    autoThresholdEnabled = true;
     scheduledResetEnabled = false;
     resetIntervalHours = 24;
-    minAcceptableRate = computeRecommendedMinRate();
-    performanceCheckInterval = 15;
     cpuFrequencyMhz = DEFAULT_CPU_MHZ;
     wifiTxPowerDbm = DEFAULT_WIFI_TX_DBM;
     wifiPowerSave = DEFAULT_WIFI_POWER_SAVE;
@@ -651,17 +610,11 @@ void resetToDefaultSettings() {
     agcEnabled = false;
     agcMultiplier = 1.0f;
     ledMode = 1;
+    strlcpy(deviceName, DEFAULT_DEVICE_NAME, sizeof(deviceName));
     overheatProtectionEnabled = DEFAULT_OVERHEAT_PROTECTION;
     overheatShutdownC = (float)DEFAULT_OVERHEAT_LIMIT_C;
-    overheatLockoutActive = false;
-    overheatTripTemp = 0.0f;
-    overheatTriggeredAt = 0;
     overheatLastReason = "";
-    overheatLastTimestamp = "";
-    overheatSensorFault = false;
     overheatLatched = false;
-    lastTemperatureC = 0.0f;
-    lastTemperatureValid = false;
 
     saveAudioSettings();
 
@@ -670,22 +623,21 @@ void resetToDefaultSettings() {
 
 // Minimal print helpers: Serial + buffered for Web UI
 // Timestamp prefix for log messages (NTP time if available, uptime fallback)
+// "[14:03:12Z] " in UTC once SNTP has synced, "[+00:00:12] " (time since boot) before that.
 static String logTimestamp() {
+    char buf[24];
     time_t now;
     time(&now);
-    if (now > 100000) {
+    if (now > 1600000000) {
         struct tm ti;
-        localtime_r(&now, &ti);
-        char buf[24];
-        strftime(buf, sizeof(buf), "[%H:%M:%S] ", &ti);
+        gmtime_r(&now, &ti);
+        strftime(buf, sizeof(buf), "[%H:%M:%SZ] ", &ti);
         return String(buf);
     }
-    // Fallback: uptime
-    unsigned long s = (millis() - bootTime) / 1000;
+    unsigned long s = uptimeSeconds();
     unsigned long h = s / 3600; s %= 3600;
     unsigned long m = s / 60; s %= 60;
-    char buf[16];
-    snprintf(buf, sizeof(buf), "[%02lu:%02lu:%02lu] ", h, m, s);
+    snprintf(buf, sizeof(buf), "[+%02lu:%02lu:%02lu] ", h, m, s);
     return String(buf);
 }
 
@@ -696,7 +648,7 @@ void simplePrint(String message) {
 void simplePrintln(String message) {
     String stamped = logTimestamp() + message;
     Serial.println(stamped);
-    webui_pushLog(stamped);
+    webui_pushLog(stamped.c_str());
 }
 
 // ================== AUDIO PIPELINE: FRAME POOL ==================
@@ -704,63 +656,60 @@ void simplePrintln(String message) {
 static void freeFramePool() {
     if (freeQ)  { vQueueDelete(freeQ);  freeQ = NULL; }
     if (readyQ) { vQueueDelete(readyQ); readyQ = NULL; }
-    if (framePoolMem) { free(framePoolMem); framePoolMem = NULL; }
+    for (uint16_t i = 0; i < framePoolCount; i++) {
+        free(framePool[i]);
+        framePool[i] = NULL;
+    }
     framePoolCount = 0;
     frameSlotBytes = 0;
 }
 
-// Allocate frames for TARGET_QUEUE_MS of audio at the current rate/buffer size.
+// Allocate frames for TARGET_QUEUE_MS of audio at the current rate/buffer size, one heap block
+// per frame. The heap is split over several memory regions, so its largest block is much smaller
+// than the total free and a single allocation would cap the queue far below what fits. Stops
+// early to leave HEAP_HEADROOM_BYTES free.
 // Only call while the capture task is parked (or not yet started) and no sender is running.
 static bool allocFramePool() {
     freeFramePool();
     pipelineSamples = currentBufferSize;   // the capture task reads this, never currentBufferSize directly
                                            // (set even if the pool fails so metering keeps running)
-    uint32_t frameMs = (uint32_t)currentBufferSize * 1000UL / currentSampleRate;
-    if (frameMs == 0) frameMs = 1;
-    uint32_t want = (TARGET_QUEUE_MS + frameMs - 1) / frameMs;
-    if (want < MIN_QUEUE_FRAMES) want = MIN_QUEUE_FRAMES;
+    const uint32_t perFrame = (uint32_t)currentBufferSize * 1000UL;   // frames = ms * rate / perFrame
+    uint32_t want = (TARGET_QUEUE_MS * currentSampleRate + perFrame - 1) / perFrame;
     if (want > MAX_QUEUE_FRAMES) want = MAX_QUEUE_FRAMES;
-    frameSlotBytes = (sizeof(TxFrame) + FRAME_HDR_BYTES + (uint32_t)currentBufferSize * 2 + 3) & ~3UL;
-
-    // Byte budget: never more than MAX_POOL_BYTES, and always leave HEAP_HEADROOM_BYTES of the
-    // largest free block for WiFi/lwIP/HTTP. (At 48 kHz the time-based count alone would ask
-    // for ~130 KB.)
-    uint32_t byTarget = want;
+    frameSlotBytes = sizeof(TxFrame) + FRAME_HDR_BYTES + (uint32_t)currentBufferSize * 2;
     if (want > MAX_POOL_BYTES / frameSlotBytes) want = MAX_POOL_BYTES / frameSlotBytes;
-    size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
-    uint32_t byHeap = (largest > HEAP_HEADROOM_BYTES) ? (uint32_t)((largest - HEAP_HEADROOM_BYTES) / frameSlotBytes) : 0;
-    if (want > byHeap) want = byHeap;
-    if (want < MIN_QUEUE_FRAMES) want = MIN_QUEUE_FRAMES;
 
-    while (want >= MIN_QUEUE_FRAMES) {
-        framePoolMem = (uint8_t*)malloc(frameSlotBytes * want);
-        if (framePoolMem) break;
-        want /= 2;
-    }
-    if (!framePoolMem) {
-        simplePrintln("FATAL: cannot allocate audio frame pool");
-        return false;
-    }
-    freeQ = xQueueCreate(want, sizeof(TxFrame*));
-    readyQ = xQueueCreate(want, sizeof(TxFrame*));
-    if (!freeQ || !readyQ) {
-        freeFramePool();
-        simplePrintln("FATAL: cannot allocate frame queues");
-        return false;
-    }
-    for (uint32_t i = 0; i < want; i++) {
-        TxFrame* f = (TxFrame*)(framePoolMem + i * frameSlotBytes);
+    const uint32_t caps = MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL;
+    const size_t heapBefore = heap_caps_get_free_size(caps);
+    uint16_t n = 0;
+    while (n < want && heap_caps_get_free_size(caps) >= HEAP_HEADROOM_BYTES + frameSlotBytes) {
+        TxFrame* f = (TxFrame*)heap_caps_malloc(frameSlotBytes, caps);
+        if (!f) break;
         f->len = 0;
         f->seq = 0;
-        xQueueSend(freeQ, &f, 0);
+        framePool[n++] = f;
     }
-    framePoolCount = (uint16_t)want;
+    framePoolCount = n;
+    if (n >= MIN_QUEUE_FRAMES) {
+        freeQ = xQueueCreate(n, sizeof(TxFrame*));
+        readyQ = xQueueCreate(n, sizeof(TxFrame*));
+    }
+    if (!freeQ || !readyQ) {
+        freeFramePool();
+        simplePrintln("FATAL: cannot allocate the audio frame pool (free heap " + String(heapBefore / 1024) + " KB)");
+        return false;
+    }
+    for (uint16_t i = 0; i < n; i++) xQueueSend(freeQ, &framePool[i], 0);
     appliedBufferSize = currentBufferSize;
-    simplePrintln("Frame pool: " + String(want) + " x " + String(frameSlotBytes) + " B (" +
-                  String(want * frameMs) + " ms of audio), largest free block was " + String(largest / 1024) + " KB");
-    if (want < byTarget) {
-        simplePrintln("NOTE: pool shorter than " + String(TARGET_QUEUE_MS) +
-                      " ms target (memory); shorter WiFi stalls will drop frames. Lower the sample rate or buffer size.");
+    const uint32_t poolMs = (uint32_t)((uint64_t)n * perFrame / currentSampleRate);
+    simplePrintln("Frame pool: " + String(n) + " x " + String(frameSlotBytes) + " B (" + String(poolMs) +
+                  " ms of audio), free heap " + String(heapBefore / 1024) + " -> " +
+                  String(heap_caps_get_free_size(caps) / 1024) + " KB");
+    if (poolMs < TARGET_QUEUE_MS) {
+        // n == want: a size cap set want below the target; n < want: free heap ran out first.
+        simplePrintln("NOTE: frame pool below the " + String(TARGET_QUEUE_MS) + " ms target (" +
+                      (n < want ? "free heap" : "size cap") + "); WiFi stalls over " +
+                      String(poolMs) + " ms drop audio. A lower sample rate lengthens it.");
     }
     return true;
 }
@@ -773,6 +722,13 @@ static void flushReadyQueue() {
     }
 }
 
+// The RTSP client's address while one is connected (negotiating or streaming), else "". Never
+// touches the socket during a session: the sender task owns it then.
+const char* currentRtspClient() {
+    if (senderTaskHandle) return rtspClientIp.c_str();
+    return rtspClient.connected() ? rtspClientIp.c_str() : "";
+}
+
 uint16_t streamQueueDepth() {
     return readyQ ? (uint16_t)uxQueueMessagesWaiting(readyQ) : 0;
 }
@@ -782,59 +738,60 @@ uint16_t streamQueueFrames() {
 }
 
 // ================== I2S (PDM microphone) ==================
+// Called from the driver's DMA interrupt when a buffer finishes while the queue of finished
+// buffers is full: the driver has just discarded the oldest one. The core is built with
+// CONFIG_I2S_ISR_IRAM_SAFE, so the callback must be in IRAM.
+static bool IRAM_ATTR onI2sRxOverflow(i2s_chan_handle_t, i2s_event_data_t*, void*) {
+    i2sLostBufs = i2sLostBufs + 1;
+    return false;
+}
+
 void setup_i2s_driver() {
-    static bool installed = false;
-    if (installed) i2s_driver_uninstall(I2S_NUM_0);
-    i2sEventQueue = NULL;
-
-    // Hardware ring: 8 buffers x 512 frames. The driver keeps one buffer in flight, so 7 x 512 =
-    // 3584 samples (224 ms at 16 kHz) can wait for the capture task before samples are lost; the
-    // old 6 x 60 ring gave 22.5 ms. (Buffer bytes stay well under the driver's 4092-byte limit.)
-    i2s_config_t i2s_config = {
-        // PDM mode required for SPM1423 microphone on Atom Echo
-        .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX | I2S_MODE_PDM),
-        .sample_rate = currentSampleRate,
-        .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
-        .channel_format = I2S_CHANNEL_FMT_ALL_RIGHT,
-#if ESP_IDF_VERSION > ESP_IDF_VERSION_VAL(4, 1, 0)
-        .communication_format = I2S_COMM_FORMAT_STAND_I2S,
-#else
-        .communication_format = I2S_COMM_FORMAT_I2S,
-#endif
-        .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-        .dma_buf_count = I2S_DMA_BUF_COUNT,
-        .dma_buf_len = I2S_DMA_BUF_LEN,
-        .use_apll = false,
-        .tx_desc_auto_clear = false,
-        .fixed_mclk = 0
-    };
-
-    i2s_pin_config_t pin_config = {
-#if (ESP_IDF_VERSION > ESP_IDF_VERSION_VAL(4, 3, 0))
-        .mck_io_num = I2S_PIN_NO_CHANGE,
-#endif
-        .bck_io_num = I2S_BCLK_PIN,
-        .ws_io_num = I2S_LRCLK_PIN,
-        .data_out_num = I2S_DATA_OUT_PIN,
-        .data_in_num = I2S_DATA_IN_PIN
-    };
-
-    // Event queue lets the capture task count DMA overruns (I2S_EVENT_RX_Q_OVF). The driver also
-    // posts one RX_DONE per finished DMA buffer with no fullness check, so the queue must hold far
-    // more than dma_buf_count events or the OVF event itself gets lost: 40 slots covers a 1.2 s
-    // stall at 16 kHz and the queue is drained before and after every read.
-    esp_err_t err = i2s_driver_install(I2S_NUM_0, &i2s_config, 40, &i2sEventQueue);
-    installed = (err == ESP_OK);
-    if (installed) appliedSampleRate = currentSampleRate;
-    if (err != ESP_OK) {
-        simplePrintln("ERROR: i2s_driver_install failed: " + String((int)err));
-        i2sEventQueue = NULL;
+    if (i2sRx) {
+        i2s_channel_disable(i2sRx);
+        i2s_del_channel(i2sRx);
+        i2sRx = NULL;
     }
-    i2s_set_pin(I2S_NUM_0, &pin_config);
-    i2s_set_clk(I2S_NUM_0, currentSampleRate, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_MONO);
 
-    simplePrintln("I2S ready (PDM mode): " + String(currentSampleRate) + "Hz, buffer " +
-                  String(currentBufferSize) + " samples, DMA slack 3584 samples");
+    // Hardware ring: 8 buffers x 512 frames. The driver queues up to 7 finished buffers for the
+    // capture task, so 7 x 512 = 3584 samples (112 ms at 32 kHz, 224 ms at 16 kHz) can wait
+    // before samples are lost. A read that stops inside a buffer gives up the rest of that buffer
+    // one buffer earlier (the driver skips it rather than read it while the DMA overwrites it).
+    i2s_chan_config_t chanCfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
+    chanCfg.dma_desc_num = I2S_DMA_BUF_COUNT;
+    chanCfg.dma_frame_num = I2S_DMA_BUF_LEN;
+
+    // PDM RX needs only the clock and data in. M5's example also routes the speaker's bit clock
+    // and data because it shares the config with playback; a microphone does not. The SPM1423 is
+    // on the right slot (the legacy driver's ALL_RIGHT); the PDM clock is 64 x the sample rate.
+    i2s_pdm_rx_config_t pdmCfg = {
+        .clk_cfg = I2S_PDM_RX_CLK_DEFAULT_CONFIG(currentSampleRate),
+        .slot_cfg = I2S_PDM_RX_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO),
+        .gpio_cfg = {},
+    };
+    pdmCfg.slot_cfg.slot_mask = I2S_PDM_SLOT_RIGHT;
+    pdmCfg.gpio_cfg.clk = (gpio_num_t)I2S_CLK_PIN;
+    pdmCfg.gpio_cfg.din = (gpio_num_t)I2S_DATA_IN_PIN;
+
+    i2s_event_callbacks_t callbacks = {};
+    callbacks.on_recv_q_ovf = onI2sRxOverflow;
+
+    esp_err_t err = i2s_new_channel(&chanCfg, NULL, &i2sRx);
+    if (err == ESP_OK) err = i2s_channel_init_pdm_rx_mode(i2sRx, &pdmCfg);
+    if (err == ESP_OK) err = i2s_channel_register_event_callback(i2sRx, &callbacks, NULL);
+    if (err == ESP_OK) err = i2s_channel_enable(i2sRx);
+    if (err != ESP_OK) {
+        // appliedSampleRate keeps the last rate that ran; the capture watchdog retries the setup.
+        simplePrintln("ERROR: I2S setup failed: " + String((int)err));
+        if (i2sRx) i2s_del_channel(i2sRx);
+        i2sRx = NULL;
+        return;
+    }
+    appliedSampleRate = currentSampleRate;
+
+    simplePrintln("I2S ready (PDM mode): " + String(currentSampleRate) + " Hz, " +
+                  String(currentBufferSize) + " samples/packet, DMA slack " +
+                  String((I2S_DMA_BUF_COUNT - 1) * I2S_DMA_BUF_LEN * 1000UL / currentSampleRate) + " ms");
 }
 
 // ================== CAPTURE TASK (core 1) ==================
@@ -842,53 +799,72 @@ void setup_i2s_driver() {
 // without a client) and, while a session is active, produces complete RTP frames into readyQ.
 // It is also the only LED writer after setup(), which removes the LED ownership race.
 
-static inline uint16_t bswap16(uint16_t v) { return (uint16_t)((v << 8) | (v >> 8)); }
-
 // Returns the number of DMA buffers the driver discarded since the last call.
-static inline uint32_t drainI2sEvents() {
-    if (!i2sEventQueue) return 0;
-    i2s_event_t evt;
-    uint32_t lost = 0;
-    while (xQueueReceive(i2sEventQueue, &evt, 0) == pdTRUE) {
-        if (evt.type == I2S_EVENT_RX_Q_OVF) { i2sOverruns++; lost++; }
-    }
+static inline uint32_t takeLostI2sBufs() {
+    static uint32_t seen = 0;
+    const uint32_t total = i2sLostBufs;
+    const uint32_t lost = total - seen;
+    seen = total;
+    if (lost) i2sOverruns += lost;
     return lost;
 }
 
-static CRGB ledColorFor(bool streaming, bool clipped, float pct) {
-    if (!streaming) {
-        if (overheatLatched) return CRGB(128, 0, 0);                 // red: thermal latch
-        return (ledMode > 0) ? CRGB(0, 0, 128) : CRGB(0, 0, 0);      // blue: ready
-    }
-    if (ledMode == 0) return CRGB(0, 0, 0);
-    if (ledMode == 1) return CRGB(0, 128, 0);                         // static green: streaming
-    if (clipped)      return CRGB(255, 0, 0);                         // red: clipping
-    if (pct > 0.7f)   return CRGB(255, 165, 0);                       // orange: hot signal
-    if (pct > 0.3f)   return CRGB(0, 255, 0);                         // bright green: good level
-    if (pct > 0.05f)  return CRGB(0, 64, 0);                          // dim green: low signal
-    return CRGB(32, 0, 32);                                           // dim purple: very quiet
+// LED colours as 0xRRGGBB, already scaled to the brightness the M5Atom/FastLED setup used
+// (20/255), so the LED looks and draws the same as before.
+static inline uint32_t rgb(uint8_t r, uint8_t g, uint8_t b) {
+    return ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+}
+#define LED_STARTUP rgb(10, 10, 0)    // yellow
+#define LED_SETUP   rgb(0, 10, 10)    // cyan: WiFi setup portal
+
+static void ledShow(uint32_t c) {
+    rgbLedWrite(LED_PIN, (uint8_t)(c >> 16), (uint8_t)(c >> 8), (uint8_t)c);   // core RMT driver
+}
+
+volatile bool buttonHeld = false;   // held long enough to show that a WiFi reset is coming
+
+// Live listening (see LIVE LISTENING below): the stream buffer the capture task copies processed
+// audio into while someone listens, NULL otherwise, and a count of finished capture blocks that
+// tells loop() when the capture task is done with a buffer it no longer feeds.
+static StreamBufferHandle_t volatile listenFeed = NULL;
+static volatile uint32_t captureBlocks = 0;
+
+// Faults (thermal latch, no WiFi) show even with the LED set to off: then it is the only sign.
+static uint32_t ledColorFor(bool streaming, bool clipped, float pct) {
+    if (buttonHeld)      return LED_SETUP;                            // cyan: release now or the WiFi setup opens
+    if (overheatLatched) return rgb(10, 0, 0);                        // red: thermal latch
+    if (!wifiLinkUp)     return LED_STARTUP;                          // yellow: no WiFi, as while joining at boot
+    if (!streaming) return (ledMode > 0) ? rgb(0, 0, 10) : 0;         // blue: ready
+    if (ledMode == 0) return 0;
+    if (ledMode == 1) return rgb(0, 10, 0);                           // static green: streaming
+    if (clipped)      return rgb(20, 0, 0);                           // red: clipping
+    if (pct > 0.7f)   return rgb(20, 13, 0);                          // orange: hot signal
+    if (pct > 0.3f)   return rgb(0, 20, 0);                           // bright green: good level
+    if (pct > 0.05f)  return rgb(0, 5, 0);                            // dim green: low signal
+    return rgb(2, 0, 2);                                              // dim purple: very quiet
 }
 
 static void captureTask(void* arg) {
-    Serial.printf("[Capture] task started on core %d\n", xPortGetCoreID());
-
     int16_t* captureBuf = NULL;
     uint16_t capSamples = 0;
 
+    DcBlocker dc;                          // removes the PDM decoder's DC offset (state lives here)
+    uint32_t dcRate = 0;                   // sample rate dc was designed for
     Biquad localHpf;                       // coefficients + filter state live here
     uint32_t localHpfVersion = 0xFFFFFFFF;
     bool hpfWasEnabled = false;
     float localAgcMult = 1.0f;
     float appliedGain = -1.0f;             // gain at the end of the previous block (ramp start)
 
-    CRGB lastLed = CRGB(1, 2, 3);          // impossible value forces the first draw
+    uint32_t lastLed = 0xFFFFFFFF;         // impossible value forces the first draw
     unsigned long lastLedUpdate = 0;
-    unsigned long lastStatsLog = millis();
+    uint8_t* listenBlock = NULL;           // one block, little-endian, while someone listens
 
     for (;;) {
         // --- pause protocol: the loop task reinstalls I2S / reallocates the pool while we are parked ---
         if (capturePauseRequested) {
             if (captureBuf) { free(captureBuf); captureBuf = NULL; capSamples = 0; }
+            if (listenBlock) { free(listenBlock); listenBlock = NULL; }   // block size may change
             capturePaused = true;
             __asm__ __volatile__("memw" ::: "memory");
             while (capturePauseRequested) {
@@ -897,6 +873,9 @@ static void captureTask(void* arg) {
             capturePaused = false;
             localHpfVersion = 0xFFFFFFFF;  // sample rate may have changed: refetch coefficients
             localHpf.reset();
+            dcRate = 0;
+            lastCaptureOkMs = millis();
+            lastMicSignalMs = lastCaptureOkMs;
             continue;
         }
 
@@ -912,19 +891,26 @@ static void captureTask(void* arg) {
                 continue;
             }
         }
+        const uint32_t rate = appliedSampleRate;   // changes only while this task is parked
+        const i2s_chan_handle_t rx = i2sRx;        // likewise
+        if (rate == 0 || !rx) { vTaskDelay(pdMS_TO_TICKS(100)); continue; }   // I2S not set up
+        if (rate != dcRate) {
+            dc.design((float)rate, DC_BLOCK_HZ);
+            dc.reset();
+            dcRate = rate;
+        }
 
         // --- one packet worth of samples (blocks in the driver until the DMA has them) ---
-        uint32_t lostBufs = drainI2sEvents();
         size_t bytesRead = 0;
         const size_t want = (size_t)capSamples * sizeof(int16_t);
-        esp_err_t r = i2s_read(I2S_NUM_0, captureBuf, want, &bytesRead, pdMS_TO_TICKS(1000));
-        lostBufs += drainI2sEvents();   // RX_DONE events from this read must not sit in the queue during a stall
+        esp_err_t r = i2s_channel_read(rx, captureBuf, want, &bytesRead, 1000);
+        const uint32_t lostBufs = takeLostI2sBufs();
         if (isStreaming && lostBufs) {
             // Audio the DMA discarded still happened: keep the RTP clock honest.
             rtpTimestamp += lostBufs * I2S_DMA_BUF_LEN;
         }
         if (r != ESP_OK || bytesRead != want) {
-            i2sReadErrors++;
+            i2sReadErrors = i2sReadErrors + 1;
             if (isStreaming) {                  // account for the packet we did not get
                 rtpTimestamp += (uint32_t)((want - bytesRead) / sizeof(int16_t));
                 rtpSequence++;
@@ -932,6 +918,7 @@ static void captureTask(void* arg) {
             if (r != ESP_OK) vTaskDelay(pdMS_TO_TICKS(20));
             continue;
         }
+        lastCaptureOkMs = millis();
 
         // --- HPF coefficient hand-off (published by the loop under hpfMux) ---
         const bool hpfOn = highpassEnabled;
@@ -947,14 +934,11 @@ static void captureTask(void* arg) {
         }
         hpfWasEnabled = hpfOn;
 
+        // Gain ramps linearly from the last block's value to this block's target, so AGC steps and
+        // manual changes glide over one block instead of clicking at the boundary.
         const bool agcOn = agcEnabled;
-        float effectiveGain = currentGainFactor;
-        if (agcOn) effectiveGain *= localAgcMult;
-        if (appliedGain < 0.0f) appliedGain = effectiveGain;
-        // Ramp linearly from last block's gain to this block's target: AGC steps and manual gain
-        // changes glide over 64 ms instead of producing a click at the block boundary.
-        float g = appliedGain;
-        const float gStep = (effectiveGain - appliedGain) / (float)capSamples;
+        const float targetGain = currentGainFactor * (agcOn ? localAgcMult : 1.0f);
+        if (appliedGain < 0.0f) appliedGain = targetGain;
 
         // --- output frame: only while streaming; when the pool is exhausted, recycle the OLDEST
         //     queued frame so the receiver gets the freshest audio and latency stays bounded ---
@@ -962,42 +946,41 @@ static void captureTask(void* arg) {
         const bool streaming = isStreaming;
         if (streaming && freeQ) {
             if (xQueueReceive(freeQ, &frame, 0) != pdTRUE) {
-                framesDroppedQueueFull++;   // either the recycled oldest frame or (never, with >= 2 frames) nothing
+                framesDroppedQueueFull = framesDroppedQueueFull + 1;   // either the recycled oldest frame or (never, with >= 2 frames) nothing
                 xQueueReceive(readyQ, &frame, 0);
             }
         }
-        int16_t* out = frame ? (int16_t*)(frame->data + FRAME_HDR_BYTES) : NULL;
 
-        // --- DSP: HPF -> gain -> clip -> metering, written big-endian straight into the frame ---
-        float peakAbs = 0.0f, sumSquares = 0.0f;
-        bool clipped = false;
-        for (uint16_t i = 0; i < capSamples; i++) {
-            float s = (float)captureBuf[i];
-            if (hpfOn) s = localHpf.process(s);
-            g += gStep;
-            s *= g;
-            float a = fabsf(s);
-            if (a > peakAbs) peakAbs = a;
-            sumSquares += s * s;
-            if (s > 32767.0f)       { s = 32767.0f;  clipped = true; }
-            else if (s < -32768.0f) { s = -32768.0f; clipped = true; }
-            if (out) out[i] = (int16_t)bswap16((uint16_t)(int16_t)s);
-        }
-        appliedGain = effectiveGain;
+        // Read once per block; loop() frees a buffer it stopped feeding only after captureBlocks
+        // has moved on, i.e. after this block is done with it.
+        const StreamBufferHandle_t feed = listenFeed;
+        const size_t blockBytes = (size_t)capSamples * sizeof(int16_t);
+        if (feed && !listenBlock) listenBlock = (uint8_t*)malloc(blockBytes);
+        if (!feed && listenBlock) { free(listenBlock); listenBlock = NULL; }
 
-        // --- AGC ---
-        if (agcOn) {
-            float rms = sqrtf(sumSquares / (float)capSamples) / 32767.0f;
-            if (rms > 0.001f) {  // Don't adjust on silence
-                float ratio = AGC_TARGET_RMS / rms;
-                if (ratio < 1.0f) {
-                    localAgcMult += (ratio - 1.0f) * AGC_ATTACK_RATE * localAgcMult;   // fast attack
-                } else {
-                    localAgcMult += (ratio - 1.0f) * AGC_RELEASE_RATE * localAgcMult;  // slow release
-                }
-                if (localAgcMult < AGC_MIN_MULT) localAgcMult = AGC_MIN_MULT;
-                if (localAgcMult > AGC_MAX_MULT) localAgcMult = AGC_MAX_MULT;
+        // --- DSP (AudioDsp.h), written big-endian straight into the frame (or, with no RTSP
+        //     session, into the listening block) ---
+        uint8_t* pcm = frame ? frame->data + FRAME_HDR_BYTES : (feed ? listenBlock : NULL);
+        const BlockStats st = processBlock(captureBuf, capSamples, dc, hpfOn ? &localHpf : NULL,
+                                           appliedGain, targetGain, pcm);
+        appliedGain = targetGain;
+
+        // --- live listening: the same audio, little-endian (WAV), whole blocks only so the
+        //     listener never gets half a sample; a block that does not fit is skipped ---
+        if (feed && listenBlock && pcm) {
+            for (size_t i = 0; i < blockBytes; i += 2) {
+                const uint8_t hi = pcm[i], lo = pcm[i + 1];
+                listenBlock[i] = lo;
+                listenBlock[i + 1] = hi;
             }
+            if (xStreamBufferSpacesAvailable(feed) >= blockBytes) {
+                xStreamBufferSend(feed, listenBlock, blockBytes, 0);
+            }
+        }
+
+        if (agcOn) {
+            const float rms = sqrtf(st.sumSquares / (float)capSamples) / 32767.0f;
+            localAgcMult = agcUpdate(localAgcMult, rms, (float)capSamples / (float)rate);
             agcMultiplier = localAgcMult;
         } else {
             localAgcMult = 1.0f;
@@ -1021,7 +1004,7 @@ static void captureTask(void* arg) {
                 frame->seq = rtpSequence;
                 if (xQueueSend(readyQ, &frame, 0) != pdTRUE) {
                     xQueueSend(freeQ, &frame, 0);
-                    framesDroppedQueueFull++;
+                    framesDroppedQueueFull = framesDroppedQueueFull + 1;
                 }
                 UBaseType_t depth = uxQueueMessagesWaiting(readyQ);
                 if (depth > queueHighWater) queueHighWater = (uint16_t)depth;
@@ -1033,36 +1016,29 @@ static void captureTask(void* arg) {
         }
 
         // --- metering for the Web UI ---
-        if (peakAbs > 32767.0f) peakAbs = 32767.0f;
+        const float peakAbs = st.peak > 32767.0f ? 32767.0f : st.peak;
         lastPeakAbs16 = (uint16_t)peakAbs;
-        audioClippedLastBlock = clipped;
-        if (clipped) audioClipCount++;
+        audioClippedLastBlock = st.clipped;
+        if (st.clipped) audioClipCount = audioClipCount + 1;
         const unsigned long now = millis();
+        if (!st.flat) lastMicSignalMs = now;
         if (lastPeakAbs16 > peakHoldAbs16) {
             peakHoldAbs16 = lastPeakAbs16;
-            peakHoldUntilMs = now + 3000UL;
-        } else if (peakHoldAbs16 > 0 && now > peakHoldUntilMs) {
+            peakHoldSinceMs = now;
+        } else if (peakHoldAbs16 > 0 && now - peakHoldSinceMs > 3000UL) {
             peakHoldAbs16 = 0;
         }
 
         // --- LED (~10 Hz, only redrawn when the colour changes) ---
         if (now - lastLedUpdate > 100) {
             lastLedUpdate = now;
-            CRGB c = ledColorFor(streaming, clipped, peakAbs / 32767.0f);
+            uint32_t c = ledColorFor(streaming, st.clipped, peakAbs / 32767.0f);
             if (c != lastLed) {
-                M5.dis.drawpix(0, c);
+                ledShow(c);
                 lastLed = c;
             }
         }
-
-        // --- periodic serial stats (no heap use) ---
-        if (streaming && now - lastStatsLog > 30000) {
-            lastStatsLog = now;
-            Serial.printf("[Capture] sent=%u dropped=%u i2s_ovf=%u q=%u/%u hw=%u stall_max=%ums clip=%u agc=%.2f\n",
-                          audioPacketsSent, framesDroppedQueueFull, i2sOverruns,
-                          (unsigned)uxQueueMessagesWaiting(readyQ), framePoolCount, queueHighWater,
-                          sendStallMaxMs, audioClipCount, localAgcMult);
-        }
+        captureBlocks = captureBlocks + 1;
     }
 }
 
@@ -1071,8 +1047,8 @@ static bool pauseCapture() {
     if (!captureTaskHandle) return true;
     capturePauseRequested = true;
     __asm__ __volatile__("memw" ::: "memory");
-    unsigned long deadline = millis() + 2500;
-    while (!capturePaused && millis() < deadline) vTaskDelay(pdMS_TO_TICKS(5));
+    const unsigned long start = millis();
+    while (!capturePaused && millis() - start < 2500) vTaskDelay(pdMS_TO_TICKS(5));
     if (!capturePaused) {
         Serial.println("[Loop] WARNING: capture task did not pause");
         capturePauseRequested = false;
@@ -1091,7 +1067,9 @@ static void resumeCapture() {
 
 static void startCaptureTask() {
     if (captureTaskHandle) return;
-    BaseType_t ok = xTaskCreatePinnedToCore(captureTask, "AudioCapture", 8192, NULL, 20,
+    lastCaptureOkMs = millis();
+    lastMicSignalMs = lastCaptureOkMs;
+    BaseType_t ok = xTaskCreatePinnedToCore(captureTask, "AudioCapture", 4096, NULL, 20,
                                             &captureTaskHandle, 1);
     if (ok != pdPASS) {
         captureTaskHandle = NULL;
@@ -1179,12 +1157,13 @@ static bool senderServiceRtsp(int fd, char* rx, int& rxlen, const int rxcap, int
                 rl = snprintf(resp, sizeof(resp), "RTSP/1.0 200 OK\r\nCSeq: %d\r\nSession: %s\r\n\r\n", cseq, streamSessionId);
                 endSession = true;
             } else if (strncmp(rx, "OPTIONS", 7) == 0) {
-                rl = snprintf(resp, sizeof(resp),
-                    "RTSP/1.0 200 OK\r\nCSeq: %d\r\nPublic: OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN, GET_PARAMETER\r\n\r\n", cseq);
-            } else if (strncmp(rx, "GET_PARAMETER", 13) == 0 || strncmp(rx, "SET_PARAMETER", 13) == 0) {
-                rl = snprintf(resp, sizeof(resp), "RTSP/1.0 200 OK\r\nCSeq: %d\r\nSession: %s\r\n\r\n", cseq, streamSessionId);  // keepalive
+                rl = snprintf(resp, sizeof(resp), "RTSP/1.0 200 OK\r\nCSeq: %d\r\nPublic: " RTSP_METHODS "\r\n\r\n", cseq);
+            } else if (strncmp(rx, "GET_PARAMETER", 13) == 0 || strncmp(rx, "SET_PARAMETER", 13) == 0 ||
+                       strncmp(rx, "PLAY", 4) == 0) {
+                // keepalive; PLAY while playing changes nothing
+                rl = snprintf(resp, sizeof(resp), "RTSP/1.0 200 OK\r\nCSeq: %d\r\nSession: %s\r\n\r\n", cseq, streamSessionId);
             } else {
-                rl = snprintf(resp, sizeof(resp), "RTSP/1.0 405 Method Not Allowed\r\nCSeq: %d\r\n\r\n", cseq);
+                rl = snprintf(resp, sizeof(resp), "RTSP/1.0 501 Not Implemented\r\nCSeq: %d\r\n\r\n", cseq);
             }
             if (!senderRespond(fd, resp, rl)) { *reason = stopStreamRequested ? "stop requested" : "client stalled"; return false; }
             lastRTSPActivity = millis();
@@ -1246,7 +1225,7 @@ static void senderTask(void* arg) {
         }
 
         // Send buffer full (WiFi retransmits, slow client, sleeping AP...). Wait, bounded.
-        if (!stallStart) { stallStart = now; sendStallCount++; }
+        if (!stallStart) { stallStart = now; sendStallCount = sendStallCount + 1; }
         if (now - lastProgress > SEND_STALL_LIMIT_MS) { reason = "client stalled"; break; }
         fd_set ws; FD_ZERO(&ws); FD_SET(fd, &ws);
         struct timeval tv = { 0, 50000 };
@@ -1281,11 +1260,21 @@ static void finishStreamSession(const char* reason) {
                   " ms, RSSI " + String(WiFi.RSSI()) + " dBm");
 }
 
+// Sums of earlier sessions' counters: the counters restart at every session, /metrics needs totals.
+static StreamTotals pastSessions = {0, 0, 0, 0, 0};
+
+StreamTotals streamTotals() {
+    return {pastSessions.sent + audioPacketsSent, pastSessions.dropped + framesDroppedQueueFull,
+            pastSessions.overruns + i2sOverruns, pastSessions.readErrors + i2sReadErrors,
+            pastSessions.stalls + sendStallCount};
+}
+
 // Loop task: hand the negotiated client to a new sender task. Called right after the PLAY reply.
 static bool startStreamSession(WiFiClient& client) {
     if (senderTaskHandle || !readyQ) return false;
     flushReadyQueue();
     strlcpy(streamSessionId, rtspSessionId.c_str(), sizeof(streamSessionId));
+    pastSessions = streamTotals();
     audioPacketsSent = 0;
     framesDroppedQueueFull = 0;
     i2sOverruns = 0;
@@ -1293,7 +1282,6 @@ static bool startStreamSession(WiFiClient& client) {
     queueHighWater = 0;
     sendStallMaxMs = 0;
     sendStallCount = 0;
-    lastStatsReset = millis();
     lastRtspPlayMs = millis();
     rtspPlayCount++;
     streamEndReason = "";
@@ -1340,6 +1328,174 @@ bool requestStreamStop(const char* reason) {
     return true;
 }
 
+// ================== LIVE LISTENING (Web UI, core 0) ==================
+// GET /api/listen hands its HTTP connection to a listener task that sends the audio as an endless
+// WAV file. The capture task copies every processed block into listener.buf (little-endian) and
+// the task forwards it with non-blocking writes. Nothing comes from the RTSP frame pool, so
+// listening does not disturb a BirdNET-Go session, and when the listener falls behind only its
+// own blocks are skipped. One listener at a time.
+// Ownership: loop() creates the buffer and keeps the WiFiClient; the task is the only user of the
+// socket while it runs; loop() closes the socket after the task has exited and frees the buffer
+// once the capture task has also finished a block without it.
+
+#define LISTEN_BUFFER_MS 250             // audio buffered for the listener
+#define LISTEN_HEAP_MARGIN (32 * 1024)   // free heap that must remain once listening has started
+#define LISTEN_TASK_STACK 4096
+#define LISTEN_STALL_LIMIT_MS 5000       // listener accepted no data for this long -> drop it
+
+static struct {
+    StreamBufferHandle_t buf = NULL;
+    TaskHandle_t task = NULL;
+    WiFiClient client;                   // keeps the socket open once WebServer drops its copy
+    int fd = -1;
+    uint8_t head[160];                   // HTTP response head + WAV header, sent by the task first
+    size_t headLen = 0;
+    volatile bool stop = false;          // loop() asks the task to end
+    volatile bool exited = false;        // the task's last action
+    const char* volatile endReason = "";
+    uint32_t cutAtBlock = 0;             // captureBlocks when the feed was cut
+    unsigned long startedMs = 0;
+    String ip;
+} listener;
+
+static bool listenSendAll(int fd, const uint8_t* p, size_t n, const char** reason) {
+    size_t off = 0;
+    unsigned long stallStart = 0;
+    while (off < n) {
+        if (listener.stop) return false;
+        const int w = send(fd, p + off, n - off, MSG_DONTWAIT);
+        if (w > 0) { off += (size_t)w; stallStart = 0; continue; }
+        if (w < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != ENOMEM) {
+            *reason = "listener closed the connection";
+            return false;
+        }
+        const unsigned long now = millis();
+        if (!stallStart) stallStart = now;
+        else if (now - stallStart > LISTEN_STALL_LIMIT_MS) { *reason = "listener stalled"; return false; }
+        fd_set ws; FD_ZERO(&ws); FD_SET(fd, &ws);
+        struct timeval tv = { 0, 50000 };
+        select(fd + 1, NULL, &ws, NULL, &tv);
+    }
+    return true;
+}
+
+static void listenTask(void* arg) {
+    uint8_t chunk[1024];                 // on the task's stack: memory only while someone listens
+    const int fd = listener.fd;
+    const char* reason = "stopped";
+    unsigned long lastPoll = 0;
+    if (listenSendAll(fd, listener.head, listener.headLen, &reason)) {
+        while (!listener.stop) {
+            if (millis() - lastPoll >= 200) {   // notice a closed connection even while no audio flows
+                lastPoll = millis();
+                char rx[32];
+                const int r = recv(fd, rx, sizeof(rx), MSG_DONTWAIT);
+                if (r == 0) { reason = "listener closed the connection"; break; }
+                if (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK) { reason = "socket error"; break; }
+            }
+            const size_t n = xStreamBufferReceive(listener.buf, chunk, sizeof(chunk), pdMS_TO_TICKS(100));
+            if (n && !listenSendAll(fd, chunk, n, &reason)) break;
+        }
+    }
+    if (!listener.stop) listener.endReason = reason;   // else loop() already gave the reason
+    __asm__ __volatile__("memw" ::: "memory");
+    listener.exited = true;
+    vTaskDelete(NULL);
+}
+
+// Stop copying audio for the listener. The buffer stays allocated until the capture task has
+// finished a block (serviceListener).
+static void cutListenFeed() {
+    if (listenFeed == NULL) return;
+    listenFeed = NULL;
+    __asm__ __volatile__("memw" ::: "memory");
+    listener.cutAtBlock = captureBlocks;
+}
+
+// Ask the listener to end, e.g. before the sample rate changes under its WAV header.
+static void stopListening(const char* why) {
+    if (!listener.task || listener.stop) return;
+    cutListenFeed();
+    listener.endReason = why;
+    __asm__ __volatile__("memw" ::: "memory");
+    listener.stop = true;
+}
+
+// Loop task, every pass: clean up after the listener task.
+static void serviceListener() {
+    if (listener.task && listener.exited) {   // gone: no longer touches the socket or the buffer
+        listener.task = NULL;
+        cutListenFeed();
+        listener.client = WiFiClient();   // last reference: closes the socket
+        listener.fd = -1;
+        simplePrintln("Listening ended (" + String(listener.endReason) + ") for " + listener.ip + " after " +
+                      String((millis() - listener.startedMs) / 1000) + " s");
+    }
+    if (!listener.task && listener.buf && listenFeed == NULL &&
+        (captureBlocks != listener.cutAtBlock || capturePaused || !captureTaskHandle)) {
+        vStreamBufferDelete(listener.buf);
+        listener.buf = NULL;
+    }
+}
+
+// Loop task, inside the /api/listen handler. Returns 0 once the listener task owns the
+// connection (it answers 200 and streams), else an HTTP status with the reason in *why.
+int startListening(WiFiClient client, const char** why) {
+    // The same address asking again (a reloaded page, or Stop and Listen in quick succession)
+    // replaces its stream. Give a listener that is ending up to a second to clear.
+    if (listener.task && listener.ip == client.remoteIP().toString()) stopListening("replaced by a new request");
+    for (int i = 0; i < 100 && listener.buf && (!listener.task || listener.stop || listener.exited); i++) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+        serviceListener();
+    }
+    if (listener.task || listener.buf) { *why = "someone is already listening"; return 409; }
+    if (overheatLatched) { *why = "thermal protection is latched"; return 503; }
+    const uint32_t rate = appliedSampleRate;
+    if (!captureTaskHandle || rate == 0 || capturePauseRequested) { *why = "audio capture is not running"; return 503; }
+    const size_t blockBytes = (size_t)pipelineSamples * 2;
+    size_t bytes = (size_t)rate * 2 * LISTEN_BUFFER_MS / 1000;
+    if (bytes < 2 * blockBytes) bytes = 2 * blockBytes;
+    // Listening also takes the task (stack and control block) and the capture task's copy of one
+    // block; the margin must remain after all of them.
+    StreamBufferHandle_t buf = NULL;
+    const size_t need = bytes + LISTEN_TASK_STACK + 512 + blockBytes + LISTEN_HEAP_MARGIN;
+    if (heap_caps_get_free_size(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL) >= need) {
+        buf = xStreamBufferCreate(bytes, 1);
+    }
+    if (!buf) { *why = "not enough free memory"; return 503; }
+
+    // An endless WAV file: the header announces ~9 hours, more than anyone listens.
+    int n = snprintf((char*)listener.head, sizeof(listener.head),
+                     "HTTP/1.1 200 OK\r\nContent-Type: audio/wav\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n");
+    wavHeader(listener.head + n, rate, 0x7FFF0000u);
+    listener.headLen = (size_t)n + 44;
+    listener.client = client;
+    listener.client.setNoDelay(false);   // let Nagle fill segments; latency does not matter here
+    listener.fd = listener.client.fd();
+    listener.buf = buf;
+    listener.stop = false;
+    listener.exited = false;
+    listener.endReason = "";
+    listener.startedMs = millis();
+    listener.ip = listener.client.remoteIP().toString();
+    if (xTaskCreatePinnedToCore(listenTask, "Listen", LISTEN_TASK_STACK, NULL, 5, &listener.task, 0) != pdPASS) {
+        listener.task = NULL;
+        listener.client = WiFiClient();   // WebServer still holds the connection and answers with the error
+        listener.buf = NULL;
+        vStreamBufferDelete(buf);
+        *why = "cannot start the listener";
+        return 503;
+    }
+    __asm__ __volatile__("memw" ::: "memory");
+    listenFeed = buf;
+    simplePrintln("Listening started for " + listener.ip);
+    return 0;
+}
+
+const char* currentListener() {
+    return listener.task ? listener.ip.c_str() : "";
+}
+
 // Reconfigure the audio front end (sample rate / buffer size). Ends any active session; the
 // client reconnects and gets the new parameters through DESCRIBE.
 // Put the last working rate/buffer back into the settings (and flash) after a failed change.
@@ -1347,7 +1503,6 @@ static void revertAudioConfig(uint32_t rate, uint16_t buf, const char* why) {
     if (rate != 0 && buf != 0 && (currentSampleRate != rate || currentBufferSize != buf)) {
         currentSampleRate = rate;
         currentBufferSize = buf;
-        if (autoThresholdEnabled) minAcceptableRate = computeRecommendedMinRate();
         saveAudioSettings();
     }
     simplePrintln(String("Audio reconfiguration aborted (") + why + "); keeping " +
@@ -1359,6 +1514,7 @@ void restartI2S() {
     const uint16_t prevBuf = appliedBufferSize;
     simplePrintln("Reconfiguring audio: " + String(currentSampleRate) + " Hz, " +
                   String(currentBufferSize) + " samples/packet");
+    stopListening("audio reconfiguration");   // its WAV header has the old rate
     if (!requestStreamStop("audio reconfiguration")) {
         revertAudioConfig(prevRate, prevBuf, "sender task busy");   // pool/queues must not change under a live sender
         return;
@@ -1375,27 +1531,29 @@ void restartI2S() {
         if (!allocFramePool()) simplePrintln("Frame pool still unavailable: PLAY will be refused until reboot");
     }
     updateHighpassCoeffs();
-    maxPacketRate = 0;
-    minPacketRate = 0xFFFFFFFF;
     resumeCapture();
     simplePrintln("Audio pipeline restarted");
 }
 
 // ================== RTSP NEGOTIATION (loop task, only while not streaming) ==================
-void handleRTSPCommand(WiFiClient &client, String request) {
-    String cseq = "1";
-    int cseqPos = request.indexOf("CSeq: ");
-    if (cseqPos >= 0) {
-        cseq = request.substring(cseqPos + 6, request.indexOf("\r", cseqPos));
-        cseq.trim();
-    }
+
+// Value of a header in a request's header block, "" when absent (RtspRequest.h).
+static String rtspHeader(const String& req, const char* name) {
+    char v[160];
+    return rtspHeaderValue(req.c_str(), req.length(), name, v, sizeof(v)) ? String(v) : String();
+}
+
+// Replies are written with one print each: the socket has TCP_NODELAY set during negotiation, so
+// every print would be its own TCP segment.
+void handleRTSPCommand(WiFiClient &client, const String& request) {
+    String cseq = rtspHeader(request, "CSeq");
+    if (cseq.length() == 0) cseq = "0";
+    const String ok = "RTSP/1.0 200 OK\r\nCSeq: " + cseq + "\r\n";
 
     lastRTSPActivity = millis();
 
     if (request.startsWith("OPTIONS")) {
-        client.print("RTSP/1.0 200 OK\r\n");
-        client.print("CSeq: " + cseq + "\r\n");
-        client.print("Public: OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN, GET_PARAMETER\r\n\r\n");
+        client.print(ok + "Public: " RTSP_METHODS "\r\n\r\n");
 
     } else if (request.startsWith("DESCRIBE")) {
         String ip = WiFi.localIP().toString();
@@ -1407,22 +1565,15 @@ void handleRTSPCommand(WiFiClient &client, String request) {
         sdp += "m=audio 0 RTP/AVP 96\r\n";
         sdp += "a=rtpmap:96 L16/" + String(currentSampleRate) + "/1\r\n";
         sdp += "a=control:track1\r\n";
-
-        client.print("RTSP/1.0 200 OK\r\n");
-        client.print("CSeq: " + cseq + "\r\n");
-        client.print("Content-Type: application/sdp\r\n");
-        client.print("Content-Base: rtsp://" + ip + ":8554/audio/\r\n");
-        client.print("Content-Length: " + String(sdp.length()) + "\r\n\r\n");
-        client.print(sdp);
+        client.print(ok + "Content-Type: application/sdp\r\nContent-Base: rtsp://" + ip + ":8554/audio/\r\n"
+                     "Content-Length: " + String(sdp.length()) + "\r\n\r\n" + sdp);
 
     } else if (request.startsWith("SETUP")) {
         // Only TCP interleaved is offered. Answering 461 to a UDP request makes clients (VLC, some
         // ffmpeg configs) fall back to TCP immediately instead of failing their first attempt.
-        int tPos = request.indexOf("Transport:");
-        String transport = (tPos >= 0) ? request.substring(tPos, request.indexOf("\r", tPos) < 0 ? request.length() : request.indexOf("\r", tPos)) : String("");
-        if (tPos >= 0 && transport.indexOf("RTP/AVP/TCP") < 0) {
-            client.print("RTSP/1.0 461 Unsupported Transport\r\n");
-            client.print("CSeq: " + cseq + "\r\n\r\n");
+        const String transport = rtspHeader(request, "Transport");
+        if (transport.length() && transport.indexOf("RTP/AVP/TCP") < 0) {
+            client.print("RTSP/1.0 461 Unsupported Transport\r\nCSeq: " + cseq + "\r\n\r\n");
             return;
         }
         uint8_t ch = 0;
@@ -1433,12 +1584,14 @@ void handleRTSPCommand(WiFiClient &client, String request) {
         }
         rtpChannel = ch;
         rtspSessionId = String(random(100000000, 999999999));
-        client.print("RTSP/1.0 200 OK\r\n");
-        client.print("CSeq: " + cseq + "\r\n");
-        client.print("Session: " + rtspSessionId + ";timeout=60\r\n");
-        client.print("Transport: RTP/AVP/TCP;unicast;interleaved=" + String(ch) + "-" + String(ch + 1) + "\r\n\r\n");
+        client.print(ok + "Session: " + rtspSessionId + ";timeout=60\r\nTransport: RTP/AVP/TCP;unicast;interleaved=" +
+                     String(ch) + "-" + String(ch + 1) + "\r\n\r\n");
 
     } else if (request.startsWith("PLAY")) {
+        if (rtspSessionId.length() == 0) {
+            client.print("RTSP/1.0 455 Method Not Valid in This State\r\nCSeq: " + cseq + "\r\n\r\n");
+            return;
+        }
         if (senderTaskHandle != NULL || readyQ == NULL) {
             // Previous sender not joined yet, or no frame pool (allocation failed): say so instead of
             // answering 200 OK and then sending nothing until the idle timeout.
@@ -1451,12 +1604,9 @@ void handleRTSPCommand(WiFiClient &client, String request) {
         rtpSequence = (uint16_t)random(1, 65535);
         rtpTimestamp = (uint32_t)random(1, 0x7FFFFFFF);
         // Reply first (the sender is not running yet, so the loop still owns the socket).
-        // One print: the socket still has TCP_NODELAY set during negotiation.
-        String resp = "RTSP/1.0 200 OK\r\nCSeq: " + cseq + "\r\nSession: " + rtspSessionId +
-                      "\r\nRange: npt=0.000-\r\nRTP-Info: url=rtsp://" + ip + ":8554/audio/track1;seq=" +
-                      String(rtpSequence) + ";rtptime=" + String(rtpTimestamp) + "\r\n\r\n";
-        client.print(resp);
-        // (no client.flush(): on arduino-esp32 that discards the receive buffer)
+        client.print(ok + "Session: " + rtspSessionId + "\r\nRange: npt=0.000-\r\nRTP-Info: url=rtsp://" + ip +
+                     ":8554/audio/track1;seq=" + String(rtpSequence) + ";rtptime=" + String(rtpTimestamp) + "\r\n\r\n");
+        // (no client.clear(): it discards the receive buffer)
 
         if (startStreamSession(client)) {
             simplePrintln("STREAMING STARTED for " + rtspClientIp);
@@ -1469,60 +1619,161 @@ void handleRTSPCommand(WiFiClient &client, String request) {
 
     } else if (request.startsWith("TEARDOWN")) {
         // Only reached before PLAY (during a session the sender answers TEARDOWN itself)
-        client.print("RTSP/1.0 200 OK\r\n");
-        client.print("CSeq: " + cseq + "\r\n");
-        client.print("Session: " + rtspSessionId + "\r\n\r\n");
+        client.print(ok + "Session: " + rtspSessionId + "\r\n\r\n");
+        rtspSessionId = "";
         simplePrintln("RTSP TEARDOWN before PLAY");
-    } else if (request.startsWith("GET_PARAMETER")) {
-        // Many RTSP clients send GET_PARAMETER as keep-alive.
-        client.print("RTSP/1.0 200 OK\r\n");
-        client.print("CSeq: " + cseq + "\r\n\r\n");
+
+    } else if (request.startsWith("GET_PARAMETER") || request.startsWith("SET_PARAMETER")) {
+        client.print(ok + "\r\n");   // keepalive
+
+    } else {
+        client.print("RTSP/1.0 501 Not Implemented\r\nCSeq: " + cseq + "\r\n\r\n");
     }
 }
 
-// RTSP request assembly (loop task, only called when !isStreaming)
+// RTSP request assembly (loop task, only while no session runs). Answers every complete request in
+// the buffer, so a pipelined second request is not left waiting for more data, and skips request
+// bodies (Content-Length) instead of parsing them as the next request.
 void processRTSP(WiFiClient &client) {
     if (!client.connected()) return;
 
-    if (client.available()) {
-        int available = client.available();
-        int spaceLeft = sizeof(rtspParseBuffer) - rtspParseBufferPos - 1;
+    int available = client.available();
+    const int spaceLeft = sizeof(rtspParseBuffer) - 1 - rtspParseBufferPos;
+    if (available > spaceLeft) available = spaceLeft;
+    if (available > 0) {
+        const int n = client.read(rtspParseBuffer + rtspParseBufferPos, available);
+        if (n > 0) rtspParseBufferPos += n;
+    }
 
-        if (available > spaceLeft) {
-            available = spaceLeft;
-        }
-
-        if (available <= 0) {
+    while (rtspParseBufferPos > 0 && senderTaskHandle == NULL && client.connected()) {
+        char* buf = (char*)rtspParseBuffer;
+        int headerLen = 0;
+        const int used = rtspRequestLength(buf, rtspParseBufferPos, sizeof(rtspParseBuffer) - 1, &headerLen);
+        if (used == 0) return;   // wait for the rest
+        if (used < 0) {
             static unsigned long lastOverflowWarning = 0;
             if (millis() - lastOverflowWarning > 5000) {
-                simplePrintln("RTSP buffer full - resetting");
+                simplePrintln("RTSP request too large or malformed - discarded");
                 lastOverflowWarning = millis();
             }
             rtspParseBufferPos = 0;
             return;
         }
+        const char saved = buf[headerLen];
+        buf[headerLen] = '\0';
+        const String request(buf);
+        buf[headerLen] = saved;
 
-        client.read(rtspParseBuffer + rtspParseBufferPos, available);
-        rtspParseBufferPos += available;
-        rtspParseBuffer[rtspParseBufferPos] = '\0';
+        handleRTSPCommand(client, request);
 
-        char* endOfHeader = strstr((char*)rtspParseBuffer, "\r\n\r\n");
-        if (endOfHeader != nullptr) {
-            *endOfHeader = '\0';
-            String request = String((char*)rtspParseBuffer);
-
-            handleRTSPCommand(client, request);
-
-            int headerLen = (endOfHeader - (char*)rtspParseBuffer) + 4;
-            int remaining = rtspParseBufferPos - headerLen;
-            if (remaining > 0) {
-                memmove(rtspParseBuffer, rtspParseBuffer + headerLen, remaining);
-            }
-            rtspParseBufferPos = remaining;
+        if (senderTaskHandle != NULL || !client.connected()) {   // streaming now (or closed): the sender owns the socket
+            rtspParseBufferPos = 0;
+            return;
         }
+        memmove(buf, buf + used, rtspParseBufferPos - used);
+        rtspParseBufferPos -= used;
     }
 }
 
+
+// Holding the button for BUTTON_FORGET_WIFI_MS forgets the WiFi network and restarts into the setup
+// portal: the way to move the device to another network without the Web UI. After 1 s the LED
+// turns cyan so the hold is visibly registering.
+static void checkButton() {
+    static unsigned long downSince = 0;
+    if (digitalRead(BUTTON_PIN) != LOW) {
+        downSince = 0;
+        buttonHeld = false;
+        return;
+    }
+    const unsigned long now = millis();
+    if (downSince == 0) {
+        downSince = now ? now : 1;
+        return;
+    }
+    buttonHeld = now - downSince >= 1000;
+    if (now - downSince >= BUTTON_FORGET_WIFI_MS) {
+        simplePrintln("Button held for 5 s: forgetting the WiFi network, restarting into the setup portal");
+        wifiForgetCredentials();
+        restartWithNote("WiFi network forgotten (button)");
+    }
+}
+
+// ================== LOOP WATCHDOG ==================
+// loop() serves the Web UI and RTSP negotiation and runs every recovery check, so a pass that never
+// ends leaves the device unreachable until a power cycle. The core's WebServer can cause one: it
+// reads a multipart request body that lacks the parts it expects forever, even after the client
+// has gone. An esp_timer callback (core 0) restarts the device once a pass has taken
+// LOOP_STUCK_MS. The setup portal's loop is watched the same way. Long work inside a single pass
+// (a firmware upload, a WiFi join) calls keepLoopAlive().
+#define LOOP_STUCK_MS 60000
+static volatile uint32_t loopAliveMs = 0;
+
+void keepLoopAlive() {
+    loopAliveMs = millis();
+}
+
+static void checkLoopAlive(void*) {
+    const uint32_t alive = loopAliveMs;   // read before millis(), as with lastCaptureOkMs
+    if (millis() - alive > LOOP_STUCK_MS) restartWithNote("recovery: main loop stuck for 60 s");
+}
+
+static void startLoopWatchdog() {
+    keepLoopAlive();
+    const esp_timer_create_args_t args = {checkLoopAlive, NULL, ESP_TIMER_TASK, "loopWatch", false};
+    esp_timer_handle_t timer;
+    if (esp_timer_create(&args, &timer) != ESP_OK || esp_timer_start_periodic(timer, 5000000) != ESP_OK) {
+        simplePrintln("WARNING: loop watchdog not started");
+    }
+}
+
+// Firmware updates run on probation. The core calls this before setup(); returning true keeps a
+// freshly written image in the "pending verify" state instead of accepting it at once, so if it
+// restarts (crash, watchdog, a failed WiFi join ending in the portal's restart) before
+// confirmFirmware() accepts it, the bootloader goes back to the previous firmware.
+extern "C" bool verifyRollbackLater() {
+    return true;
+}
+
+// Accept the running firmware once it has kept WiFi for a minute (a no-op unless it was just
+// installed by an update).
+static void confirmFirmware() {
+    static bool done = false;
+    if (done || !wifiLinkUp || uptimeSeconds() < 60) return;
+    done = true;
+    esp_ota_img_states_t state;
+    if (esp_ota_get_state_partition(esp_ota_get_running_partition(), &state) == ESP_OK &&
+        state == ESP_OTA_IMG_PENDING_VERIFY) {
+        esp_ota_mark_app_valid_cancel_rollback();
+        simplePrintln("Firmware update confirmed: ran for a minute with WiFi");
+    }
+    audioPrefs.begin("audio", false);
+    if (audioPrefs.isKey("otaFrom")) audioPrefs.remove("otaFrom");   // can no longer be rolled back
+    audioPrefs.end();
+}
+
+// Once an update is written, remember the slot it was installed from. Booting from that slot
+// again while the other one is marked invalid means the bootloader rolled the update back.
+void noteFirmwareUpdateInstalled() {
+    audioPrefs.begin("audio", false);
+    audioPrefs.putString("otaFrom", esp_ota_get_running_partition()->label);
+    audioPrefs.end();
+}
+
+static void checkUpdateRollback() {
+    audioPrefs.begin("audio", false);
+    bool rolledBack = false;
+    if (audioPrefs.isKey("otaFrom")) {
+        char from[17] = "";
+        audioPrefs.getString("otaFrom", from, sizeof(from));
+        if (strcmp(from, esp_ota_get_running_partition()->label) == 0) {
+            audioPrefs.remove("otaFrom");
+            rolledBack = esp_ota_get_last_invalid_partition() != NULL;
+        }
+    }
+    audioPrefs.end();
+    if (rolledBack) restartInfoMarkRollback();
+}
 
 // Web UI is a separate module (WebUI.*)
 
@@ -1530,26 +1781,32 @@ void setup() {
     // TX ring buffer so serial prints return immediately instead of blocking on the 128-byte FIFO
     // (must precede Serial.begin, which M5.begin performs).
     Serial.setTxBufferSize(1024);
-    M5.begin(true, false, false);
-    // Atom Echo has one LED; the library default clocks out a 25-LED matrix on every show().
-    M5.dis.begin(1);
-    M5.dis.setTaskName("LEDs");
-    M5.dis.setTaskPriority(2);
-    M5.dis.setCore(1);
-    M5.dis.start();
+    Serial.begin(115200);
 
-    delay(200);
+    // The NS4168 speaker amplifier shares the PDM clock line with the microphone. Hold its bit
+    // clock and data inputs low so it never sees a usable I2S stream and stays idle.
+    pinMode(SPK_BCLK_PIN, OUTPUT);
+    digitalWrite(SPK_BCLK_PIN, LOW);
+    pinMode(SPK_DATA_PIN, OUTPUT);
+    digitalWrite(SPK_DATA_PIN, LOW);
+    pinMode(BUTTON_PIN, INPUT);   // input-only pin; the board pulls it up
+
+    // The first write also sets up the RMT channel, here on the loop task (core 1); the capture
+    // task takes over the LED once it runs.
+    ledShow(LED_STARTUP);
+
     Serial.println("\n\n=== ESP32 RTSP Mic Starting ===");
     Serial.println("Board: M5Stack Atom Echo");
+    restartInfoInit();
+    checkUpdateRollback();
+    simplePrintln(String("Firmware ") + FW_VERSION + ", last restart: " + restartReason());
+    if (restartCrashDetails()[0]) {
+        simplePrintln(String("Crash: ") + restartCrashDetails());
+    }
 
     senderExitSem = xSemaphoreCreateBinary();
 
-    // Set LED to indicate startup (the capture task takes over the LED once it runs)
-    M5.dis.drawpix(0, CRGB(128, 128, 0));  // Yellow for startup
-
     randomSeed((uint32_t)micros() ^ (uint32_t)(ESP.getEfuseMac() & 0xFFFFFFFF));
-
-    bootTime = millis(); // Store boot time
     rtpSSRC = (uint32_t)random(1, 0x7FFFFFFF);
 
     // Load settings from flash
@@ -1558,45 +1815,30 @@ void setup() {
 
     // WiFi: power save is applied from settings after the connection is up
     Serial.println("Initializing WiFi...");
+    WiFi.onEvent(onWifiEvent);
     WiFi.setSleep(false);
-
-    WiFiManager wm;
-    wm.setConnectTimeout(60);
-    wm.setConfigPortalTimeout(180);
-    if (!wm.autoConnect("ESP32-RTSP-Mic-AP")) {
-        simplePrintln("WiFi failed, restarting...");
-        ESP.restart();
+    if (!wifiJoinStored(deviceName, WIFI_JOIN_TIMEOUT_MS)) {
+        ledShow(LED_SETUP);
+        simplePrintln(wifiHasStoredCredentials() ? "WiFi: stored network not reachable, starting setup portal"
+                                                 : "WiFi: no network configured, starting setup portal");
+        startLoopWatchdog();
+        wifiRunSetupPortal(SETUP_AP_NAME, deviceName, FW_VERSION);   // restarts the device
     }
+    simplePrintln("WiFi connected: " + WiFi.localIP().toString() + " on " + WiFi.SSID() +
+                  ", RSSI " + String(WiFi.RSSI()) + " dBm, channel " + String(WiFi.channel()));
 
-    simplePrintln("WiFi connected: " + WiFi.localIP().toString());
-
-    // NTP time sync (EST = UTC-5, no DST)
-    configTime(-5 * 3600, 0, "pool.ntp.org");
-    Serial.print("Waiting for NTP time sync...");
-    time_t now = 0;
-    for (int i = 0; i < 20 && now < 100000; i++) {
-        delay(250);
-        time(&now);
-    }
-    if (now > 100000) {
-        struct tm ti;
-        localtime_r(&now, &ti);
-        char buf[32];
-        strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &ti);
-        Serial.printf(" OK: %s EST\n", buf);
-    } else {
-        Serial.println(" failed (will use uptime)");
-    }
+    // Log timestamps in UTC once SNTP has synced (in the background); uptime until then.
+    configTime(0, 0, "pool.ntp.org");
 
     // Apply configured WiFi TX power / power save after connect
     applyWifiTxPower(true);
     applyWifiPowerSave(true);
 
-    // mDNS: allows rtsp://atomecho.local:8554/audio
-    if (MDNS.begin("atomecho")) {
+    // mDNS: allows rtsp://<name>.local:8554/audio
+    if (MDNS.begin(deviceName)) {
         MDNS.addService("rtsp", "tcp", 8554);
         MDNS.addService("http", "tcp", 80);
-        simplePrintln("mDNS: atomecho.local");
+        simplePrintln(String("mDNS: ") + deviceName + ".local");
     }
 
     // CPU clock before the audio pipeline starts (WiFi needs >= 80 MHz)
@@ -1614,58 +1856,38 @@ void setup() {
     updateHighpassCoeffs();
     startCaptureTask();
 
-    if (!overheatLatched) {
-        rtspServer.begin();
-        rtspServer.setNoDelay(true);
-        rtspServerEnabled = true;
-    } else {
-        rtspServerEnabled = false;
-        rtspServer.stop();
-    }
+    setRtspServer(true);   // stays off while the thermal latch is set
     // Web UI
     webui_begin();
 
-    lastStatsReset = millis();
     lastRTSPActivity = millis();
     lastMemoryCheck = millis();
-    lastPerformanceCheck = millis();
-    lastWiFiCheck = millis();
-    minFreeHeap = ESP.getFreeHeap();
     float initialTemp = temperatureRead();
     if (isTemperatureValid(initialTemp)) {
         maxTemperature = initialTemp;
         lastTemperatureC = initialTemp;
         lastTemperatureValid = true;
-        overheatSensorFault = false;
     } else {
-        maxTemperature = 0.0f;
-        lastTemperatureC = 0.0f;
-        lastTemperatureValid = false;
         overheatSensorFault = true;
-        overheatLastReason = "Thermal protection disabled: temperature sensor unavailable.";
-        overheatLastTimestamp = "";
-        overheatTripTemp = 0.0f;
-        overheatTriggeredAt = 0;
-        persistOverheatNote();
         simplePrintln("WARNING: Temperature sensor unavailable at startup. Thermal protection paused.");
     }
 
     if (!overheatLatched) {
         simplePrintln("RTSP server ready on port 8554");
         simplePrintln("RTSP URL: rtsp://" + WiFi.localIP().toString() + ":8554/audio");
-        simplePrintln("RTSP URL: rtsp://atomecho.local:8554/audio");
+        simplePrintln(String("RTSP URL: rtsp://") + deviceName + ".local:8554/audio");
     } else {
         simplePrintln("RTSP server paused due to thermal latch. Clear via Web UI before resuming streaming.");
     }
     simplePrintln("Web UI: http://" + WiFi.localIP().toString() + "/");
     Serial.printf("Free heap after init: %u KB\n", ESP.getFreeHeap() / 1024);
+    startLoopWatchdog();
 }
 
 void loop() {
-    // Update M5Atom (for button handling)
-    M5.update();
-
+    keepLoopAlive();
     webui_handleClient();
+    wifiImprovPoll(deviceName, FW_VERSION);
 
     if (millis() - lastTempCheck > 60000) { // 1 min
         checkTemperature();
@@ -1674,26 +1896,62 @@ void loop() {
 
     // Heap monitoring (every 10 minutes — useful for detecting leaks in long deployments)
     if (millis() - lastMemoryCheck > 600000) { // 10 min
-        uint32_t currentHeap = ESP.getFreeHeap();
-        if (currentHeap < minFreeHeap) minFreeHeap = currentHeap;
-        Serial.printf("[Heap] Current: %u KB, Min: %u KB\n", currentHeap / 1024, minFreeHeap / 1024);
+        Serial.printf("[Heap] Current: %u KB, Min: %u KB\n", ESP.getFreeHeap() / 1024, ESP.getMinFreeHeap() / 1024);
         lastMemoryCheck = millis();
     }
 
-    if (millis() - lastPerformanceCheck > (performanceCheckInterval * 60000UL)) {
-        checkPerformance();
-        lastPerformanceCheck = millis();
+    static unsigned long lastWiFiCheck = 0;
+    if (millis() - lastWiFiCheck >= 1000) {
+        lastWiFiCheck = millis();
+        checkWiFi();
     }
 
-    if (millis() - lastWiFiCheck > 30000) { // 30 s
-        checkWiFiHealth(); // without TX power log spam
-        lastWiFiCheck = millis();
+    // Session statistics on serial every 30 s. Printed here, not by the capture task: a full
+    // UART buffer would block a priority-20 task that has only ~100 ms of DMA slack at 32 kHz.
+    static unsigned long lastStatsLog = 0;
+    if (isStreaming && millis() - lastStatsLog >= 30000) {
+        lastStatsLog = millis();
+        Serial.printf("[Stream] sent=%u dropped=%u i2s_ovf=%u q=%u/%u peak=%u stall_max=%ums clip=%u "
+                      "agc=%.2f stack_free capture=%u sender=%u\n",
+                      audioPacketsSent, framesDroppedQueueFull, i2sOverruns, streamQueueDepth(),
+                      framePoolCount, queueHighWater, sendStallMaxMs, audioClipCount, agcMultiplier,
+                      captureTaskHandle ? (unsigned)uxTaskGetStackHighWaterMark(captureTaskHandle) : 0,
+                      senderTaskHandle ? (unsigned)uxTaskGetStackHighWaterMark(senderTaskHandle) : 0);
     }
 
     checkScheduledReset();
+    checkButton();
+    confirmFirmware();
+    serviceListener();
 
-    // WiFi power save can starve the TCP send window (5760 B per beacon-period RTT). If a session
-    // drops frames while it is on, switch it off until reboot rather than keep dropping audio.
+    // The capture task (higher priority, same core) stamps these at any moment. Read them before
+    // millis(): the other order can pair a newer stamp with an older "now", and the unsigned
+    // difference then wraps to ~49 days.
+    const uint32_t captureOkAt = lastCaptureOkMs, micSignalAt = lastMicSignalMs;
+    const uint32_t nowMs = millis();
+
+    // Capture watchdog. A read gives up after 1 s, so CAPTURE_STALL_MS without one complete block
+    // means the driver stopped delivering; reinstalling it ends any session (the client reconnects).
+    if (captureTaskHandle && !capturePauseRequested && appliedSampleRate != 0 &&
+        nowMs - captureOkAt > CAPTURE_STALL_MS && nowMs - lastI2SReset > 30000) {
+        lastI2SReset = nowMs;
+        simplePrintln("Capture stalled: no I2S data for " + String((nowMs - captureOkAt) / 1000) +
+                      " s (read errors " + String(i2sReadErrors) + "); restarting audio");
+        restartI2S();
+    }
+
+    // Microphone check. A stuck PDM data line decodes to one constant value; a working microphone
+    // varies by at least 1 LSB even in a silent room. Only judged while capture is delivering.
+    const bool flatNow = nowMs - captureOkAt < 2000 && nowMs - micSignalAt > MIC_FLAT_MS;
+    if (flatNow != micFlat) {
+        micFlat = flatNow;
+        simplePrintln(micFlat ? "WARNING: no signal from the microphone (constant samples for 10 s); check the hardware"
+                              : "Microphone signal back");
+    }
+
+    // WiFi power save can starve the TCP send window (16 KB per beacon-period RTT, set in
+    // platformio.ini). If a session drops frames while it is on, switch it off until reboot
+    // rather than keep dropping audio.
     static unsigned long lastPsCheck = 0;
     if (isStreaming && wifiPowerSave && !wifiPsSuspended && millis() - lastPsCheck > 5000) {
         lastPsCheck = millis();
@@ -1713,9 +1971,9 @@ void loop() {
         }
     }
     if (senderTaskHandle && stopStreamRequested && stopRequestedAt != 0 &&
-        millis() - stopRequestedAt > SENDER_JOIN_LIMIT_MS && scheduledRebootAt == 0) {
+        millis() - stopRequestedAt > SENDER_JOIN_LIMIT_MS && !rebootScheduled) {
         simplePrintln("Sender task did not exit for 30 s; rebooting to recover");
-        scheduleReboot(false, 200);
+        scheduleReboot(RebootKind::Plain, 200, "recovery: sender task stuck");
     }
 
     // RTSP idle timeout — disconnect clients that connect but never stream (60s)
@@ -1733,14 +1991,14 @@ void loop() {
             lastRtspPoll = millis();
             // Phase: accept a new client (never while a previous sender is still being joined)
             if (!rtspClient || !rtspClient.connected()) {
-                WiFiClient newClient = rtspServer.available();
+                WiFiClient newClient = rtspServer.accept();
                 if (newClient) {
                     rtspClient = newClient;
                     rtspClient.setNoDelay(true);   // snappy negotiation; switched off for streaming
                     rtspClientIp = rtspClient.remoteIP().toString();
+                    rtspSessionId = "";   // PLAY needs a SETUP on this connection
                     rtspParseBufferPos = 0;
                     lastRTSPActivity = millis();
-                    lastRtspClientConnectMs = millis();
                     rtspConnectCount++;
                     simplePrintln("New RTSP client: " + rtspClientIp);
                 }
@@ -1756,12 +2014,10 @@ void loop() {
     }
 
     // Handle deferred reboot/reset safely here
-    if (scheduledRebootAt != 0 && millis() >= scheduledRebootAt) {
-        if (scheduledFactoryReset) {
-            resetToDefaultSettings();
-        }
-        delay(50);
-        ESP.restart();
+    if (rebootScheduled && millis() - rebootRequestedAt >= rebootDelayMs) {
+        if (rebootKind == RebootKind::RestoreDefaults) resetToDefaultSettings();
+        if (rebootKind == RebootKind::ForgetWifi) wifiForgetCredentials();   // the next boot opens the setup portal
+        restartWithNote(rebootNote);
     }
 
     // Everything above is poll-based. WebServer::handleClient already sleeps 1 ms when no HTTP
