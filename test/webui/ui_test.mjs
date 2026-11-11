@@ -36,6 +36,21 @@ function listenFrom(base, localAddress) {
   });
 }
 
+// A request with a Host header of our choosing (fetch() always sends the URL's). Resolves the
+// status and the body.
+function withHost(base, method, path, host) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(path, base);
+    const req = request({ host: u.hostname, port: u.port, path: u.pathname, method, headers: { host } }, (res) => {
+      let body = '';
+      res.on('data', (c) => { body += c; });
+      res.on('end', () => resolve({ status: res.statusCode, body }));
+    });
+    req.on('error', reject);
+    req.end();
+  });
+}
+
 async function startMock(port, scenario) {
   const proc = spawn(process.execPath, [new URL('./mock_server.mjs', import.meta.url).pathname, String(port)],
     { env: { ...process.env, MOCK_SCENARIO: scenario }, stdio: ['ignore', 'pipe', 'inherit'] });
@@ -167,6 +182,13 @@ async function streamingScenario(base) {
   check(await page.evaluate(`!${field('gain')}.classList.contains('dirty')`), 'dirty mark cleared after save');
   check(await page.evaluate(`${formOf('gain')}.querySelector('button[type=submit]').disabled`), 'Save disabled again after save');
 
+  // A poll leaves the field being typed in alone, even while its text equals the saved value.
+  await page.evaluate(`${field('gain')}.focus()`);
+  await setValue(page, 'gain', '4.50');
+  await sleep(1300);
+  check(await page.evaluate(`${field('gain')}.value`) === '4.50', 'poll leaves the focused field alone', await page.evaluate(`${field('gain')}.value`));
+  await page.evaluate(`${field('gain')}.blur()`);
+
   // The browser's form validation stops an out-of-range value before any request.
   page.requests.length = 0;
   await setValue(page, 'hpf_hz', '5');
@@ -180,12 +202,30 @@ async function streamingScenario(base) {
   check(await page.evaluate(`${field('hpf_hz')}.value`) === '300', 'Undo restores the saved value', await page.evaluate(`${field('hpf_hz')}.value`));
   check(await page.evaluate(`!${field('hpf_hz')}.classList.contains('dirty')`), 'Undo clears the dirty mark');
 
+  // A field edited while a save is out keeps its text and stays dirty; the field sent is clean.
+  // The page's fetch is wrapped to hold /api/settings for a second.
+  await page.evaluate(`(() => {
+    window.realFetch = window.fetch;
+    window.fetch = (url, opts) => (String(url).includes('/api/settings')
+      ? new Promise((r) => setTimeout(r, 1000)).then(() => window.realFetch(url, opts)) : window.realFetch(url, opts));
+  })()`);
+  await setValue(page, 'gain', '4');
+  await page.evaluate(`${formOf('gain')}.requestSubmit()`);
+  await setValue(page, 'hpf_hz', '350');
+  await waitFor(page, `!${field('gain')}.classList.contains('dirty')`, 'save with a delayed reply');
+  await page.evaluate('window.fetch = window.realFetch');
+  check(await page.evaluate(`${field('gain')}.value`) === '4', 'the field sent shows the saved value', await page.evaluate(`${field('gain')}.value`));
+  check(await page.evaluate(`${field('hpf_hz')}.value`) === '350', 'a field edited during the save keeps its text', await page.evaluate(`${field('hpf_hz')}.value`));
+  check(await page.evaluate(`${field('hpf_hz')}.classList.contains('dirty')`), 'a field edited during the save stays dirty');
+  check(await page.evaluate(`!${formOf('hpf_hz')}.querySelector('button[type=submit]').disabled`), 'Save stays enabled for it');
+  await page.evaluate(`${formOf('hpf_hz')}.reset()`);
+
   // A value the device rejects shows the device's message.
   await page.evaluate(`(() => { const s = ${field('buffer')}; s.add(new Option('9000', '9000')); s.value = '9000'; s.dispatchEvent(new Event('change', { bubbles: true })); })()`);
   await page.evaluate(`${formOf('buffer')}.requestSubmit()`);
   await waitFor(page, `${formOf('buffer')}.querySelector('.msg').textContent.startsWith('Not saved')`, 'server error message');
   const srvMsg = await page.evaluate(`${formOf('buffer')}.querySelector('.msg').textContent`);
-  check(srvMsg === 'Not saved: buffer: must be 256 to 8192 samples', 'device error shown', srvMsg);
+  check(srvMsg === 'Not saved: buffer: must be 256 to 4096 samples', 'device error shown', srvMsg);
   check(await page.evaluate(`${field('buffer')}.classList.contains('dirty')`), 'rejected field stays dirty');
   await page.evaluate(`${formOf('buffer')}.reset()`);
 
@@ -230,6 +270,16 @@ async function streamingScenario(base) {
   const lines = logText.trim().split('\n');
   check(new Set(lines).size === lines.length, 'no duplicated log lines', lines.length);
 
+  // A restart the page did not start: the page notices it from the uptime and loads the log again.
+  const action = (name) => fetch(base + 'api/action', { method: 'POST', body: new URLSearchParams({ name }) });
+  await action('reboot');
+  await waitFor(page, "document.getElementById('restart').textContent === 'Web UI reboot'", 'page sees the restart', 10000);
+  await action('restart_audio');
+  await waitFor(page, "document.getElementById('log').textContent.includes('Web UI: restart audio')", 'log line after the restart');
+  const restartLines = (await text(page, 'log')).trim().split('\n');
+  check(new Set(restartLines).size === restartLines.length, 'no duplicated log lines after a restart', restartLines);
+  check(restartLines.filter((l) => l.endsWith('Web UI: reboot')).length === 1, 'the reboot logged once', restartLines);
+
   // Listening: the page plays the device's WAV stream and draws a spectrogram from it.
   check(await text(page, 'listener') === 'nobody', 'nobody listening at first', await text(page, 'listener'));
   await page.evaluate("document.getElementById('listenBtn').click()", true);
@@ -271,7 +321,7 @@ async function streamingScenario(base) {
   check(overflow <= 0, 'no horizontal scrolling at 390 px', overflow);
   await screenshot(page, 'mobile');
 
-  // Firmware upload: a file that is not an ESP32 image is refused with the device's reason.
+  // Firmware upload: a file that is not an ESP32 application image is refused with the device's reason.
   const pick = (bytes) => page.evaluate(`(() => {
     const dt = new DataTransfer();
     dt.items.add(new File([new Uint8Array(${JSON.stringify(bytes)})], 'firmware.bin'));
@@ -279,35 +329,55 @@ async function streamingScenario(base) {
     input.files = dt.files;
     input.dispatchEvent(new Event('change'));
   })()`);
+  // The start of an application image as the device checks it: 0xE9, and the app descriptor's
+  // magic word 0xABCD5432 (little-endian) at offset 32. Byte 1 selects the mock's test hook.
+  const image = (hook) => {
+    const b = new Array(48).fill(0);
+    b[0] = 0xe9; b[1] = hook;
+    b.splice(32, 4, 0x32, 0x54, 0xcd, 0xab);
+    return b;
+  };
+  const notAnImage = 'Not installed: not a firmware image; upload firmware.bin (the other .bin files of a release are for flashing over USB)';
   await pick([0x00, 0x01, 0x02, 0x03]);
   check(await page.evaluate("!document.getElementById('fwInstall').disabled"), 'Install enabled once a file is picked');
   await page.evaluate("document.getElementById('fwInstall').click()");
   await waitFor(page, "document.getElementById('fwMsg').textContent.startsWith('Not installed')", 'upload refusal');
-  check(await text(page, 'fwMsg') === 'Not installed: Wrong Magic Byte', 'device reason shown', await text(page, 'fwMsg'));
-  await pick([0xe9, 0x06, 0x02, 0x20, 0x00, 0x00]);
+  check(await text(page, 'fwMsg') === notAnImage, 'device reason shown', await text(page, 'fwMsg'));
+  const bootloader = image(0x06);
+  bootloader[32] = 0x50;   // as in bootloader.bin: an image, but no app descriptor
+  await pick(bootloader);
+  await page.evaluate("document.getElementById('fwInstall').click()");
+  await waitFor(page, "document.getElementById('fwMsg').textContent.startsWith('Not installed')", 'bootloader refusal');
+  check(await text(page, 'fwMsg') === notAnImage, 'bootloader.bin refused with the same reason', await text(page, 'fwMsg'));
+  await pick(image(0x06));
   await page.evaluate("document.getElementById('fwInstall').click()");
   await waitFor(page, "getComputedStyle(document.getElementById('overlay')).display === 'flex'", 'restart overlay after an update');
   await waitFor(page, "getComputedStyle(document.getElementById('overlay')).display !== 'flex'", 'page reloaded after the update', 15000);
 
   // The reply is lost after the whole file went out: the device's uptime shows whether it restarted.
   const overlayShown = "getComputedStyle(document.getElementById('overlay')).display === 'flex'";
-  await pick([0xe9, 0x01, 0x02, 0x20]);   // the mock installs it and restarts
+  await pick(image(0x01));   // the mock installs it and restarts
   await page.evaluate("document.getElementById('fwInstall').click()");
   await waitFor(page, overlayShown, 'overlay while the page checks a lost reply');
   await waitFor(page, `!(${overlayShown}) && document.getElementById('status').textContent !== 'Loading…'`,
     'page reloaded after the restart', 15000);
   check(await text(page, 'fwMsg') === '', 'no error after a lost reply and a restart', await text(page, 'fwMsg'));
-  await pick([0xe9, 0x02, 0x02, 0x20]);   // the mock loses the end of the file
+  await pick(image(0x02));   // the mock loses the end of the file
   await page.evaluate("document.getElementById('fwInstall').click()");
   await waitFor(page, "document.getElementById('fwMsg').textContent.startsWith('Not installed')", 'lost reply without a restart', 15000);
   check(await text(page, 'fwMsg') === 'Not installed: the connection dropped before the device had the whole file.',
     'says the update was not installed', await text(page, 'fwMsg'));
   check(!(await page.evaluate(overlayShown)), 'overlay gone once the device answered');
-  await pick([0xe9, 0x03, 0x02, 0x20]);   // the mock restarts for another reason
+  await pick(image(0x03));   // the mock restarts for another reason
   await page.evaluate("document.getElementById('fwInstall').click()");
   await waitFor(page, "document.getElementById('fwMsg').textContent.startsWith('Not installed: the device restarted')", 'restart for another reason', 15000);
   check(await text(page, 'fwMsg') === 'Not installed: the device restarted (recovery: main loop stuck for 60 s).',
     'names the restart reason', await text(page, 'fwMsg'));
+  await pick(image(0x04));   // the mock's running firmware is an update not confirmed yet
+  await page.evaluate("document.getElementById('fwInstall').click()");
+  await waitFor(page, "document.getElementById('fwMsg').textContent.startsWith('Not installed: the running firmware')", 'refusal while on probation');
+  check(await text(page, 'fwMsg') === 'Not installed: the running firmware is not confirmed yet; wait until the log says "Firmware update confirmed" (about a minute after start, with WiFi), then upload again',
+    'says the running firmware is not confirmed yet', await text(page, 'fwMsg'));
 
   // Reboot shows the overlay and the page reloads when the device answers again.
   await page.evaluate("document.querySelector('[data-action=reboot]').click()");
@@ -337,6 +407,24 @@ async function latchedScenario(base) {
   await page.close();
 }
 
+// A device that has just started: no temperature reading yet, no WiFi drop, no session so far.
+async function idleScenario(base) {
+  const page = await openPage();
+  await load(page, base);
+  check(await text(page, 'temp') === 'sensor unavailable', 'no temperature reading', await text(page, 'temp'));
+  check(await text(page, 'drops') === 'none since boot', 'no WiFi drop', await text(page, 'drops'));
+  check(await text(page, 'session') === '–', 'no session so far', await text(page, 'session'));
+  check(await text(page, 'ip') === '192.168.1.50, atomecho.local', 'address and the name mDNS answers to', await text(page, 'ip'));
+  await page.close();
+
+  // The device answers only to Host values that name it, which defeats DNS rebinding.
+  const unknownHost = 'unknown host name: open the device by its IP address or name.local';
+  const get = await withHost(base, 'GET', 'api/state', 'evil.example');
+  check(get.status === 403 && JSON.parse(get.body).error === unknownHost, 'GET with a foreign Host refused', get);
+  const post = await withHost(base, 'POST', 'api/action', 'atomecho.evil.example');
+  check(post.status === 403 && JSON.parse(post.body).error === unknownHost, 'POST with a foreign Host refused', post);
+}
+
 // Serve the page's requests for host (a name the browser cannot resolve here) from base; the page
 // still sees its own URL. Origin follows, as Host and Origin would agree on the device.
 async function mapHost(page, host, base) {
@@ -349,8 +437,9 @@ async function mapHost(page, host, base) {
   await page.send('Fetch.enable', { patterns: [{ urlPattern: `http://${host}/*` }] });
 }
 
-// The device answers only to its current name, so a page opened by the old name moves on after a
-// rename: to the new .local name, or to the device's address (192.168.1.50 in the mock).
+// The device answers only to its current names, so a page opened by an old one moves on after a
+// rename: to the new name mDNS answers to under .local, or to the device's address (192.168.1.50
+// in the mock).
 async function renameScenario(port) {
   const base = `http://127.0.0.1:${port}/`;
   const nameMock = (name) => fetch(base + 'api/settings', { method: 'POST', body: new URLSearchParams({ name }) });
@@ -390,6 +479,16 @@ async function renameScenario(port) {
   await waitFor(page, `${formOf('name')}.querySelector('.msg').textContent === 'Saved.'`, 'name saved by address');
   check(await page.evaluate('location.href') === base, 'a page opened by address stays', await page.evaluate('location.href'));
   await page.close();
+
+  await nameMock('taken');   // the mock's mDNS answers as taken-2, as after a name clash
+  page = await openPage();
+  await mapHost(page, `taken-2.local:${port}`, base);
+  await load(page, `http://taken-2.local:${port}/`);
+  check(await text(page, 'ip') === '192.168.1.50, taken-2.local', 'address shows the name mDNS answers to', await text(page, 'ip'));
+  await rename(page, 'pond');
+  to = await navigatesTo(page, `http://pond.local:${port}/`);
+  check(to === true, 'a page opened by the clash name continues at the new name', to);
+  await page.close();
 }
 
 try {
@@ -402,6 +501,7 @@ const mocks = [await startMock(18080, 'streaming'), await startMock(18081, 'latc
 try {
   await streamingScenario('http://127.0.0.1:18080/');
   await latchedScenario('http://127.0.0.1:18081/');
+  await idleScenario('http://127.0.0.1:18082/');
   await renameScenario(18082);
 } catch (e) {
   failures++;

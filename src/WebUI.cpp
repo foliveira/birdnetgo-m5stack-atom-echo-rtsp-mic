@@ -2,6 +2,10 @@
 #include <Update.h>
 #include <WiFi.h>
 #include <WebServer.h>
+#include <esp_app_desc.h>
+#include <esp_app_format.h>
+#include <esp_attr.h>
+#include <esp_heap_caps.h>
 #include <math.h>
 #include "App.h"
 #include "HostCheck.h"
@@ -23,33 +27,59 @@
 
 static WebServer web(80);
 
-// ---------------------------------------------------------------------------------------------
-// Log ring. Lines are numbered from boot so the page fetches only what it has not seen. Fixed
-// slots: no heap use while logMux is held and no fragmentation over long uptimes.
+// Free heap as the frame pool and HEAP_HEADROOM_BYTES count it: byte-addressable internal RAM.
+// ESP.getFreeHeap() adds the IRAM heap, which only the frame pool uses.
+static const uint32_t HEAP_CAPS = MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL;
 
-static const uint32_t LOG_CAP = 48;
+// ---------------------------------------------------------------------------------------------
+// Log ring, in RTC slow memory: it survives every restart except a power cycle, so the log still
+// shows what led to a restart, and its 7.5 KB are not taken from the heap the frame pool comes
+// from. Lines are numbered from the power cycle (or from the first boot of a firmware with another
+// ring layout) so the page fetches only what it has not seen. Fixed slots: no heap use while
+// logMux is held and no fragmentation over long uptimes.
+
+static const uint32_t LOG_CAP = 39;   // as many as fit in RTC slow memory; the linker fails if they do not
 static const size_t LOG_LINE = 192;   // the session summary line is ~170 characters
-static char logLines[LOG_CAP][LOG_LINE];
-static uint32_t logSeq = 0;           // lines logged since boot; line n is in slot n % LOG_CAP
-extern portMUX_TYPE logMux;
+// Depends on the ring's dimensions, so a firmware with another layout does not read an old ring.
+static const uint32_t LOG_MAGIC = 0x4C470000u ^ ((LOG_CAP << 16) | LOG_LINE);
+static_assert(LOG_CAP < 0x10000 && LOG_LINE < 0x10000, "LOG_MAGIC holds each dimension in 16 bits");
+
+struct LogRing {
+    uint32_t magic;                   // LOG_MAGIC while seq and lines are valid
+    uint32_t seq;                     // lines logged since the ring was cleared; line n is in slot n % LOG_CAP
+    char lines[LOG_CAP][LOG_LINE];
+};
+RTC_NOINIT_ATTR static LogRing logRing;
+static portMUX_TYPE logMux = portMUX_INITIALIZER_UNLOCKED;
+
+// A static constructor: runs before setup(), so before the first line is pushed or read.
+__attribute__((constructor)) static void checkLogRing() {
+    if (logRing.magic != LOG_MAGIC) {   // power cycle, or another layout
+        memset(&logRing, 0, sizeof(logRing));
+        logRing.magic = LOG_MAGIC;
+        return;
+    }
+    // A restart can interrupt a line being copied: end every slot within its bounds.
+    for (uint32_t i = 0; i < LOG_CAP; i++) logRing.lines[i][LOG_LINE - 1] = '\0';
+}
 
 void webui_pushLog(const char* line) {
     portENTER_CRITICAL(&logMux);
-    strlcpy(logLines[logSeq % LOG_CAP], line, LOG_LINE);
-    logSeq++;
+    strlcpy(logRing.lines[logRing.seq % LOG_CAP], line, LOG_LINE);
+    logRing.seq++;
     portEXIT_CRITICAL(&logMux);
 }
 
 static void httpLogs() {
     // Lines are only added from the loop task, which is running this handler, so the ring cannot
     // change between the length pass and the send pass.
-    const uint32_t end = logSeq;
+    const uint32_t end = logRing.seq;
     uint32_t first = web.arg("since").toInt();
-    if (first > end) first = 0;                       // the device rebooted since the page's last fetch
+    if (first > end) first = 0;                       // numbering began again (power cycle) since the page's last fetch
     if (end > LOG_CAP && first < end - LOG_CAP) first = end - LOG_CAP;
 
     size_t total = 0;
-    for (uint32_t n = first; n < end; n++) total += strlen(logLines[n % LOG_CAP]) + 1;
+    for (uint32_t n = first; n < end; n++) total += strlen(logRing.lines[n % LOG_CAP]) + 1;
     web.sendHeader("Cache-Control", "no-store");
     web.sendHeader("X-Log-Seq", String(end));
     web.setContentLength(total);
@@ -57,7 +87,7 @@ static void httpLogs() {
     char chunk[1024];
     size_t used = 0;
     for (uint32_t n = first; n < end; n++) {
-        const char* line = logLines[n % LOG_CAP];
+        const char* line = logRing.lines[n % LOG_CAP];
         const size_t len = strlen(line);
         if (used + len + 1 > sizeof(chunk)) { web.sendContent(chunk, used); used = 0; }
         memcpy(chunk + used, line, len);
@@ -115,7 +145,8 @@ static void sendState() {
     const uint16_t peak = lastPeakAbs16, hold = peakHoldAbs16;
     j.open("live");
     j.u("uptime", uptimeSeconds()).s("restart_reason", restartReason());
-    j.s("ip", WiFi.localIP().toString().c_str()).s("ssid", WiFi.SSID().c_str()).i("rssi", WiFi.RSSI());
+    j.s("ip", WiFi.localIP().toString().c_str()).s("mdns", mdnsHostName());
+    j.s("ssid", WiFi.SSID().c_str()).i("rssi", WiFi.RSSI());
     j.s("bssid", WiFi.BSSIDstr().c_str()).u("channel", WiFi.channel());
     j.u("wifi_drops", wifiDrops);
     if (wifiDrops) {
@@ -125,10 +156,11 @@ static void sendState() {
         j.null("wifi_last_drop").null("wifi_last_drop_s");
     }
     j.b("ps_suspended", wifiPsSuspended);
-    j.u("heap_kb", ESP.getFreeHeap() / 1024).u("heap_min_kb", ESP.getMinFreeHeap() / 1024);
+    j.u("heap_kb", heap_caps_get_free_size(HEAP_CAPS) / 1024);
+    j.u("heap_min_kb", heap_caps_get_minimum_free_size(HEAP_CAPS) / 1024);
     j.u("cpu_mhz", getCpuFrequencyMhz());
     j.f("temp_c", lastTemperatureValid ? lastTemperatureC : NAN, 1);
-    j.f("temp_max_c", maxTemperature > 0.0f ? maxTemperature : NAN, 1);
+    j.f("temp_max_c", maxTemperature, 1);
     j.b("server", rtspServerEnabled).b("streaming", streaming).s("client", currentRtspClient());
     j.u("session_s", streaming ? (millis() - lastRtspPlayMs) / 1000 : 0).s("end_reason", streamEndReason);
     j.u("connects", rtspConnectCount).u("plays", rtspPlayCount).s("listener", currentListener());
@@ -141,7 +173,7 @@ static void sendState() {
     j.u("clips", audioClipCount).f("agc_x", agcMultiplier, 2).b("mic_flat", micFlat);
     j.b("oh_latched", overheatLatched).b("oh_sensor_fault", overheatSensorFault);
     j.s("oh_note", overheatLastReason.c_str());
-    j.u("log_seq", logSeq);
+    j.u("log_seq", logRing.seq);
     j.close();
 
     j.close();
@@ -149,9 +181,11 @@ static void sendState() {
 }
 
 // Prometheus scrape. The buffer is taken from the heap per request (scrapes are seconds apart)
-// rather than held permanently, where it would shorten the frame pool.
+// rather than held permanently, where it would shorten the frame pool. PromOut prints each value
+// through a 40-byte buffer, so with every value at those 39 characters and a 31-character device
+// name the reply below is 4192 bytes; 6144 leaves room for more metrics.
 static void httpMetrics() {
-    const size_t cap = 4096;
+    const size_t cap = 6144;
     char* buf = (char*)malloc(cap);
     if (!buf) {
         web.send(503, "text/plain", "out of memory");
@@ -166,8 +200,8 @@ static void httpMetrics() {
     p.gauge("rtspmic_wifi_rssi_dbm", "Signal strength of the access point.", WiFi.RSSI());
     p.gauge("rtspmic_wifi_channel", "WiFi channel.", WiFi.channel());
     p.counter("rtspmic_wifi_disconnects_total", "WiFi link losses.", wifiDrops);
-    p.gauge("rtspmic_heap_free_bytes", "Free heap.", ESP.getFreeHeap());
-    p.gauge("rtspmic_heap_min_free_bytes", "Lowest free heap since boot.", ESP.getMinFreeHeap());
+    p.gauge("rtspmic_heap_free_bytes", "Free heap.", heap_caps_get_free_size(HEAP_CAPS));
+    p.gauge("rtspmic_heap_min_free_bytes", "Lowest free heap since boot.", heap_caps_get_minimum_free_size(HEAP_CAPS));
     if (lastTemperatureValid) p.gauge("rtspmic_temperature_celsius", "Chip sensor, uncalibrated.", lastTemperatureC, 1);
     p.gauge("rtspmic_thermal_latched", "1 while thermal protection holds the server off.", overheatLatched);
     p.gauge("rtspmic_rtsp_server_enabled", "1 while the RTSP server accepts clients.", rtspServerEnabled);
@@ -203,8 +237,11 @@ static void httpMetrics() {
 // Every request must name the device in Host (HostCheck.h), which defeats DNS rebinding.
 static const char* const UNKNOWN_HOST = "unknown host name: open the device by its IP address or name.local";
 
+// The device answers to its configured name, and to the name mDNS announces, which differs when
+// another device already had the configured one (atomecho-2.local).
 static bool knownHost() {
-    return isDeviceHost(web.hostHeader().c_str(), deviceName);
+    const String host = web.hostHeader();
+    return isDeviceHost(host.c_str(), deviceName) || isDeviceHost(host.c_str(), mdnsHostName());
 }
 
 // Browsers attach Origin to cross-site POSTs. Refusing those keeps other web pages open in the
@@ -242,24 +279,6 @@ static WebServer::THandlerFunction deviceHostOnly(void (*handler)()) {
 // ---------------------------------------------------------------------------------------------
 // Settings
 
-struct Settings {
-    uint32_t rate;
-    uint16_t buffer;
-    float gain;
-    bool hpf;
-    uint16_t hpfHz;
-    bool agc;
-    float tx;
-    bool ps;
-    uint8_t cpu;
-    uint8_t led;
-    bool oh;
-    uint8_t ohLimit;
-    bool sched;
-    uint16_t schedH;
-    char name[33];
-};
-
 static Settings currentSettings() {
     Settings s;
     s.rate = currentSampleRate;
@@ -280,69 +299,6 @@ static Settings currentSettings() {
     return s;
 }
 
-static bool parseBool(const String& v, bool& out) {
-    if (v == "1" || v == "on" || v == "true") { out = true; return true; }
-    if (v == "0" || v == "off" || v == "false") { out = false; return true; }
-    return false;
-}
-
-// A number within [lo, hi]; integral if asked. Rejects empty and trailing text ("12abc").
-static bool parseNum(const String& v, double lo, double hi, bool integral, double& out) {
-    if (v.length() == 0) return false;
-    char* end = nullptr;
-    const double d = strtod(v.c_str(), &end);
-    if (*end != '\0' || !isfinite(d) || d < lo || d > hi) return false;
-    if (integral && d != floor(d)) return false;
-    out = d;
-    return true;
-}
-
-// Parses one key into s. Returns an error message, or nullptr.
-static const char* parseSetting(const String& key, const String& v, Settings& s) {
-    double d;
-    if (key == "rate") {
-        if (!parseNum(v, 16000, 48000, true, d) || !isSupportedSampleRate((uint32_t)d))
-            return "must be 16000, 22050, 24000, 32000, 44100 or 48000";
-        s.rate = (uint32_t)d;
-    } else if (key == "buffer") {
-        if (!parseNum(v, 256, 8192, true, d)) return "must be 256 to 8192 samples";
-        s.buffer = (uint16_t)d;
-    } else if (key == "gain") {
-        if (!parseNum(v, 0.1, 100, false, d)) return "must be 0.1 to 100";
-        s.gain = (float)d;
-    } else if (key == "hpf_hz") {
-        if (!parseNum(v, 10, 10000, true, d)) return "must be 10 to 10000 Hz";
-        s.hpfHz = (uint16_t)d;
-    } else if (key == "tx") {
-        if (!parseNum(v, -1, 19.5, false, d)) return "must be -1 to 19.5 dBm";
-        s.tx = snapWifiTxDbm((float)d);
-    } else if (key == "cpu") {
-        if (!parseNum(v, 80, 240, true, d) || (d != 80 && d != 160 && d != 240)) return "must be 80, 160 or 240";
-        s.cpu = (uint8_t)d;
-    } else if (key == "led") {
-        if (!parseNum(v, 0, 2, true, d)) return "must be 0, 1 or 2";
-        s.led = (uint8_t)d;
-    } else if (key == "oh_limit") {
-        if (!parseNum(v, OVERHEAT_MIN_LIMIT_C, OVERHEAT_MAX_LIMIT_C, true, d)) return "must be 30 to 95";
-        s.ohLimit = (uint8_t)(OVERHEAT_MIN_LIMIT_C +
-                              ((uint32_t)d - OVERHEAT_MIN_LIMIT_C) / OVERHEAT_LIMIT_STEP_C * OVERHEAT_LIMIT_STEP_C);
-    } else if (key == "sched_h") {
-        if (!parseNum(v, 1, 168, true, d)) return "must be 1 to 168 hours";
-        s.schedH = (uint16_t)d;
-    } else if (key == "name") {
-        String n = v;
-        n.toLowerCase();
-        if (!isValidDeviceName(n.c_str())) return "must be 1 to 31 letters, digits or hyphens, with no hyphen at either end";
-        strlcpy(s.name, n.c_str(), sizeof(s.name));
-    } else {
-        bool* flag = key == "hpf" ? &s.hpf : key == "agc" ? &s.agc : key == "ps" ? &s.ps :
-                     key == "oh" ? &s.oh : key == "sched" ? &s.sched : nullptr;
-        if (!flag) return "unknown setting";
-        if (!parseBool(v, *flag)) return "must be 1 or 0";
-    }
-    return nullptr;
-}
-
 static void httpSettings() {
     if (!fromThisPage()) return;
     const Settings was = currentSettings();
@@ -350,7 +306,7 @@ static void httpSettings() {
     String changes;
     for (int i = 0; i < web.args(); i++) {
         const String key = web.argName(i);
-        const char* err = parseSetting(key, web.arg(i), s);
+        const char* err = parseSetting(key.c_str(), web.arg(i).c_str(), s);
         if (err) {
             sendError(400, (key + ": " + err).c_str());
             return;
@@ -359,6 +315,23 @@ static void httpSettings() {
     }
     if (changes.length() == 0) { sendState(); return; }
     simplePrintln("Web UI settings: " + changes);
+
+    // Rate and frame size first: if the audio pipeline does not take them, nothing else changes.
+    if (s.rate != was.rate || s.buffer != was.buffer) {
+        currentSampleRate = s.rate;
+        currentBufferSize = s.buffer;
+        if (!restartI2S()) {
+            // restartI2S put back (and saved) the last values that ran. When none had run yet it
+            // left the requested ones, which were never saved: take back the ones flash holds.
+            if (currentSampleRate == s.rate && currentBufferSize == s.buffer) {
+                currentSampleRate = was.rate;
+                currentBufferSize = was.buffer;
+            }
+            sendError(500, "the audio pipeline did not accept the new sample rate or frame size; "
+                           "the previous values are back (see the log)");
+            return;
+        }
+    }
 
     // Live: the capture task reads these every block.
     currentGainFactor = s.gain;
@@ -387,21 +360,8 @@ static void httpSettings() {
     if (strcmp(s.name, was.name) != 0) setDeviceName(s.name);
     overheatProtectionEnabled = s.oh;
     overheatShutdownC = s.ohLimit;
-    scheduledResetEnabled = s.sched;
-    resetIntervalHours = s.schedH;
-    const bool reconfigure = s.rate != was.rate || s.buffer != was.buffer;
-    currentSampleRate = s.rate;
-    currentBufferSize = s.buffer;
+    setScheduledReset(s.sched, s.schedH);
     saveAudioSettings();
-
-    if (reconfigure) {
-        restartI2S();   // ends the session; on failure it puts the previous rate and size back
-        if (currentSampleRate != s.rate || currentBufferSize != s.buffer) {
-            sendError(500, "the audio pipeline did not accept the new sample rate or frame size; "
-                           "the previous values are back (see the log)");
-            return;
-        }
-    }
     sendState();
 }
 
@@ -413,7 +373,10 @@ static void httpAction() {
     const String name = web.arg("name");
     if (name == "restart_audio") {
         simplePrintln("Web UI: restart audio");
-        restartI2S();
+        if (!restartI2S()) {
+            sendError(500, "the audio pipeline did not restart (see the log)");
+            return;
+        }
     } else if (name == "server_on") {
         if (!setRtspServer(true)) {
             sendError(409, "thermal protection is latched; use Resume streaming");
@@ -443,85 +406,142 @@ static void httpAction() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Firmware update. WebServer calls the upload handler for every chunk of the multipart body, then
-// the request handler to reply. Update writes to the other OTA slot and switches the boot slot
-// only after esp_ota_set_boot_partition() has verified the whole image (checksum and SHA-256),
-// so a truncated or foreign file leaves the running firmware in place. The new firmware then
-// runs on probation until confirmFirmware() in the sketch accepts it.
+// Firmware update. While WebServer reads the request body, inside one loop() pass, it calls
+// httpUpdateUpload: for a multipart body at the start of each file part, for every chunk of it
+// (up to 1436 bytes) and at its end; for any other body ("raw" mode, where web.upload() is
+// invalid) once per chunk. Then it calls httpUpdateDone to reply, unless the connection dropped:
+// then the last call has the status ABORTED.
+// Update writes to the other OTA slot and switches the boot slot only after
+// esp_ota_set_boot_partition() has verified the whole image (checksum and SHA-256), so a
+// truncated or foreign file leaves the running firmware in place. The new firmware then runs on
+// probation until confirmFirmware() in the sketch accepts it.
 
-static String updateError;
-static bool updateStarted = false;
-static bool updateWritten = false;   // Update.end() verified the image and switched the boot slot
+// Where the current request is; back to Idle when it ends (httpUpdateDone or ABORTED).
+enum class UpdateState : uint8_t {
+    Idle,        // no call yet for this request, or no file part in it so far
+    Closed,      // failed the page checks: connection closed unread, nothing logged or answered
+    Receiving,   // the first file part is arriving; Update runs from its first chunk on
+    Failed,      // refused: the rest of the body is read and dropped, then answered with updateError
+    Written,     // Update.end() verified the image and switched the boot slot
+};
+static UpdateState updateState = UpdateState::Idle;
+static int updateErrorCode = 400;      // Failed: HTTP status of the reply
+static const char* updateError = "";   // Failed: the reason (a string literal, ours or Update's)
+
+static const char* const NOT_AN_IMAGE =
+    "not a firmware image; upload firmware.bin (the other .bin files of a release are for flashing over USB)";
+
+static void failUpdate(int code, const char* why) {
+    if (Update.isRunning()) Update.abort();   // frees its buffer; a half-written slot is never made bootable
+    updateState = UpdateState::Failed;
+    updateErrorCode = code;
+    updateError = why;
+}
+
+// Update's reason for its last failure. It sets none when it cannot allocate a buffer, and its
+// errorString() then says "No Error".
+static const char* updateLibError() {
+    return Update.getError() == UPDATE_ERROR_OK ? "not enough free memory for the update" : Update.errorString();
+}
+
+// The first chunk of an application image: the image header's magic byte, and the app
+// descriptor's magic word after the image header and the first segment's header, where ESP-IDF
+// reads it. bootloader.bin has the first and not the second; Update checks only the first.
+static bool isAppImage(const uint8_t* buf, size_t len) {
+    const size_t at = sizeof(esp_image_header_t) + sizeof(esp_image_segment_header_t);   // 32
+    uint32_t magic;
+    if (len < at + sizeof(magic) || buf[0] != ESP_IMAGE_HEADER_MAGIC) return false;
+    memcpy(&magic, buf + at, sizeof(magic));
+    return magic == ESP_APP_DESC_MAGIC_WORD;
+}
 
 static void httpUpdateUpload() {
-    // WebServer also calls this for a POST body that is not multipart (its "raw" mode), when
-    // web.upload() refers to nothing. httpUpdateDone answers such a request "no firmware file".
-    if (!web.header("Content-Type").startsWith("multipart/form-data")) return;
-    HTTPUpload& up = web.upload();
-    if (up.status == UPLOAD_FILE_START) {
-        updateError = "";
-        updateStarted = updateWritten = false;
-        if (Update.isRunning()) Update.abort();   // never left running, but begin() would refuse
-        if (!knownHost() || crossSite()) {
-            updateError = "refused";   // httpUpdateDone sends the 403
-            return;
-        }
-        simplePrintln("Firmware update: receiving " + up.filename);
-        requestStreamStop("firmware update");   // flash writes stall the capture task; end the session cleanly
-        if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
-            updateError = Update.errorString();
-            return;
-        }
-        updateStarted = true;
-    } else if (up.status == UPLOAD_FILE_WRITE) {
-        if (updateStarted) keepLoopAlive();   // the whole upload runs inside one loop() pass
-        if (updateStarted && updateError.length() == 0 && Update.write(up.buf, up.currentSize) != up.currentSize) {
-            updateError = Update.errorString();
-        }
-    } else if (up.status == UPLOAD_FILE_END) {
-        if (updateStarted && updateError.length() == 0) {
-            updateWritten = Update.end(true);
-            if (!updateWritten) updateError = Update.errorString();
-            // The image boots at the next restart, whatever causes it (even the loop watchdog,
-            // if WebServer then hangs on the rest of the request): record where it came from now.
-            if (updateWritten) noteFirmwareUpdateInstalled();
-        }
-    } else if (up.status == UPLOAD_FILE_ABORTED) {
-        // The connection dropped. WebServer does not call httpUpdateDone after this.
-        if (updateWritten) {
-            // WebServer also reports this after the end of the file when the connection then
-            // looks closed (the client left during verification). The image is verified and
-            // already the boot slot: finish as httpUpdateDone would.
-            updateStarted = updateWritten = false;
+    const bool raw = web.hasRaw();
+    if (updateState == UpdateState::Idle && (!knownHost() || crossSite())) {
+        // Another web page, or a name that is not the device's. The headers are in and the body
+        // is unread: closing now keeps a slow or endless body from holding the loop. Nothing is
+        // logged, so such requests cannot fill the log.
+        web.client().stop();
+        updateState = UpdateState::Closed;
+        return;
+    }
+    if (raw ? web.raw().status == RAW_ABORTED : web.upload().status == UPLOAD_FILE_ABORTED) {
+        // The connection dropped (or was closed above). WebServer does not call httpUpdateDone.
+        if (updateState == UpdateState::Written) {
+            // Also reported after the end of the file when the connection then looks closed (the
+            // client left during verification). The image is verified and already the boot
+            // slot: finish as httpUpdateDone would.
             simplePrintln("Firmware update written, but the connection closed before the reply; restarting into it");
             scheduleReboot(RebootKind::Plain, 1000, "firmware update");
+        } else if (updateState == UpdateState::Receiving) {
+            if (Update.isRunning()) Update.abort();
+            simplePrintln("Firmware update interrupted: the upload connection dropped");
+        } else if (updateState == UpdateState::Failed) {
+            simplePrintln(String("Firmware update failed: ") + updateError);
+        }
+        updateState = UpdateState::Idle;
+        return;
+    }
+    if (updateState == UpdateState::Closed) return;   // the end of an empty raw body; httpUpdateDone follows
+    keepLoopAlive();   // read to the end however slowly it arrives, so the reply can say what happened
+    if (raw) {
+        if (updateState == UpdateState::Idle) failUpdate(400, "no firmware file in the request");
+        return;
+    }
+
+    HTTPUpload& up = web.upload();
+    if (up.status == UPLOAD_FILE_START) {
+        if (updateState != UpdateState::Idle) return;   // only the first file part is the firmware
+        // Update does not refuse an upload while the running firmware awaits confirmation, and it
+        // would overwrite the other slot: the only confirmed firmware, the one a rollback needs.
+        if (firmwareOnProbation()) {
+            failUpdate(409, "the running firmware is not confirmed yet; wait until the log says \"Firmware "
+                            "update confirmed\" (about a minute after start, with WiFi), then upload again");
             return;
         }
-        // Mid-file: release the update (and its buffer).
-        if (updateStarted) Update.abort();
-        updateStarted = updateWritten = false;
-        updateError = "";
-        simplePrintln("Firmware update interrupted: the upload connection dropped");
+        updateState = UpdateState::Receiving;
+        simplePrintln("Firmware update: receiving " + up.filename);
+    } else if (updateState != UpdateState::Receiving) {
+        return;   // the rest of a refused part, or a part after the first
+    } else if (up.status == UPLOAD_FILE_WRITE) {
+        if (up.totalSize == 0) {   // the first chunk
+            if (!isAppImage(up.buf, up.currentSize)) {
+                failUpdate(400, NOT_AN_IMAGE);
+                return;
+            }
+            requestStreamStop("firmware update");   // flash writes stall the capture task; end the session cleanly
+            if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
+                failUpdate(400, updateLibError());
+                return;
+            }
+        }
+        if (Update.write(up.buf, up.currentSize) != up.currentSize) failUpdate(400, updateLibError());
+    } else if (up.status == UPLOAD_FILE_END) {
+        if (!Update.end(true)) {
+            failUpdate(400, updateLibError());
+            return;
+        }
+        updateState = UpdateState::Written;
+        // The image boots at the next restart, whatever causes it: record where it came from now.
+        noteFirmwareUpdateInstalled();
     }
 }
 
 static void httpUpdateDone() {
-    String error = updateError;
-    const bool started = updateStarted, written = updateWritten;
-    updateError = "";   // the next request starts clean, whatever this one was
-    updateStarted = updateWritten = false;
-    if (!fromThisPage()) return;
-    if (!started && error.length() == 0) error = "no firmware file in the request";
-    if (started && !written && error.length() == 0) error = "the upload ended early";
-    if (error.length()) {
-        Update.abort();   // frees the buffer; a half-written slot is never made bootable
-        simplePrintln("Firmware update failed: " + error);
-        sendError(400, error.c_str());
+    const UpdateState state = updateState;
+    updateState = UpdateState::Idle;   // the next request starts clean, whatever this one was
+    if (!fromThisPage()) return;       // also a request httpUpdateUpload closed: the reply goes nowhere
+    if (state == UpdateState::Written) {
+        simplePrintln("Firmware update written; restarting into it");
+        sendOk();
+        scheduleReboot(RebootKind::Plain, 1000, "firmware update");
         return;
     }
-    simplePrintln("Firmware update written; restarting into it");
-    sendOk();
-    scheduleReboot(RebootKind::Plain, 1000, "firmware update");
+    // Failed, or Idle: no file part. Receiving cannot get here: WebServer ends a part before it replies.
+    const bool failed = state == UpdateState::Failed;
+    const char* error = failed ? updateError : "no firmware file in the request";
+    simplePrintln(String("Firmware update failed: ") + error);
+    sendError(failed ? updateErrorCode : 400, error);
 }
 
 // ---------------------------------------------------------------------------------------------

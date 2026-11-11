@@ -3,5 +3,6 @@
 void webui_begin();
 void webui_handleClient();
 
-// Append a line to the log the Web UI shows (the last 48 are kept).
+// Append a line to the log the Web UI shows (the last 39 are kept, across restarts until a power
+// cycle).
 void webui_pushLog(const char* line);

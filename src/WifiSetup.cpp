@@ -113,14 +113,33 @@ static bool joinNewNetwork(const char* ssidIn, const char* passwordIn, Idle idle
     wifi_config_t previous;
     if (esp_wifi_get_config(WIFI_IF_STA, &previous) != ESP_OK) return false;
     esp_wifi_set_storage(WIFI_STORAGE_RAM);
-    // Leave the current network first, so its connection cannot pass for the new one.
-    if (WiFi.status() == WL_CONNECTED) {
-        WiFi.disconnect();
-        for (int i = 0; i < 200 && WiFi.status() == WL_CONNECTED; i++) delay(10);
+    // Leave the current network, so its connection cannot pass for the new one, and stop the
+    // station's own connecting: while an attempt runs the driver refuses a new configuration
+    // (ESP_ERR_WIFI_STATE), and the core keeps starting attempts while it reconnects after a lost
+    // link. Auto-reconnect goes off first, otherwise the core's event task (higher priority than
+    // this one) starts the next attempt as soon as the current one ends.
+    WiFi.setAutoReconnect(false);
+    WiFi.disconnect();
+    for (int i = 0; i < 200 && WiFi.status() == WL_CONNECTED; i++) delay(10);
+    // WiFi.STA.begin() and WiFi.STA.connect() are what WiFi.begin(ssid, password) runs, but
+    // connect() also says whether the driver took the configuration and began to connect. An
+    // attempt still winding down can refuse it, and so can the one reconnect the event task makes
+    // after the first failure since boot, whatever auto-reconnect says: disconnect and try again,
+    // for about a second.
+    bool started = false;
+    if (WiFi.status() != WL_CONNECTED) {
+        for (int i = 0; i < 10; i++) {
+            if (WiFi.STA.begin() && WiFi.STA.connect(ssid, password)) {
+                started = true;
+                break;
+            }
+            WiFi.disconnect();
+            delay(100);
+        }
     }
     bool joined = false;
-    if (WiFi.status() != WL_CONNECTED) {
-        WiFi.begin(ssid, password);
+    if (started) {
+        WiFi.setAutoReconnect(true);   // the core retries the new network meanwhile
         for (const uint32_t t0 = millis(); millis() - t0 < 20000;) {
             if (WiFi.status() == WL_CONNECTED && WiFi.SSID() == ssid) {
                 joined = true;
@@ -130,6 +149,8 @@ static bool joinNewNetwork(const char* ssidIn, const char* passwordIn, Idle idle
             idle();
             delay(10);
         }
+    } else {
+        Serial.println("[WiFi] the station did not start joining the new network");
     }
     if (joined) {
         // Store it, with the scan settings wifiJoinStored would otherwise write at the next boot.
@@ -144,12 +165,13 @@ static bool joinNewNetwork(const char* ssidIn, const char* passwordIn, Idle idle
         Serial.println("[WiFi] could not store the new network");
     }
     // Put the previous network back. After some failures the core's event task (higher priority
-    // than this one) reconnects with WiFi.begin(), which writes back the configuration it read:
-    // switch that off, disconnect, and check that the restore holds.
+    // than this one) reconnects, writing back the configuration it read, and the driver refuses
+    // a new configuration while that attempt runs: switch auto-reconnect off, disconnect before
+    // each try, and check that the restore holds.
     WiFi.setAutoReconnect(false);
-    WiFi.disconnect();
     bool restored = false;
-    for (int i = 0; i < 3 && !restored; i++) {
+    for (int i = 0; i < 10 && !restored; i++) {
+        WiFi.disconnect();
         delay(100);
         esp_wifi_set_config(WIFI_IF_STA, &previous);
         wifi_config_t now;
@@ -278,8 +300,9 @@ static const char PAGE_HEAD[] =
 
 [[noreturn]] void wifiRunSetupPortal(const char* apName, const char* hostname, const char* firmwareVersion) {
     // Without stored credentials there is nothing to retry, so the portal waits indefinitely.
-    // With them (the join failed, e.g. the router was down), restart after 3 idle minutes.
-    const uint32_t idleTimeoutMs = wifiHasStoredCredentials() ? 180000 : 0;
+    // With them (the join failed, e.g. the router was down), restart after 3 minutes if nobody
+    // has used the portal, or 10 minutes after its last use.
+    const bool hasStored = wifiHasStoredCredentials();
 
     // Scan before the access point starts: in AP+STA mode a scan hops channels under the phone.
     WiFi.disconnect();
@@ -297,7 +320,15 @@ static const char PAGE_HEAD[] =
     dns.start(53, "*", ip);   // every name resolves to the portal: phones then show the page
     WebServer server(80);
 
+    // Use of the portal: a request for one of its pages, or bytes for Improv over USB. A device
+    // that only joins the open network (phones rejoin remembered open networks by themselves) and
+    // its captive-portal probes are not use.
+    bool used = false;
     uint32_t lastActivity = millis();
+    auto noteUse = [&]() {
+        used = true;
+        lastActivity = millis();
+    };
     uint32_t lastRetry = millis();
     String error;
     char pendSsid[33] = "", pendPass[65] = "";
@@ -335,15 +366,15 @@ static const char PAGE_HEAD[] =
         server.send(200, "text/html; charset=utf-8", h);
     };
 
-    server.on("/", HTTP_GET, [&]() { lastActivity = millis(); page(); });
+    server.on("/", HTTP_GET, [&]() { noteUse(); page(); });
     server.on("/rescan", HTTP_GET, [&]() {
-        lastActivity = millis();
+        noteUse();
         scanNetworks();
         server.sendHeader("Location", home, true);
         server.send(302, "text/plain", "");
     });
     server.on("/save", HTTP_POST, [&]() {
-        lastActivity = millis();
+        noteUse();
         const String ssid = server.arg("ssid");
         const String pass = server.arg("pass");
         if (ssid.length() == 0 || ssid.length() > 32) {
@@ -369,8 +400,9 @@ static const char PAGE_HEAD[] =
         }
         page();
     });
-    server.onNotFound([&]() {   // captive-portal probes (generate_204, hotspot-detect, ...) land here
-        lastActivity = millis();
+    // Captive-portal probes (generate_204, hotspot-detect, ...) land here. A phone sends them by
+    // itself on joining the network and now and then after, so they are not use of the portal.
+    server.onNotFound([&]() {
         server.sendHeader("Location", home, true);
         server.send(302, "text/plain", "");
     });
@@ -380,8 +412,7 @@ static const char PAGE_HEAD[] =
         keepLoopAlive();   // the loop watchdog covers the portal too: its web server can hang
         dns.processNextRequest();
         server.handleClient();
-        if (improvPoll(hostname, firmwareVersion, true)) lastActivity = millis();   // an Improv client, over USB
-        if (WiFi.softAPgetStationNum() > 0) lastActivity = millis();   // someone is on the setup network
+        if (improvPoll(hostname, firmwareVersion, true)) noteUse();   // an Improv client, over USB
 
         // Join outside the request handler so the reply above reaches the phone first.
         if (pendingAt && millis() - pendingAt > 500) {
@@ -399,14 +430,17 @@ static const char PAGE_HEAD[] =
             lastActivity = millis();
         }
 
-        // With a stored network, keep trying it while nobody uses the portal: after a power cut
-        // the router often boots slower than the device, and this joins as soon as it is up
-        // instead of waiting for the idle restart.
-        if (idleTimeoutMs && !pendingAt && WiFi.softAPgetStationNum() == 0 && millis() - lastRetry > 30000) {
+        // With a stored network, try it every 30 s until someone uses the portal: after a power
+        // cut the router often boots slower than the device, and this joins as soon as it is up
+        // instead of waiting for the idle restart. A retry takes the radio off the access point's
+        // channel for seconds, so after the first use there are no more of them.
+        if (hasStored && !used && millis() - lastRetry > 30000) {
             Serial.println("[Setup] retrying the stored network");
             WiFi.begin();   // stored credentials
             const uint32_t t0 = millis();
-            while (WiFi.status() != WL_CONNECTED && millis() - t0 < 10000 && WiFi.softAPgetStationNum() == 0) {
+            // Requests are served meanwhile; one for a page ends the retry, and so do bytes for
+            // Improv (read once the retry is over).
+            while (WiFi.status() != WL_CONNECTED && millis() - t0 < 10000 && !used && Serial.available() == 0) {
                 dns.processNextRequest();
                 server.handleClient();
                 delay(10);
@@ -419,9 +453,11 @@ static const char PAGE_HEAD[] =
             lastRetry = millis();
         }
 
-        if (idleTimeoutMs && millis() - lastActivity > idleTimeoutMs) {
+        // Restart to retry the stored network: 3 minutes after the start if nobody has used the
+        // portal, otherwise 10 minutes after the last use, so someone typing is not cut off.
+        if (hasStored && millis() - lastActivity > (used ? 600000UL : 180000UL)) {
             Serial.println("[Setup] idle, restarting to retry the stored network");
-            restartWithNote("setup portal idle for 3 minutes");
+            restartWithNote(used ? "setup portal idle for 10 minutes" : "setup portal idle for 3 minutes");
         }
         delay(5);
     }

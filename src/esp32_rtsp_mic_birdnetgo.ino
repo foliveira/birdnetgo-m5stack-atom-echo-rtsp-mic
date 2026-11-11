@@ -7,6 +7,7 @@
 #include <errno.h>
 #include <lwip/sockets.h>
 #include <esp_heap_caps.h>
+#include <esp_memory_utils.h>
 #include <esp_netif.h>
 #include <esp_ota_ops.h>
 #include <esp_timer.h>
@@ -23,21 +24,24 @@
 // Sender task  (core 0, one per session): readyQ -> non-blocking send() on the raw socket -> freeQ
 // Arduino loop (core 1, priority 1):      RTSP negotiation, Web UI, diagnostics; owns the WiFiClient
 //
-// Frames are allocated once (TARGET_QUEUE_MS of audio) and travel between cores as pointers in two
-// FreeRTOS queues. The sender is the only task that touches the socket during a session, and it only
-// ever sends whole frames, so the interleaved RTSP framing cannot desynchronise. The loop closes the
-// WiFiClient only after the sender has confirmed exit through senderExitSem.
+// Frames are allocated once (up to TARGET_QUEUE_MS of audio) and travel between cores as pointers
+// in two FreeRTOS queues. The sender is the only task that touches the socket during a session, and
+// it only ever sends whole frames, so the interleaved RTSP framing cannot desynchronise. The loop
+// closes the WiFiClient only after the sender has confirmed exit through senderExitSem.
 // PDM microphone outputs 16-bit samples directly (no bit shift).
 
+// A frame may sit in IRAM, which takes 32-bit loads and stores only (see copyWords): hence the
+// 32-bit len, which also keeps data[] on a word boundary for copyWords.
 struct TxFrame {
-    uint16_t len;      // valid bytes in data[]
-    uint16_t seq;      // RTP sequence (diagnostics)
+    uint32_t len;      // valid bytes in data[]
     uint8_t  data[];   // '$' interleave header (4) + RTP header (12) + big-endian L16 PCM
 };
+static_assert(offsetof(TxFrame, data) % 4 == 0, "copyWords copies frame data by 32-bit words");
 #define FRAME_HDR_BYTES   16
 #define I2S_DMA_BUF_COUNT 8
 #define I2S_DMA_BUF_LEN   512    // frames per DMA buffer; one buffer is lost per queue overflow
-#define TARGET_QUEUE_MS   3000   // software buffer in front of the socket; one lwIP retransmission timeout is >= 1.5 s
+#define I2S_READ_TIMEOUT_MS 1000 // longest wait for one DMA buffer in i2s_channel_read()
+#define TARGET_QUEUE_MS   3000   // software buffer in front of the socket; lwIP resends a lost segment after 0.4-0.6 s, then 1.2 s later
 #define MIN_QUEUE_FRAMES  4
 #define MAX_QUEUE_FRAMES  384    // 3 s of 256-sample frames at 32 kHz is 375
 #define MAX_POOL_BYTES    (196 * 1024) // cap on the frame pool regardless of rate/buffer choice; holds 3 s at 32 kHz
@@ -50,7 +54,10 @@ struct TxFrame {
 
 static TxFrame*  framePool[MAX_QUEUE_FRAMES];
 static uint16_t  framePoolCount = 0;
+static uint16_t  framePoolIram = 0;      // how many of them are in IRAM
 static uint32_t  frameSlotBytes = 0;
+static uint8_t*  frameStage = NULL;      // the capture task builds a frame for IRAM here
+static uint8_t*  sendBounce = NULL;      // the sender copies a frame out of IRAM here
 volatile uint16_t pipelineSamples = 0;   // samples per packet the pool is sized for; changes only while capture is parked
 uint32_t appliedSampleRate = 0;          // what the I2S driver actually runs (for reverting a failed reconfiguration)
 static uint16_t appliedBufferSize = 0;
@@ -79,16 +86,16 @@ volatile uint32_t i2sReadErrors = 0;
 volatile uint16_t queueHighWater = 0;
 volatile uint32_t sendStallMaxMs = 0;
 volatile uint32_t sendStallCount = 0;
+static volatile UBaseType_t senderStackFree = 0; // sender's stack high-water mark, measured by the sender
 volatile uint32_t lastCaptureOkMs = 0;         // last complete I2S read (capture watchdog)
 volatile uint32_t lastMicSignalMs = 0;         // last block whose raw samples were not all identical
 bool micFlat = false;                          // no signal from the microphone for MIC_FLAT_MS
 #define MIC_FLAT_MS 10000
 
-portMUX_TYPE logMux = portMUX_INITIALIZER_UNLOCKED;  // guards the fixed-size log ring (WebUI.cpp)
 portMUX_TYPE hpfMux = portMUX_INITIALIZER_UNLOCKED;  // guards HPF coefficient hand-off
 
 // ================== SETTINGS (ESP32 RTSP Mic for BirdNET-Go) ==================
-#define FW_VERSION "4.0.0"
+#define FW_VERSION "4.1.0"
 // Expose FW version as a global C string for WebUI/API
 const char* FW_VERSION_STR = FW_VERSION;
 
@@ -138,6 +145,9 @@ uint32_t rtpSSRC = 0x43215678;
 unsigned long lastRTSPActivity = 0;
 
 // -- Buffers
+// RTSP receive buffer. Before PLAY, loop() assembles requests in it (processRTSP, length
+// rtspParseBufferPos). From PLAY until the sender has confirmed its exit, the sender task owns its
+// contents: it starts with the bytes that followed PLAY, and the sender keeps its own length.
 uint8_t rtspParseBuffer[1024];
 int rtspParseBufferPos = 0;
 
@@ -153,7 +163,6 @@ uint16_t currentBufferSize = DEFAULT_BUFFER_SIZE;
 // -- Audio metering / clipping diagnostics
 volatile uint16_t lastPeakAbs16 = 0;       // last block peak absolute value (0..32767)
 volatile uint32_t audioClipCount = 0;      // total blocks where clipping occurred
-volatile bool audioClippedLastBlock = false; // clipping occurred in last processed block
 volatile uint16_t peakHoldAbs16 = 0;       // peak hold (recent window)
 unsigned long peakHoldSinceMs = 0;         // when the held peak was set (cleared after 3 s)
 
@@ -184,7 +193,7 @@ unsigned long rebootRequestedAt = 0;
 uint32_t rebootDelayMs = 0;
 const char* rebootNote = "";               // reported as the restart reason after the reboot
 unsigned long lastI2SReset = 0;
-float maxTemperature = 0.0f;
+float maxTemperature = NAN;              // highest valid reading since boot, NAN before the first
 float lastTemperatureC = 0.0f;
 bool lastTemperatureValid = false;
 bool overheatProtectionEnabled = DEFAULT_OVERHEAT_PROTECTION;
@@ -196,6 +205,7 @@ bool overheatLatched = false;          // set by a trip, kept across reboots unt
 // -- Scheduled reset
 bool scheduledResetEnabled = false;
 uint32_t resetIntervalHours = 24; // Default 24 hours
+static uint32_t resetIntervalFrom = 0;   // uptime (s) the interval counts from; 0 = boot
 
 uint8_t cpuFrequencyMhz = DEFAULT_CPU_MHZ;
 
@@ -220,20 +230,8 @@ uint32_t rtspPlayCount = 0;
 
 // ===============================================
 
-// Transmit power steps the radio supports. wifi_power_t values are in 0.25 dBm units.
-static const wifi_power_t WIFI_TX_STEPS[] = {
-    WIFI_POWER_MINUS_1dBm, WIFI_POWER_2dBm, WIFI_POWER_5dBm, WIFI_POWER_7dBm, WIFI_POWER_8_5dBm,
-    WIFI_POWER_11dBm, WIFI_POWER_13dBm, WIFI_POWER_15dBm, WIFI_POWER_17dBm, WIFI_POWER_18_5dBm,
-    WIFI_POWER_19dBm, WIFI_POWER_19_5dBm};
-
-// Nearest supported transmit power step, in dBm.
-float snapWifiTxDbm(float dbm) {
-    float best = (int)WIFI_TX_STEPS[0] * 0.25f;
-    for (const int s : WIFI_TX_STEPS) {
-        if (fabsf(s * 0.25f - dbm) < fabsf(best - dbm)) best = s * 0.25f;
-    }
-    return best;
-}
+static_assert(WIFI_POWER_MINUS_1dBm == -4 && WIFI_POWER_8_5dBm == 34 && WIFI_POWER_19_5dBm == 78,
+              "applyWifiTxPower converts dBm to wifi_power_t, which counts quarter dBm");
 
 // Apply the configured transmit power unless the driver already uses it (it falls back to its
 // default whenever the station interface restarts). Logs only if log is set and it changed.
@@ -276,22 +274,6 @@ uint32_t uptimeSeconds() {
     return (uint32_t)(esp_timer_get_time() / 1000000);
 }
 
-bool isSupportedSampleRate(uint32_t hz) {
-    return hz == 16000 || hz == 22050 || hz == 24000 || hz == 32000 || hz == 44100 || hz == 48000;
-}
-
-// A DNS label: 1-31 lowercase letters, digits and hyphens, no hyphen at either end. 31 is what
-// the core's hostname buffer (32 bytes) keeps.
-bool isValidDeviceName(const char* name) {
-    const size_t n = strlen(name);
-    if (n < 1 || n > 31 || name[0] == '-' || name[n - 1] == '-') return false;
-    for (size_t i = 0; i < n; i++) {
-        const char c = name[i];
-        if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-')) return false;
-    }
-    return true;
-}
-
 // Rename the device. mDNS answers to the new name at once; the DHCP client sends it from its next
 // request (lease renewal or reconnect).
 void setDeviceName(const char* name) {
@@ -300,6 +282,15 @@ void setDeviceName(const char* name) {
     if (esp_netif_t* sta = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF")) esp_netif_set_hostname(sta, deviceName);
     mdns_hostname_set(deviceName);
     simplePrintln(String("Device name: ") + deviceName + " (mDNS " + deviceName + ".local now, DHCP from its next request)");
+}
+
+// The name mDNS answers to: deviceName, unless another device on the network already had it, in
+// which case the mDNS component picked a free one (atomecho -> atomecho-2). "" while mDNS is not
+// running. One static buffer: loop task only.
+const char* mdnsHostName() {
+    static char name[MDNS_NAME_BUF_LEN];
+    if (mdns_hostname_get(name) != ESP_OK) name[0] = '\0';
+    return name;
 }
 
 // Uptime -> "Xd Yh Zm Ts"
@@ -377,7 +368,7 @@ void checkTemperature() {
         overheatSensorFault = false;
         simplePrintln("Temperature sensor restored. Thermal protection active again.");
     }
-    if (temp > maxTemperature) {
+    if (isnan(maxTemperature) || temp > maxTemperature) {
         maxTemperature = temp;
     }
 
@@ -492,10 +483,21 @@ static void checkWiFi() {
 void checkScheduledReset() {
     if (!scheduledResetEnabled) return;
 
-    if (uptimeSeconds() / 3600 >= resetIntervalHours) {
+    if (uptimeSeconds() - resetIntervalFrom >= resetIntervalHours * 3600) {
         simplePrintln("SCHEDULED RESET: " + String(resetIntervalHours) + " hours reached");
         restartWithNote("scheduled reboot");
     }
+}
+
+// Change the reboot schedule (Web UI). The interval counts from boot, or from this change when the
+// device has already been up for the new interval, so that saving it does not restart the device
+// at once. Saving the same values changes nothing.
+void setScheduledReset(bool enabled, uint32_t hours) {
+    if (enabled == scheduledResetEnabled && hours == resetIntervalHours) return;
+    scheduledResetEnabled = enabled;
+    resetIntervalHours = hours;
+    const uint32_t up = uptimeSeconds();
+    resetIntervalFrom = up >= hours * 3600 ? up : 0;
 }
 
 // Load settings from flash
@@ -532,7 +534,7 @@ void loadAudioSettings() {
     // Sanity clamps (corrupted flash, or a value older versions accepted, must not produce an
     // unusable pipeline). 8 kHz was allowed before but clocks the microphone below its range.
     if (!isSupportedSampleRate(currentSampleRate)) currentSampleRate = DEFAULT_SAMPLE_RATE;
-    if (currentBufferSize < 256 || currentBufferSize > 8192) currentBufferSize = DEFAULT_BUFFER_SIZE;
+    if (currentBufferSize < MIN_BUFFER_SIZE || currentBufferSize > MAX_BUFFER_SIZE) currentBufferSize = DEFAULT_BUFFER_SIZE;
     if (!(currentGainFactor >= 0.1f && currentGainFactor <= 100.0f)) currentGainFactor = DEFAULT_GAIN_FACTOR;
     if (resetIntervalHours < 1 || resetIntervalHours > 168) resetIntervalHours = 24;
     if (highpassCutoffHz < 10 || highpassCutoffHz > 10000) highpassCutoffHz = DEFAULT_HPF_CUTOFF_HZ;
@@ -641,10 +643,6 @@ static String logTimestamp() {
     return String(buf);
 }
 
-void simplePrint(String message) {
-    Serial.print(logTimestamp() + message);
-}
-
 void simplePrintln(String message) {
     String stamped = logTimestamp() + message;
     Serial.println(stamped);
@@ -653,6 +651,16 @@ void simplePrintln(String message) {
 
 // ================== AUDIO PIPELINE: FRAME POOL ==================
 
+// IRAM takes 32-bit loads and stores only; a byte or 16-bit access raises LoadStoreError, and
+// memcpy, lwIP and the DSP make them. Frames in IRAM are filled and emptied with this loop
+// (volatile stops the compiler from turning it into a memcpy call). Copies whole words: buffers
+// are sized in words (allocFramePool).
+static void copyWords(void* dst, const void* src, size_t bytes) {
+    volatile uint32_t* d = (volatile uint32_t*)dst;
+    const volatile uint32_t* s = (const volatile uint32_t*)src;
+    for (size_t i = 0; i < (bytes + 3) / 4; i++) d[i] = s[i];
+}
+
 static void freeFramePool() {
     if (freeQ)  { vQueueDelete(freeQ);  freeQ = NULL; }
     if (readyQ) { vQueueDelete(readyQ); readyQ = NULL; }
@@ -660,14 +668,20 @@ static void freeFramePool() {
         free(framePool[i]);
         framePool[i] = NULL;
     }
+    free(frameStage);
+    free(sendBounce);
+    frameStage = NULL;
+    sendBounce = NULL;
     framePoolCount = 0;
+    framePoolIram = 0;
     frameSlotBytes = 0;
 }
 
 // Allocate frames for TARGET_QUEUE_MS of audio at the current rate/buffer size, one heap block
 // per frame. The heap is split over several memory regions, so its largest block is much smaller
-// than the total free and a single allocation would cap the queue far below what fits. Stops
-// early to leave HEAP_HEADROOM_BYTES free.
+// than the total free and a single allocation would cap the queue far below what fits. Frames go
+// first into the IRAM that code leaves free (about 48 KB, which nothing else allocates from), then
+// into byte-addressable RAM until HEAP_HEADROOM_BYTES are left.
 // Only call while the capture task is parked (or not yet started) and no sender is running.
 static bool allocFramePool() {
     freeFramePool();
@@ -676,17 +690,37 @@ static bool allocFramePool() {
     const uint32_t perFrame = (uint32_t)currentBufferSize * 1000UL;   // frames = ms * rate / perFrame
     uint32_t want = (TARGET_QUEUE_MS * currentSampleRate + perFrame - 1) / perFrame;
     if (want > MAX_QUEUE_FRAMES) want = MAX_QUEUE_FRAMES;
-    frameSlotBytes = sizeof(TxFrame) + FRAME_HDR_BYTES + (uint32_t)currentBufferSize * 2;
+    const uint32_t frameBytes = (FRAME_HDR_BYTES + (uint32_t)currentBufferSize * 2 + 3) & ~3u;   // whole words
+    frameSlotBytes = sizeof(TxFrame) + frameBytes;
     if (want > MAX_POOL_BYTES / frameSlotBytes) want = MAX_POOL_BYTES / frameSlotBytes;
 
     const uint32_t caps = MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL;
     const size_t heapBefore = heap_caps_get_free_size(caps);
     uint16_t n = 0;
+    frameStage = (uint8_t*)heap_caps_malloc(frameBytes, caps);
+    sendBounce = (uint8_t*)heap_caps_malloc(frameBytes, caps);
+    while (frameStage && sendBounce && n < want) {
+        TxFrame* f = (TxFrame*)heap_caps_malloc(frameSlotBytes, MALLOC_CAP_EXEC);
+        // Once IRAM is full, MALLOC_CAP_EXEC hands out byte-addressable RAM through its IRAM alias
+        // (D/IRAM, RTC fast memory), which HEAP_HEADROOM_BYTES must keep. esp_ptr_in_iram() takes
+        // in the first 40 KB of the D/IRAM alias, hence the second test.
+        if (f && (!esp_ptr_in_iram(f) || esp_ptr_in_diram_iram(f))) { free(f); f = NULL; }
+        if (!f) break;
+        f->len = 0;
+        framePool[n++] = f;
+    }
+    if (n <= 2) {   // IRAM frames that do not outnumber the two buffers they need gain nothing
+        while (n) { free(framePool[--n]); framePool[n] = NULL; }
+        free(frameStage);
+        free(sendBounce);
+        frameStage = NULL;
+        sendBounce = NULL;
+    }
+    framePoolIram = n;
     while (n < want && heap_caps_get_free_size(caps) >= HEAP_HEADROOM_BYTES + frameSlotBytes) {
         TxFrame* f = (TxFrame*)heap_caps_malloc(frameSlotBytes, caps);
         if (!f) break;
         f->len = 0;
-        f->seq = 0;
         framePool[n++] = f;
     }
     framePoolCount = n;
@@ -703,8 +737,8 @@ static bool allocFramePool() {
     appliedBufferSize = currentBufferSize;
     const uint32_t poolMs = (uint32_t)((uint64_t)n * perFrame / currentSampleRate);
     simplePrintln("Frame pool: " + String(n) + " x " + String(frameSlotBytes) + " B (" + String(poolMs) +
-                  " ms of audio), free heap " + String(heapBefore / 1024) + " -> " +
-                  String(heap_caps_get_free_size(caps) / 1024) + " KB");
+                  " ms of audio), " + String(framePoolIram) + " in IRAM, free heap " +
+                  String(heapBefore / 1024) + " -> " + String(heap_caps_get_free_size(caps) / 1024) + " KB");
     if (poolMs < TARGET_QUEUE_MS) {
         // n == want: a size cap set want below the target; n < want: free heap ran out first.
         simplePrintln("NOTE: frame pool below the " + String(TARGET_QUEUE_MS) + " ms target (" +
@@ -746,7 +780,8 @@ static bool IRAM_ATTR onI2sRxOverflow(i2s_chan_handle_t, i2s_event_data_t*, void
     return false;
 }
 
-void setup_i2s_driver() {
+// Returns true once the channel runs at currentSampleRate.
+bool setup_i2s_driver() {
     if (i2sRx) {
         i2s_channel_disable(i2sRx);
         i2s_del_channel(i2sRx);
@@ -755,8 +790,8 @@ void setup_i2s_driver() {
 
     // Hardware ring: 8 buffers x 512 frames. The driver queues up to 7 finished buffers for the
     // capture task, so 7 x 512 = 3584 samples (112 ms at 32 kHz, 224 ms at 16 kHz) can wait
-    // before samples are lost. A read that stops inside a buffer gives up the rest of that buffer
-    // one buffer earlier (the driver skips it rather than read it while the DMA overwrites it).
+    // before samples are lost. The capture task reads whole buffers only: once 6 of them wait, the
+    // driver moves on and drops the unread rest of a partly read buffer without reporting it.
     i2s_chan_config_t chanCfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
     chanCfg.dma_desc_num = I2S_DMA_BUF_COUNT;
     chanCfg.dma_frame_num = I2S_DMA_BUF_LEN;
@@ -781,17 +816,19 @@ void setup_i2s_driver() {
     if (err == ESP_OK) err = i2s_channel_register_event_callback(i2sRx, &callbacks, NULL);
     if (err == ESP_OK) err = i2s_channel_enable(i2sRx);
     if (err != ESP_OK) {
-        // appliedSampleRate keeps the last rate that ran; the capture watchdog retries the setup.
+        // appliedSampleRate keeps the last rate that ran. With no channel the capture task reads
+        // nothing, so the capture watchdog in loop() retries the setup.
         simplePrintln("ERROR: I2S setup failed: " + String((int)err));
         if (i2sRx) i2s_del_channel(i2sRx);
         i2sRx = NULL;
-        return;
+        return false;
     }
     appliedSampleRate = currentSampleRate;
 
     simplePrintln("I2S ready (PDM mode): " + String(currentSampleRate) + " Hz, " +
                   String(currentBufferSize) + " samples/packet, DMA slack " +
                   String((I2S_DMA_BUF_COUNT - 1) * I2S_DMA_BUF_LEN * 1000UL / currentSampleRate) + " ms");
+    return true;
 }
 
 // ================== CAPTURE TASK (core 1) ==================
@@ -829,6 +866,10 @@ volatile bool buttonHeld = false;   // held long enough to show that a WiFi rese
 static StreamBufferHandle_t volatile listenFeed = NULL;
 static volatile uint32_t captureBlocks = 0;
 
+// Set by the capture task while it cannot allocate its sample buffer; loop() logs it (the capture
+// task does not print).
+static volatile bool captureBufFailing = false;
+
 // Faults (thermal latch, no WiFi) show even with the LED set to off: then it is the only sign.
 static uint32_t ledColorFor(bool streaming, bool clipped, float pct) {
     if (buttonHeld)      return LED_SETUP;                            // cyan: release now or the WiFi setup opens
@@ -847,6 +888,7 @@ static uint32_t ledColorFor(bool streaming, bool clipped, float pct) {
 static void captureTask(void* arg) {
     int16_t* captureBuf = NULL;
     uint16_t capSamples = 0;
+    uint32_t carried = 0;                  // samples in captureBuf read past the last packet
 
     DcBlocker dc;                          // removes the PDM decoder's DC offset (state lives here)
     uint32_t dcRate = 0;                   // sample rate dc was designed for
@@ -863,7 +905,7 @@ static void captureTask(void* arg) {
     for (;;) {
         // --- pause protocol: the loop task reinstalls I2S / reallocates the pool while we are parked ---
         if (capturePauseRequested) {
-            if (captureBuf) { free(captureBuf); captureBuf = NULL; capSamples = 0; }
+            if (captureBuf) { free(captureBuf); captureBuf = NULL; capSamples = 0; carried = 0; }
             if (listenBlock) { free(listenBlock); listenBlock = NULL; }   // block size may change
             capturePaused = true;
             __asm__ __volatile__("memw" ::: "memory");
@@ -883,13 +925,16 @@ static void captureTask(void* arg) {
         if (!captureBuf || capSamples != pipelineSamples) {
             if (captureBuf) free(captureBuf);
             capSamples = pipelineSamples;
-            captureBuf = (int16_t*)malloc((size_t)capSamples * sizeof(int16_t));
+            carried = 0;
+            // One DMA buffer more than a packet: reads take whole buffers (see below).
+            captureBuf = (int16_t*)malloc(((size_t)capSamples + I2S_DMA_BUF_LEN) * sizeof(int16_t));
             if (!captureBuf) {
-                Serial.println("[Capture] FATAL: no memory for capture buffer");
+                captureBufFailing = true;
                 capSamples = 0;
                 vTaskDelay(pdMS_TO_TICKS(1000));
                 continue;
             }
+            captureBufFailing = false;
         }
         const uint32_t rate = appliedSampleRate;   // changes only while this task is parked
         const i2s_chan_handle_t rx = i2sRx;        // likewise
@@ -900,24 +945,36 @@ static void captureTask(void* arg) {
             dcRate = rate;
         }
 
-        // --- one packet worth of samples (blocks in the driver until the DMA has them) ---
-        size_t bytesRead = 0;
-        const size_t want = (size_t)capSamples * sizeof(int16_t);
-        esp_err_t r = i2s_channel_read(rx, captureBuf, want, &bytesRead, 1000);
-        const uint32_t lostBufs = takeLostI2sBufs();
-        if (isStreaming && lostBufs) {
-            // Audio the DMA discarded still happened: keep the RTP clock honest.
-            rtpTimestamp += lostBufs * I2S_DMA_BUF_LEN;
+        // --- one packet worth of samples (blocks in the driver until the DMA has them). Each read
+        //     takes the fewest whole DMA buffers that complete the packet, appended to the samples
+        //     carried over, so the driver never holds a partly read buffer (setup_i2s_driver) ---
+        size_t bytesRead = 0, want = 0;
+        esp_err_t r = ESP_OK;
+        if (carried < capSamples) {   // else the carried samples make a whole packet
+            const uint32_t bufs = (capSamples - carried + I2S_DMA_BUF_LEN - 1) / I2S_DMA_BUF_LEN;
+            want = (size_t)bufs * I2S_DMA_BUF_LEN * sizeof(int16_t);
+            r = i2s_channel_read(rx, captureBuf + carried, want, &bytesRead, I2S_READ_TIMEOUT_MS);
+            const uint32_t lostBufs = takeLostI2sBufs();
+            if (isStreaming && lostBufs) {
+                // Audio the DMA discarded still happened: keep the RTP clock honest. Counted only
+                // with a read: the driver drops the oldest waiting buffer, which comes after the
+                // carried samples, so the gap belongs to the packet that reads past it.
+                rtpTimestamp += lostBufs * I2S_DMA_BUF_LEN;
+            }
         }
         if (r != ESP_OK || bytesRead != want) {
             i2sReadErrors = i2sReadErrors + 1;
-            if (isStreaming) {                  // account for the packet we did not get
-                rtpTimestamp += (uint32_t)((want - bytesRead) / sizeof(int16_t));
+            if (isStreaming) {                  // the packet is lost: count the samples thrown away
+                uint32_t gap = carried + (uint32_t)(bytesRead / sizeof(int16_t));
+                if (r == ESP_ERR_TIMEOUT) gap += rate * I2S_READ_TIMEOUT_MS / 1000;   // and the wait without data
+                rtpTimestamp += gap;
                 rtpSequence++;
             }
-            if (r != ESP_OK) vTaskDelay(pdMS_TO_TICKS(20));
+            carried = 0;
+            if (r != ESP_OK && r != ESP_ERR_TIMEOUT) vTaskDelay(pdMS_TO_TICKS(20));   // a timeout has waited already
             continue;
         }
+        carried += (uint32_t)(bytesRead / sizeof(int16_t));
         lastCaptureOkMs = millis();
 
         // --- HPF coefficient hand-off (published by the loop under hpfMux) ---
@@ -959,11 +1016,18 @@ static void captureTask(void* arg) {
         if (!feed && listenBlock) { free(listenBlock); listenBlock = NULL; }
 
         // --- DSP (AudioDsp.h), written big-endian straight into the frame (or, with no RTSP
-        //     session, into the listening block) ---
-        uint8_t* pcm = frame ? frame->data + FRAME_HDR_BYTES : (feed ? listenBlock : NULL);
+        //     session, into the listening block). A frame in IRAM is built in frameStage and
+        //     copied in by words once complete ---
+        uint8_t* out = frame ? (esp_ptr_in_iram(frame) ? frameStage : frame->data) : NULL;
+        uint8_t* pcm = out ? out + FRAME_HDR_BYTES : (feed ? listenBlock : NULL);
         const BlockStats st = processBlock(captureBuf, capSamples, dc, hpfOn ? &localHpf : NULL,
                                            appliedGain, targetGain, pcm);
         appliedGain = targetGain;
+
+        // Samples read past this packet start the next one (none when capSamples is a multiple of
+        // I2S_DMA_BUF_LEN). Nothing below reads captureBuf.
+        carried -= capSamples;
+        if (carried) memmove(captureBuf, captureBuf + capSamples, carried * sizeof(int16_t));
 
         // --- live listening: the same audio, little-endian (WAV), whole blocks only so the
         //     listener never gets half a sample; a block that does not fit is skipped ---
@@ -989,7 +1053,7 @@ static void captureTask(void* arg) {
         // --- RTP framing + enqueue ---
         if (streaming) {
             if (frame) {
-                uint8_t* d = frame->data;
+                uint8_t* d = out;
                 const uint16_t payload = (uint16_t)(capSamples * 2);
                 const uint16_t pkt = (uint16_t)(12 + payload);
                 d[0] = 0x24; d[1] = rtpChannel;                             // '$', interleaved channel
@@ -1000,8 +1064,8 @@ static void captureTask(void* arg) {
                 d[10] = (uint8_t)(rtpTimestamp >> 8);  d[11] = (uint8_t)(rtpTimestamp);
                 d[12] = (uint8_t)(rtpSSRC >> 24); d[13] = (uint8_t)(rtpSSRC >> 16);
                 d[14] = (uint8_t)(rtpSSRC >> 8);  d[15] = (uint8_t)(rtpSSRC);
+                if (out != frame->data) copyWords(frame->data, out, FRAME_HDR_BYTES + payload);
                 frame->len = FRAME_HDR_BYTES + payload;
-                frame->seq = rtpSequence;
                 if (xQueueSend(readyQ, &frame, 0) != pdTRUE) {
                     xQueueSend(freeQ, &frame, 0);
                     framesDroppedQueueFull = framesDroppedQueueFull + 1;
@@ -1018,7 +1082,6 @@ static void captureTask(void* arg) {
         // --- metering for the Web UI ---
         const float peakAbs = st.peak > 32767.0f ? 32767.0f : st.peak;
         lastPeakAbs16 = (uint16_t)peakAbs;
-        audioClippedLastBlock = st.clipped;
         if (st.clipped) audioClipCount = audioClipCount + 1;
         const unsigned long now = millis();
         if (!st.flat) lastMicSignalMs = now;
@@ -1084,16 +1147,19 @@ static void startCaptureTask() {
 
 // Write a short RTSP response at a frame boundary. Same no-progress budget as RTP frames
 // (SEND_STALL_LIMIT_MS) so a congested link does not end the session sooner than a frame would;
-// gives up early if the loop asks the sender to stop.
-static bool senderRespond(int fd, const char* resp, int len) {
+// gives up early if the loop asks the sender to stop. On failure *reason says why.
+static bool senderRespond(int fd, const char* resp, int len, const char** reason) {
     int off = 0;
     unsigned long lastProgress = millis();
     while (off < len) {
-        if (stopStreamRequested) return false;
+        if (stopStreamRequested) { *reason = "stop requested"; return false; }
         int w = send(fd, resp + off, len - off, MSG_DONTWAIT);
         if (w > 0) { off += w; lastProgress = millis(); continue; }
-        if (w < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != ENOMEM) return false;
-        if (millis() - lastProgress > SEND_STALL_LIMIT_MS) return false;
+        if (w < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != ENOMEM) {
+            *reason = "socket write error";
+            return false;
+        }
+        if (millis() - lastProgress > SEND_STALL_LIMIT_MS) { *reason = "client stalled"; return false; }
         fd_set ws; FD_ZERO(&ws); FD_SET(fd, &ws);
         struct timeval tv = { 0, 50000 };
         select(fd + 1, NULL, &ws, NULL, &tv);
@@ -1101,20 +1167,10 @@ static bool senderRespond(int fd, const char* resp, int len) {
     return true;
 }
 
-// Drain and answer whatever the client sent. Returns false when the session must end.
+// Answer what is already in rx (at first, the bytes that came after PLAY), then drain the socket
+// and answer whatever the client sent. Returns false when the session must end.
 static bool senderServiceRtsp(int fd, char* rx, int& rxlen, const int rxcap, int& skipBytes, const char** reason) {
     for (;;) {
-        int room = rxcap - 1 - rxlen;
-        if (room <= 0) { rxlen = 0; room = rxcap - 1; }   // unparseable junk: reset
-        int n = recv(fd, rx + rxlen, room, MSG_DONTWAIT);
-        if (n == 0) { *reason = "client closed connection"; return false; }
-        if (n < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) return true;
-            *reason = "socket read error";
-            return false;
-        }
-        rxlen += n;
-
         while (rxlen > 0) {
             if (skipBytes > 0) {                       // tail of an oversized interleaved packet
                 int k = (skipBytes < rxlen) ? skipBytes : rxlen;
@@ -1134,11 +1190,17 @@ static bool senderServiceRtsp(int fd, char* rx, int& rxlen, const int rxcap, int
             rx[rxlen] = '\0';
             char* end = strstr(rx, "\r\n\r\n");
             if (!end) break;                           // wait for the rest of the header
-            int consumed = (int)(end - rx) + 4;
+            const size_t headLen = (size_t)(end - rx);
+            int consumed = (int)headLen + 4;
             *end = '\0';
-            int bodyLen = 0;
-            const char* cl = strstr(rx, "Content-Length:");
-            if (cl) bodyLen = atoi(cl + 15);
+            // Header values as rtspRequestLength() reads them during negotiation (RtspRequest.h).
+            char hv[12];
+            long bodyLen = 0;
+            if (rtspHeaderValue(rx, headLen, "Content-Length", hv, sizeof(hv))) {
+                char* e = nullptr;
+                bodyLen = strtol(hv, &e, 10);
+                if (e == hv || *e != '\0') bodyLen = -1;   // not a number
+            }
             if (bodyLen < 0 || bodyLen > 4096) { *reason = "malformed RTSP request"; return false; }
             if (rxlen < consumed + bodyLen) {          // body not complete yet
                 if (consumed + bodyLen > rxcap - 1) { skipBytes = consumed + bodyLen - rxlen; rxlen = 0; break; }
@@ -1148,8 +1210,7 @@ static bool senderServiceRtsp(int fd, char* rx, int& rxlen, const int rxcap, int
             consumed += bodyLen;
 
             int cseq = 1;
-            const char* cs = strstr(rx, "CSeq:");
-            if (cs) cseq = atoi(cs + 5);
+            if (rtspHeaderValue(rx, headLen, "CSeq", hv, sizeof(hv))) cseq = atoi(hv);
             char resp[224];
             int rl;
             bool endSession = false;
@@ -1165,22 +1226,35 @@ static bool senderServiceRtsp(int fd, char* rx, int& rxlen, const int rxcap, int
             } else {
                 rl = snprintf(resp, sizeof(resp), "RTSP/1.0 501 Not Implemented\r\nCSeq: %d\r\n\r\n", cseq);
             }
-            if (!senderRespond(fd, resp, rl)) { *reason = stopStreamRequested ? "stop requested" : "client stalled"; return false; }
+            if (!senderRespond(fd, resp, rl, reason)) return false;
             lastRTSPActivity = millis();
             if (endSession) { *reason = "TEARDOWN"; return false; }
 
             memmove(rx, rx + consumed, rxlen - consumed);
             rxlen -= consumed;
         }
+
+        int room = rxcap - 1 - rxlen;
+        if (room <= 0) { rxlen = 0; room = rxcap - 1; }   // unparseable junk: reset
+        int n = recv(fd, rx + rxlen, room, MSG_DONTWAIT);
+        if (n == 0) { *reason = "client closed connection"; return false; }
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return true;
+            *reason = "socket read error";
+            return false;
+        }
+        rxlen += n;
     }
 }
 
+// arg: the number of bytes startStreamSession() put in rtspParseBuffer (those that followed PLAY).
 static void senderTask(void* arg) {
     const int fd = streamFd;
     TxFrame* cur = NULL;
+    const uint8_t* src = NULL;   // cur's bytes: its data, or sendBounce for a frame in IRAM
     size_t off = 0;
-    char rx[512];
-    int rxlen = 0, skipBytes = 0;
+    char* const rx = (char*)rtspParseBuffer;   // this task's until it exits
+    int rxlen = (int)(intptr_t)arg, skipBytes = 0;
     unsigned long lastProgress = millis();
     unsigned long lastRtspPoll = 0;
     unsigned long stallStart = 0;
@@ -1190,19 +1264,26 @@ static void senderTask(void* arg) {
     Serial.printf("[Sender] session started on core %d, fd %d\n", xPortGetCoreID(), fd);
 
     while (!stopStreamRequested) {
-        const unsigned long now = millis();
-
         if (!cur) {
+            const unsigned long now = millis();
             // Frame boundary: the only safe point to interleave RTSP responses.
             if (now - lastRtspPoll >= 200) {
                 lastRtspPoll = now;
-                if (!senderServiceRtsp(fd, rx, rxlen, sizeof(rx), skipBytes, &reason)) break;
+                senderStackFree = uxTaskGetStackHighWaterMark(NULL);
+                if (!senderServiceRtsp(fd, rx, rxlen, sizeof(rtspParseBuffer), skipBytes, &reason)) break;
             }
             if (xQueueReceive(readyQ, &cur, pdMS_TO_TICKS(100)) != pdTRUE) continue;
+            lastProgress = millis();   // a frame's stall clock starts here: the poll and the wait are no stall
             off = 0;
+            src = cur->data;
+            if (esp_ptr_in_iram(cur)) {   // lwIP copies it with byte loads
+                copyWords(sendBounce, cur->data, cur->len);
+                src = sendBounce;
+            }
         }
 
-        int w = send(fd, cur->data + off, cur->len - off, MSG_DONTWAIT);
+        const unsigned long now = millis();   // after the RTSP poll and the queue wait, which can take seconds
+        int w = send(fd, src + off, cur->len - off, MSG_DONTWAIT);
         if (w > 0) {
             off += (size_t)w;
             lastProgress = now;
@@ -1232,13 +1313,20 @@ static void senderTask(void* arg) {
         select(fd + 1, NULL, &ws, NULL, &tv);
     }
 
+    // A stall still open at exit (a client that stalled out, or a stop while stalled) counts too;
+    // set before isStreaming drops so the session summary in loop() reads it.
+    if (stallStart) {
+        const uint32_t d = (uint32_t)(millis() - stallStart);
+        if (d > sendStallMaxMs) sendStallMaxMs = d;
+    }
+
     // --- cleanup: leave the socket alone (the loop closes it), recycle frames, confirm exit ---
     streamEndReason = reason;
     isStreaming = false;
     __asm__ __volatile__("memw" ::: "memory");
     if (cur) xQueueSend(freeQ, &cur, 0);
     flushReadyQueue();
-    Serial.printf("[Sender] session ended: %s (sent %u)\n", reason, sent);
+    Serial.printf("[Sender] session ended: %s (sent %lu)\n", reason, (unsigned long)sent);
     xSemaphoreGive(senderExitSem);
     vTaskDelete(NULL);
 }
@@ -1272,6 +1360,16 @@ StreamTotals streamTotals() {
 // Loop task: hand the negotiated client to a new sender task. Called right after the PLAY reply.
 static bool startStreamSession(WiFiClient& client) {
     if (senderTaskHandle || !readyQ) return false;
+    // The sender reads the raw socket, so everything the client sent after PLAY goes to it in
+    // rtspParseBuffer: what processRTSP() left there, then all the WiFiClient holds (available()
+    // counts its own buffer and the socket's).
+    int staged = rtspParseBufferPos;
+    for (int avail = client.available(); avail > 0; avail = client.available()) {
+        if (avail > (int)sizeof(rtspParseBuffer) - 1 - staged) return false;   // does not fit
+        const int n = client.read(rtspParseBuffer + staged, avail);
+        if (n <= 0) break;
+        staged += n;
+    }
     flushReadyQueue();
     strlcpy(streamSessionId, rtspSessionId.c_str(), sizeof(streamSessionId));
     pastSessions = streamTotals();
@@ -1282,6 +1380,7 @@ static bool startStreamSession(WiFiClient& client) {
     queueHighWater = 0;
     sendStallMaxMs = 0;
     sendStallCount = 0;
+    senderStackFree = 0;
     lastRtspPlayMs = millis();
     rtspPlayCount++;
     streamEndReason = "";
@@ -1297,7 +1396,8 @@ static bool startStreamSession(WiFiClient& client) {
     __asm__ __volatile__("memw" ::: "memory");
     isStreaming = true;
 
-    BaseType_t ok = xTaskCreatePinnedToCore(senderTask, "RtpSender", 6144, NULL, 8, &senderTaskHandle, 0);
+    BaseType_t ok = xTaskCreatePinnedToCore(senderTask, "RtpSender", 6144, (void*)(intptr_t)staged, 8,
+                                            &senderTaskHandle, 0);
     if (ok != pdPASS) {
         senderTaskHandle = NULL;
         isStreaming = false;
@@ -1341,6 +1441,7 @@ bool requestStreamStop(const char* reason) {
 #define LISTEN_BUFFER_MS 250             // audio buffered for the listener
 #define LISTEN_HEAP_MARGIN (32 * 1024)   // free heap that must remain once listening has started
 #define LISTEN_TASK_STACK 4096
+#define LISTEN_TASK_NAME "Listen"        // also how restartI2S finds a listener task not yet freed
 #define LISTEN_STALL_LIMIT_MS 5000       // listener accepted no data for this long -> drop it
 
 static struct {
@@ -1478,7 +1579,7 @@ int startListening(WiFiClient client, const char** why) {
     listener.endReason = "";
     listener.startedMs = millis();
     listener.ip = listener.client.remoteIP().toString();
-    if (xTaskCreatePinnedToCore(listenTask, "Listen", LISTEN_TASK_STACK, NULL, 5, &listener.task, 0) != pdPASS) {
+    if (xTaskCreatePinnedToCore(listenTask, LISTEN_TASK_NAME, LISTEN_TASK_STACK, NULL, 5, &listener.task, 0) != pdPASS) {
         listener.task = NULL;
         listener.client = WiFiClient();   // WebServer still holds the connection and answers with the error
         listener.buf = NULL;
@@ -1496,8 +1597,6 @@ const char* currentListener() {
     return listener.task ? listener.ip.c_str() : "";
 }
 
-// Reconfigure the audio front end (sample rate / buffer size). Ends any active session; the
-// client reconnects and gets the new parameters through DESCRIBE.
 // Put the last working rate/buffer back into the settings (and flash) after a failed change.
 static void revertAudioConfig(uint32_t rate, uint16_t buf, const char* why) {
     if (rate != 0 && buf != 0 && (currentSampleRate != rate || currentBufferSize != buf)) {
@@ -1509,7 +1608,25 @@ static void revertAudioConfig(uint32_t rate, uint16_t buf, const char* why) {
                   String(currentSampleRate) + " Hz / " + String(currentBufferSize) + " samples");
 }
 
-void restartI2S() {
+// Loop task, with capture parked, after stopListening(): wait up to a second for the listener to
+// end and for serviceListener() to release its connection and buffer, so that memory is free when
+// the frame pool is sized. A task that deletes itself is freed later by an idle task, and until
+// then xTaskGetHandle() still finds it.
+static void awaitListenerGone() {
+    for (int i = 0; i < 100; i++) {
+        serviceListener();
+        if (!listener.task && !listener.buf && xTaskGetHandle(LISTEN_TASK_NAME) == NULL) return;
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
+// Reconfigure the audio front end (sample rate / buffer size). Ends any active session; the
+// client reconnects and gets the new parameters through DESCRIBE. Returns true when the driver
+// runs and the frame pool holds frames for currentSampleRate / currentBufferSize; false when it
+// gave up before touching the driver (sender or capture task busy) or had to put the previous
+// values back. Without working previous values (none ran since boot) a failure leaves the
+// settings as they are.
+bool restartI2S() {
     const uint32_t prevRate = appliedSampleRate;   // last configuration that actually ran
     const uint16_t prevBuf = appliedBufferSize;
     simplePrintln("Reconfiguring audio: " + String(currentSampleRate) + " Hz, " +
@@ -1517,22 +1634,38 @@ void restartI2S() {
     stopListening("audio reconfiguration");   // its WAV header has the old rate
     if (!requestStreamStop("audio reconfiguration")) {
         revertAudioConfig(prevRate, prevBuf, "sender task busy");   // pool/queues must not change under a live sender
-        return;
+        return false;
+    }
+    if (rtspClient) {
+        // Still negotiating: the SDP it got from DESCRIBE may name the old rate. It reconnects
+        // and asks again.
+        simplePrintln("Closing RTSP client " + rtspClientIp + " that was still negotiating");
+        rtspClient.stop();
+        rtspParseBufferPos = 0;
     }
     if (!pauseCapture()) {
         revertAudioConfig(prevRate, prevBuf, "capture task busy");
-        return;
+        return false;
     }
-    setup_i2s_driver();
-    if (!allocFramePool()) {
-        // New parameters do not fit in memory: go back to the ones that worked so streaming stays possible.
-        revertAudioConfig(prevRate, prevBuf, "frame pool allocation failed");
-        setup_i2s_driver();
-        if (!allocFramePool()) simplePrintln("Frame pool still unavailable: PLAY will be refused until reboot");
+    awaitListenerGone();
+
+    const char* failed = NULL;
+    if (!setup_i2s_driver()) failed = "I2S setup failed";
+    else if (!allocFramePool()) failed = "frame pool allocation failed";
+    bool ok = failed == NULL;
+    if (failed && prevRate != 0 && prevBuf != 0) {
+        // Go back to the values that worked so streaming stays possible. When they are the ones
+        // just tried (a restart without changes), this is a second attempt.
+        const bool unchanged = currentSampleRate == prevRate && currentBufferSize == prevBuf;
+        revertAudioConfig(prevRate, prevBuf, failed);
+        ok = setup_i2s_driver() && allocFramePool() && unchanged;
     }
     updateHighpassCoeffs();
     resumeCapture();
-    simplePrintln("Audio pipeline restarted");
+    if (!i2sRx) simplePrintln("Audio input not running: the capture watchdog retries the I2S setup every 30 s");
+    else if (!readyQ) simplePrintln("Frame pool unavailable: PLAY will be refused until the audio restarts with enough memory");
+    else simplePrintln("Audio pipeline restarted");
+    return ok;
 }
 
 // ================== RTSP NEGOTIATION (loop task, only while not streaming) ==================
@@ -1663,6 +1796,10 @@ void processRTSP(WiFiClient &client) {
         buf[headerLen] = '\0';
         const String request(buf);
         buf[headerLen] = saved;
+        // Out of the buffer before it is handled: after PLAY the buffer holds just what followed
+        // it, which startStreamSession() hands to the sender.
+        memmove(buf, buf + used, rtspParseBufferPos - used);
+        rtspParseBufferPos -= used;
 
         handleRTSPCommand(client, request);
 
@@ -1670,8 +1807,6 @@ void processRTSP(WiFiClient &client) {
             rtspParseBufferPos = 0;
             return;
         }
-        memmove(buf, buf + used, rtspParseBufferPos - used);
-        rtspParseBufferPos -= used;
     }
 }
 
@@ -1701,9 +1836,10 @@ static void checkButton() {
 
 // ================== LOOP WATCHDOG ==================
 // loop() serves the Web UI and RTSP negotiation and runs every recovery check, so a pass that never
-// ends leaves the device unreachable until a power cycle. The core's WebServer can cause one: it
-// reads a multipart request body that lacks the parts it expects forever, even after the client
-// has gone. An esp_timer callback (core 0) restarts the device once a pass has taken
+// ends leaves the device unreachable until a power cycle. The core's WebServer gives up on a client
+// that has gone or stalls, but it reads a request body that keeps arriving to its end inside one
+// pass, before the request's handler runs; a multipart field value, for instance, may have any
+// number of lines. An esp_timer callback (core 0) restarts the device once a pass has taken
 // LOOP_STUCK_MS. The setup portal's loop is watched the same way. Long work inside a single pass
 // (a firmware upload, a WiFi join) calls keepLoopAlive().
 #define LOOP_STUCK_MS 60000
@@ -1735,15 +1871,20 @@ extern "C" bool verifyRollbackLater() {
     return true;
 }
 
+// True while the running firmware is an update not yet accepted: a restart now rolls it back.
+bool firmwareOnProbation() {
+    esp_ota_img_states_t state;
+    return esp_ota_get_state_partition(esp_ota_get_running_partition(), &state) == ESP_OK &&
+           state == ESP_OTA_IMG_PENDING_VERIFY;
+}
+
 // Accept the running firmware once it has kept WiFi for a minute (a no-op unless it was just
 // installed by an update).
 static void confirmFirmware() {
     static bool done = false;
     if (done || !wifiLinkUp || uptimeSeconds() < 60) return;
     done = true;
-    esp_ota_img_states_t state;
-    if (esp_ota_get_state_partition(esp_ota_get_running_partition(), &state) == ESP_OK &&
-        state == ESP_OTA_IMG_PENDING_VERIFY) {
+    if (firmwareOnProbation()) {
         esp_ota_mark_app_valid_cancel_rollback();
         simplePrintln("Firmware update confirmed: ran for a minute with WiFi");
     }
@@ -1779,7 +1920,7 @@ static void checkUpdateRollback() {
 
 void setup() {
     // TX ring buffer so serial prints return immediately instead of blocking on the 128-byte FIFO
-    // (must precede Serial.begin, which M5.begin performs).
+    // (must precede Serial.begin).
     Serial.setTxBufferSize(1024);
     Serial.begin(115200);
 
@@ -1806,7 +1947,8 @@ void setup() {
 
     senderExitSem = xSemaphoreCreateBinary();
 
-    randomSeed((uint32_t)micros() ^ (uint32_t)(ESP.getEfuseMac() & 0xFFFFFFFF));
+    // random() draws from the hardware generator (esp_random) as long as randomSeed() is never
+    // called; a seed would switch it to libc rand() for good.
     rtpSSRC = (uint32_t)random(1, 0x7FFFFFFF);
 
     // Load settings from flash
@@ -1848,8 +1990,11 @@ void setup() {
     }
     simplePrintln("CPU frequency set to " + String(getCpuFrequencyMhz()) + " MHz");
 
-    // Audio front end: I2S driver, frame pool, HPF coefficients, then the always-on capture task
-    setup_i2s_driver();
+    // Audio front end: I2S driver, frame pool, HPF coefficients, then the always-on capture task.
+    // Without I2S the rest starts anyway (Web UI, RTSP) and the capture watchdog in loop() retries.
+    if (!setup_i2s_driver()) {
+        simplePrintln("Continuing without audio input: the capture watchdog retries the I2S setup every 30 s");
+    }
     if (!allocFramePool()) {
         simplePrintln("Continuing without a frame pool: streaming disabled");
     }
@@ -1880,7 +2025,7 @@ void setup() {
         simplePrintln("RTSP server paused due to thermal latch. Clear via Web UI before resuming streaming.");
     }
     simplePrintln("Web UI: http://" + WiFi.localIP().toString() + "/");
-    Serial.printf("Free heap after init: %u KB\n", ESP.getFreeHeap() / 1024);
+    Serial.printf("Free heap after init: %u KB\n", heap_caps_get_free_size(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL) / 1024);
     startLoopWatchdog();
 }
 
@@ -1896,7 +2041,9 @@ void loop() {
 
     // Heap monitoring (every 10 minutes — useful for detecting leaks in long deployments)
     if (millis() - lastMemoryCheck > 600000) { // 10 min
-        Serial.printf("[Heap] Current: %u KB, Min: %u KB\n", ESP.getFreeHeap() / 1024, ESP.getMinFreeHeap() / 1024);
+        const uint32_t caps = MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL;   // not IRAM, which ESP.getFreeHeap() counts
+        Serial.printf("[Heap] Current: %u KB, Min: %u KB\n", heap_caps_get_free_size(caps) / 1024,
+                      heap_caps_get_minimum_free_size(caps) / 1024);
         lastMemoryCheck = millis();
     }
 
@@ -1911,12 +2058,15 @@ void loop() {
     static unsigned long lastStatsLog = 0;
     if (isStreaming && millis() - lastStatsLog >= 30000) {
         lastStatsLog = millis();
-        Serial.printf("[Stream] sent=%u dropped=%u i2s_ovf=%u q=%u/%u peak=%u stall_max=%ums clip=%u "
+        // The sender measures its own stack: it can exit at any moment, and its handle then points
+        // at freed memory until finishStreamSession() clears it.
+        Serial.printf("[Stream] sent=%lu dropped=%lu i2s_ovf=%lu q=%u/%u peak=%u stall_max=%lums clip=%lu "
                       "agc=%.2f stack_free capture=%u sender=%u\n",
-                      audioPacketsSent, framesDroppedQueueFull, i2sOverruns, streamQueueDepth(),
-                      framePoolCount, queueHighWater, sendStallMaxMs, audioClipCount, agcMultiplier,
+                      (unsigned long)audioPacketsSent, (unsigned long)framesDroppedQueueFull,
+                      (unsigned long)i2sOverruns, streamQueueDepth(), framePoolCount, queueHighWater,
+                      (unsigned long)sendStallMaxMs, (unsigned long)audioClipCount, agcMultiplier,
                       captureTaskHandle ? (unsigned)uxTaskGetStackHighWaterMark(captureTaskHandle) : 0,
-                      senderTaskHandle ? (unsigned)uxTaskGetStackHighWaterMark(senderTaskHandle) : 0);
+                      (unsigned)senderStackFree);
     }
 
     checkScheduledReset();
@@ -1932,12 +2082,26 @@ void loop() {
 
     // Capture watchdog. A read gives up after 1 s, so CAPTURE_STALL_MS without one complete block
     // means the driver stopped delivering; reinstalling it ends any session (the client reconnects).
-    if (captureTaskHandle && !capturePauseRequested && appliedSampleRate != 0 &&
+    // With no I2S channel (its setup failed, at boot or since) the capture task reads nothing, so
+    // this also retries the setup.
+    if (captureTaskHandle && !capturePauseRequested &&
         nowMs - captureOkAt > CAPTURE_STALL_MS && nowMs - lastI2SReset > 30000) {
         lastI2SReset = nowMs;
-        simplePrintln("Capture stalled: no I2S data for " + String((nowMs - captureOkAt) / 1000) +
-                      " s (read errors " + String(i2sReadErrors) + "); restarting audio");
+        if (i2sRx) {
+            simplePrintln("Capture stalled: no I2S data for " + String((nowMs - captureOkAt) / 1000) +
+                          " s (read errors " + String(i2sReadErrors) + "); restarting audio");
+        } else {
+            simplePrintln("Audio input not running; retrying the I2S setup");
+        }
         restartI2S();
+    }
+
+    // The capture task cannot print; it raises this flag while it cannot allocate its buffer.
+    static bool captureBufFailLogged = false;
+    const bool captureBufFailNow = captureBufFailing;
+    if (captureBufFailNow != captureBufFailLogged) {
+        captureBufFailLogged = captureBufFailNow;
+        if (captureBufFailNow) simplePrintln("ERROR: the capture task has no memory for its sample buffer; retrying every second");
     }
 
     // Microphone check. A stuck PDM data line decodes to one constant value; a working microphone

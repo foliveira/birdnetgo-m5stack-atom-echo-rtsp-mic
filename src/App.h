@@ -6,6 +6,8 @@
 
 #include <WiFiClient.h>
 
+#include "SettingsParse.h"
+
 extern const char* FW_VERSION_STR;
 
 // --- Settings (stored in NVS by saveAudioSettings) ---
@@ -24,15 +26,6 @@ extern float overheatShutdownC;
 extern bool scheduledResetEnabled;
 extern uint32_t resetIntervalHours;
 extern char deviceName[33];              // DHCP and mDNS name
-
-#define OVERHEAT_MIN_LIMIT_C 30
-#define OVERHEAT_MAX_LIMIT_C 95
-#define OVERHEAT_LIMIT_STEP_C 5
-
-// Sample rates the PDM microphone runs at: its clock is 64 x the rate and must stay within
-// the SPM1423's 1.0-3.25 MHz.
-bool isSupportedSampleRate(uint32_t hz);
-bool isValidDeviceName(const char* name);
 
 // --- Live state (read by the Web UI on the loop task) ---
 extern uint32_t appliedSampleRate;       // what the I2S driver runs
@@ -60,7 +53,7 @@ extern uint32_t wifiLastDropAt;          // uptime (s) of the latest loss
 extern bool micFlat;                     // the microphone delivers constant samples
 extern float lastTemperatureC;
 extern bool lastTemperatureValid;
-extern float maxTemperature;
+extern float maxTemperature;             // NAN until the first valid reading
 extern bool overheatSensorFault;
 extern bool overheatLatched;
 extern String overheatLastReason;
@@ -72,6 +65,7 @@ struct StreamTotals {
 StreamTotals streamTotals();
 
 const char* currentRtspClient();
+const char* mdnsHostName();   // the name mDNS answers to; "" while mDNS is not running. Loop task only
 uint16_t streamQueueDepth();
 uint16_t streamQueueFrames();
 uint32_t uptimeSeconds();
@@ -79,18 +73,19 @@ uint32_t uptimeSeconds();
 // --- Actions (loop task only) ---
 void simplePrintln(String message);
 void saveAudioSettings();
-void restartI2S();
+bool restartI2S();   // false: aborted, or not running with the requested rate/size (see the log)
 void updateHighpassCoeffs();
 void applyWifiPowerSave(bool log);
 void applyWifiTxPower(bool log);
-float snapWifiTxDbm(float dbm);
 void setDeviceName(const char* name);
 bool setRtspServer(bool on);   // false: refused because the thermal latch is set
 void clearThermalLatch();
+void setScheduledReset(bool enabled, uint32_t hours);   // sets scheduledResetEnabled and resetIntervalHours
 enum class RebootKind { Plain, RestoreDefaults, ForgetWifi };
 void scheduleReboot(RebootKind kind, uint32_t delayMs, const char* why);   // why: a string literal
 bool requestStreamStop(const char* reason);
 void noteFirmwareUpdateInstalled();   // once an update is written: it boots at the next restart
+bool firmwareOnProbation();   // the running firmware is an update not yet accepted; a restart rolls it back
 void keepLoopAlive();   // long work inside one loop() pass: the loop watchdog restarts after 60 s
 // Live listening (GET /api/listen): 0 once a listener task owns the connection, else an HTTP
 // status with the reason in *why.

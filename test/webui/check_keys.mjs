@@ -1,12 +1,14 @@
-// Checks that web/index.html, src/WebUI.cpp and mock_server.mjs agree on the API's names: every
-// state key the page reads is one the firmware sends, every settings field is a key the firmware
-// accepts, and the mock sends exactly what the firmware sends. Run: node test/webui/check_keys.mjs
+// Checks that web/index.html, the firmware (src/WebUI.cpp for the state, src/SettingsParse.h for
+// the settings) and mock_server.mjs agree on the API's names: every state key the page reads is one
+// the firmware sends, every settings field is a key the firmware accepts, and the mock sends
+// exactly what the firmware sends. Run: node test/webui/check_keys.mjs
 import { readFileSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 
 const root = new URL('../../', import.meta.url);
 const read = (p) => readFileSync(new URL(p, root), 'utf8');
 const cpp = read('src/WebUI.cpp');
+const settingsParse = read('src/SettingsParse.h');
 const html = read('web/index.html');
 let failures = 0;
 const fail = (msg) => { failures++; console.log('FAIL: ' + msg); };
@@ -21,7 +23,8 @@ const section = (name) => {
 const keysIn = (src) => new Set([...src.matchAll(/\.(?:u|i|b|s|f|null)\("([a-z_]+)"/g)].map((m) => m[1]));
 const fwCfg = keysIn(section('cfg'));
 const fwLive = keysIn(section('live'));
-const fwSettable = new Set([...cpp.matchAll(/key == "([a-z_]+)"/g)].map((m) => m[1]));
+// Keys parseSetting() accepts: its comparisons are written is("key").
+const fwSettable = new Set([...settingsParse.matchAll(/\bis\("([a-z_]+)"\)/g)].map((m) => m[1]));
 
 // Page: fields of the settings forms, and the state keys its script reads.
 const formFields = new Set([...html.matchAll(/<(?:input|select)[^>]*\bname="([a-z_]+)"/g)].map((m) => m[1]));

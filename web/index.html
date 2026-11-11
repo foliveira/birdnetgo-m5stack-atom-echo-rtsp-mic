@@ -177,7 +177,7 @@ pre{margin:10px 0 0;max-height:50vh;overflow:auto;white-space:pre-wrap;word-brea
   </div>
   <div class="meter" id="fwBar" hidden><div id="fwProgress"></div></div>
   <div class="msg" id="fwMsg"></div>
-  <small>Install a <b>firmware.bin</b> from the <a href="https://github.com/foliveira/birdnetgo-m5stack-atom-echo-rtsp-mic/releases" target="_blank" rel="noopener">releases page</a>. The device checks the whole image before switching to it, and if the new version restarts before it has kept WiFi for a minute, the device goes back to the current one.</small>
+  <small>Install a <b>firmware.bin</b> from the <a href="https://github.com/foliveira/birdnetgo-m5stack-atom-echo-rtsp-mic/releases" target="_blank" rel="noopener">releases page</a>. The device checks the whole image before switching to it, and if the new version restarts before it has kept WiFi for a minute, the device goes back to the current one. After an update the device accepts the next one only once it has confirmed the new version, about a minute after it starts.</small>
 </section>
 
 <section class="card">
@@ -193,7 +193,7 @@ pre{margin:10px 0 0;max-height:50vh;overflow:auto;white-space:pre-wrap;word-brea
 'use strict';
 const $ = (id) => document.getElementById(id);
 const forms = [...document.querySelectorAll('form[data-settings]')];
-let st = null, logSeq = 0, timer = 0, clipsSeen = null, clipUntil = 0, uploading = false;
+let st = null, timer = 0, clipsSeen = null, clipUntil = 0, uploading = false;
 
 for (let c = 30; c <= 95; c += 5) document.querySelector('[name=oh_limit]').add(new Option(c, c));
 
@@ -218,6 +218,13 @@ async function api(path, body) {
   return r;
 }
 
+// The page's host name as the device compares it, and whether host names the device by the
+// configured or mDNS name in state s, alone or followed by a domain (never an IPv4 address).
+const pageHost = () => location.hostname.toLowerCase().replace(/\.$/, '');
+function namesDevice(host, s) {
+  return !/^[\d.]+$/.test(host) && [s.cfg.name, s.live.mdns].some((n) => n && (host === n || host.startsWith(n + '.')));
+}
+
 function setField(el, v) {
   if (el.type === 'checkbox') { el.checked = !!v; return; }
   const val = String(v);
@@ -231,7 +238,7 @@ function frameLabels() {
   for (const o of form.buffer.options) o.textContent = o.value + ' samples (' + Math.round(o.value / rate * 1000) + ' ms)';
 }
 
-function render(s) {
+function render(s, polled) {
   st = s;
   const L = s.live, C = s.cfg;
   $('fw').textContent = 'v' + s.fw;
@@ -282,19 +289,24 @@ function render(s) {
   set('wifi', L.ssid + ', ' + L.rssi + ' dBm (' + q[0] + ')', q[1]);
   set('ap', L.bssid + ', channel ' + L.channel);
   set('drops', L.wifi_drops ? num(L.wifi_drops) + ' since boot, last ' + dur(L.wifi_last_drop_s) + ' ago (' + L.wifi_last_drop + ')' : 'none since boot');
-  set('ip', L.ip + ', ' + C.name + '.local');
+  set('ip', L.mdns ? L.ip + ', ' + L.mdns + '.local' : L.ip);
   set('psState', C.ps ? (L.ps_suspended ? 'suspended until reboot (frames dropped)' : 'on') : 'off', L.ps_suspended ? 'warn' : '');
   set('heap', L.heap_kb + ' KB free (lowest ' + L.heap_min_kb + ' KB)', L.heap_min_kb < 40 ? 'warn' : '');
   set('cpu', L.cpu_mhz + ' MHz');
-  set('temp', L.temp_c == null ? 'sensor unavailable' : L.temp_c.toFixed(1) + ' °C (peak ' + L.temp_max_c.toFixed(1) + ' °C)');
+  const peak = L.temp_max_c == null ? '' : ' (peak ' + L.temp_max_c.toFixed(1) + ' °C)';
+  set('temp', (L.temp_c == null ? 'sensor unavailable' : L.temp_c.toFixed(1) + ' °C') + peak);
   set('thermal', L.oh_sensor_fault ? 'paused: no sensor reading' : C.oh ? 'on, limit ' + C.oh_limit + ' °C' : 'off', L.oh_latched ? 'bad' : L.oh_sensor_fault ? 'warn' : '');
 
   const sb = $('serverBtn');
   sb.dataset.action = L.server ? 'server_off' : 'server_on';
   sb.textContent = L.server ? 'Stop RTSP server' : 'Start RTSP server';
 
+  // A poll leaves the text or number field being typed in alone, even while its text equals the
+  // saved value ("3.0" on the way to "3.05"). Undo and the reply to a save write every clean field.
+  const typing = polled && document.activeElement;
   for (const form of forms) {
     for (const el of form.elements) {
+      if (el === typing && (el.type === 'text' || el.type === 'number')) continue;
       if (el.name && el.name in C && !el.classList.contains('dirty')) setField(el, C[el.name]);
     }
   }
@@ -302,6 +314,7 @@ function render(s) {
 }
 
 function dirtyFields(form) { return [...form.elements].filter((el) => el.classList.contains('dirty')); }
+const fieldValue = (el) => (el.type === 'checkbox' ? (el.checked ? '1' : '0') : el.value);   // as posted
 function updateButtons(form) {
   const n = dirtyFields(form).length;
   for (const b of form.querySelectorAll('button')) b.disabled = n === 0;
@@ -330,22 +343,28 @@ for (const form of forms) {
     e.preventDefault();
     const msg = form.querySelector('.msg');
     const body = {};
-    for (const el of dirtyFields(form)) body[el.name] = el.type === 'checkbox' ? (el.checked ? '1' : '0') : el.value;
+    for (const el of dirtyFields(form)) body[el.name] = fieldValue(el);
     if (('rate' in body || 'buffer' in body) && !confirm('This restarts the audio pipeline; the RTSP client reconnects. Continue?')) return;
     for (const b of form.querySelectorAll('button')) b.disabled = true;
     msg.textContent = 'Saving…'; msg.className = 'msg muted';
-    const oldName = st && st.cfg.name;
+    const was = st;
     try {
       const s = await (await api('/api/settings', body)).json();
-      // The device answers only to its current name, so a page opened by the old one moves on:
-      // to the new .local name if it used .local (mDNS knows it at once), else to the address.
-      const host = location.hostname.toLowerCase().replace(/\.$/, '');
-      if (oldName && s.cfg.name !== oldName && !/^[\d.]+$/.test(host) && (host === oldName || host.startsWith(oldName + '.'))) {
-        const to = host === oldName + '.local' ? s.cfg.name + '.local' : s.live.ip;
+      // The device answers only to its current names, so a page opened by an old one moves on:
+      // from name.local to the name mDNS now answers to (or the address while mDNS has none),
+      // from any other form of the name to the address.
+      const host = pageHost();
+      if (was && s.cfg.name !== was.cfg.name && namesDevice(host, was)) {
+        const local = host === was.cfg.name + '.local' || host === was.live.mdns + '.local';
+        const to = local && s.live.mdns ? s.live.mdns + '.local' : s.live.ip;
         location.href = 'http://' + to + (location.port ? ':' + location.port : '') + '/';
         return;
       }
-      for (const el of dirtyFields(form)) el.classList.remove('dirty');
+      // A field edited while the request was out keeps its text: only a field still holding what
+      // was sent is clean now. Dirty fields that were not sent stay dirty.
+      for (const el of form.elements) {
+        if (el.name in body) el.classList.toggle('dirty', fieldValue(el) !== body[el.name]);
+      }
       render(s);
       msg.textContent = 'Saved.'; msg.className = 'msg ok';
     } catch (err) {
@@ -372,7 +391,7 @@ document.addEventListener('click', async (e) => {
   b.disabled = true;
   try {
     await api('/api/action', { name });
-    if (name === 'reboot' || name === 'defaults') { waitForReboot(); return; }
+    if (name === 'reboot' || name === 'defaults') { waitForReboot(name === 'defaults'); return; }
     if (name === 'forget_wifi') { showOverlay('The device is restarting into its WiFi setup portal. Join the ESP32-RTSP-Mic-AP network to choose a new network.'); return; }
     msg.textContent = ''; poll();
   } catch (err) {
@@ -386,9 +405,18 @@ function showOverlay(text) {
   $('overlay').style.display = 'flex';
 }
 
-function waitForReboot() {
+// Reloads the page once the device answers OK at the page's own origin. Restoring the defaults
+// also resets the device name, which a page opened by name may then no longer reach: while its own
+// origin gives no OK, such a page probes the device's IP address (an opaque no-cors reply is
+// enough to know the device is up) and continues there.
+function waitForReboot(defaults) {
   showOverlay('Restarting… this page reloads when the device is back.');
-  const tick = () => fetch('/api/state', { cache: 'no-store' }).then((r) => r.ok ? location.reload() : setTimeout(tick, 2000)).catch(() => setTimeout(tick, 2000));
+  const byIp = defaults && st && namesDevice(pageHost(), st) ? 'http://' + st.live.ip + (location.port ? ':' + location.port : '') : '';
+  const retry = () => setTimeout(tick, 2000);
+  const probe = () => fetch(byIp + '/api/state', { mode: 'no-cors', cache: 'no-store', signal: AbortSignal.timeout(4000) })
+    .then(() => { location.href = byIp + '/'; }, retry);
+  const tick = () => fetch('/api/state', { cache: 'no-store' }).then((r) => r.ok, () => false)
+    .then((ok) => (ok ? location.reload() : byIp ? probe() : retry()));
   setTimeout(tick, 5000);
 }
 
@@ -464,6 +492,7 @@ function startListen() {
   ctx.createMediaElementSource(audio).connect(an);
   an.connect(ctx.destination);
   const canvas = $('spectrum');
+  $('spec').hidden = false;   // before measuring: a hidden canvas is 0 px wide
   canvas.width = Math.max(100, canvas.clientWidth || 600);
   const top = Math.min(ctx.sampleRate, st ? st.live.rate : 32000) / 2;   // highest frequency shown
   $('axisTop').textContent = (top / 1000).toFixed(0) + ' kHz';
@@ -472,7 +501,6 @@ function startListen() {
   audio.addEventListener('error', () => stopListen('The stream ended (another listener, an audio restart, or low memory).'));
   audio.addEventListener('ended', () => stopListen('The device ended the stream.'));
   audio.play().then(() => ctx.resume()).catch(() => stopListen('The browser did not start playback.'));
-  $('spec').hidden = false;
   $('listenBtn').textContent = 'Stop';
   set('listenMsg', 'Connecting…', 'msg muted');
   audio.addEventListener('playing', () => set('listenMsg', '', 'msg'), { once: true });
@@ -510,29 +538,69 @@ $('listenBtn').onclick = () => (listen ? stopListen('') : startListen());
 $('copyUrl').onclick = () => copyText($('url').textContent, $('copyUrl'));
 $('copyLog').onclick = () => copyText($('log').textContent, $('copyLog'));
 
+// Log view. Requests go out one at a time, as the device serves them; a call while one is out
+// asks for another right after it. resetLog() makes the reply to a request already out stale: it
+// is dropped and the next request starts again from line 0.
+let logSeq = 0, logEpoch = 0, logBusy = false, logAgain = false;
+function resetLog() {
+  logEpoch++;
+  logSeq = 0;
+  $('log').textContent = '';
+  if (logBusy) logAgain = true;
+}
 async function loadLogs() {
-  const r = await api('/api/logs?since=' + logSeq);
-  const text = await r.text();
-  const seq = Number(r.headers.get('X-Log-Seq'));
-  const pre = $('log');
-  if (seq < logSeq) pre.textContent = '';   // the device restarted: line numbers began again
-  logSeq = seq;
-  if (!text) return;
-  const atBottom = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 4;
-  pre.textContent = (pre.textContent + text).split('\n').slice(-400).join('\n');
-  if (atBottom) pre.scrollTop = pre.scrollHeight;
+  if (logBusy) { logAgain = true; return; }
+  logBusy = true;
+  try {
+    do {
+      logAgain = false;
+      const epoch = logEpoch;
+      const r = await api('/api/logs?since=' + logSeq);
+      const text = await r.text();
+      if (epoch !== logEpoch) continue;   // made before resetLog(), which asked for another
+      const seq = Number(r.headers.get('X-Log-Seq'));
+      const pre = $('log');
+      if (seq < logSeq) pre.textContent = '';   // line numbers began again (power cycle)
+      logSeq = seq;
+      if (!text) continue;
+      const atBottom = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 4;
+      pre.textContent = (pre.textContent + text).split('\n').slice(-400).join('\n');
+      if (atBottom) pre.scrollTop = pre.scrollHeight;
+    } while (logAgain && $('logBox').open);
+  } finally {
+    logBusy = false;
+  }
 }
 $('logBox').addEventListener('toggle', () => {
-  if ($('logBox').open) { logSeq = 0; $('log').textContent = ''; loadLogs().catch(() => {}); }
+  if ($('logBox').open) { resetLog(); loadLogs().catch(() => {}); }
 });
+
+// Each state reply bounds the device's boot time: later than (request sent) - uptime - 1 s, as
+// uptime counts whole seconds, and no later than (reply arrived) - uptime. For one boot every lower
+// bound lies below the boot time and every upper bound at or above it, so a reply whose lower
+// bound is past the previous reply's upper bound comes from a later boot. The comparison allows
+// 0.01 % of the time between the two replies, because the device's clock and this computer's may
+// run at rates that differ by about that much, however long the page was hidden in between. A
+// slow reply only widens its own bounds. After a restart the log view loads again from the start,
+// which suits a restart that kept the log (numbering continues) and a power cycle (numbering began
+// again) alike.
+let prevNotAfter = null, prevArrivedAt = 0;
+function noteUptime(sentAt, arrivedAt, uptime) {
+  const after = sentAt - uptime * 1000 - 1000, notAfter = arrivedAt - uptime * 1000;
+  if (prevNotAfter !== null && after > prevNotAfter + (sentAt - prevArrivedAt) * 1e-4) resetLog();
+  prevNotAfter = notAfter;
+  prevArrivedAt = arrivedAt;
+}
 
 async function poll() {
   clearTimeout(timer);
   if (uploading) return;   // the device serves one request at a time; let the upload have it
   try {
+    const sentAt = Date.now();
     const s = await (await api('/api/state')).json();
+    noteUptime(sentAt, Date.now(), s.live.uptime);
     $('offline').style.display = 'none';
-    render(s);
+    render(s, true);
     if ($('logBox').open && s.live.log_seq !== logSeq) await loadLogs();
   } catch (e) {
     $('offline').style.display = 'block';

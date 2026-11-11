@@ -37,6 +37,26 @@ jobs:
             echo "Tag v${{ steps.version.outputs.version }} is new, will release."
           fi
 
+      - name: Host unit tests
+        if: steps.check.outputs.exists == 'false'
+        run: sh test/host/run.sh
+
+      - uses: actions/setup-node@v4
+        if: steps.check.outputs.exists == 'false'
+        with:
+          node-version: '22'
+
+      - name: Web UI API keys match the firmware
+        if: steps.check.outputs.exists == 'false'
+        run: node test/webui/check_keys.mjs
+
+      - name: Web UI behaviour (headless Chrome against the mock device)
+        if: steps.check.outputs.exists == 'false'
+        run: |
+          google-chrome --headless=new --no-sandbox --disable-gpu '--remote-allow-origins=*' --remote-debugging-port=9222 about:blank &
+          for i in $(seq 1 30); do curl -sf http://127.0.0.1:9222/json/version >/dev/null && break; sleep 1; done
+          node test/webui/ui_test.mjs
+
       - uses: actions/setup-python@v5
         if: steps.check.outputs.exists == 'false'
         with:
@@ -88,7 +108,7 @@ jobs:
 
       - name: Create tag and GitHub Release
         if: steps.check.outputs.exists == 'false'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           tag_name: v${{ steps.version.outputs.version }}
           name: v${{ steps.version.outputs.version }}

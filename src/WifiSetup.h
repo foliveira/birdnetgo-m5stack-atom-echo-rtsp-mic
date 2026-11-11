@@ -9,8 +9,11 @@ bool wifiJoinStored(const char* hostname, uint32_t timeoutMs);
 // Open access point apName with a captive setup page that lists nearby networks and saves the
 // chosen credentials. Never returns: the device restarts after a successful join. If credentials
 // are already stored (the join failed, e.g. during a router outage) it retries that network every
-// 30 s while nobody is connected to the portal, restarts as soon as it is reachable, and restarts
-// anyway after three minutes without anyone using the portal. Answers Improv like wifiImprovPoll.
+// 30 s until someone uses the portal and restarts as soon as it is reachable. It also restarts
+// after three minutes if nobody has used the portal, or ten minutes after its last use. Using
+// the portal means opening one of its pages or sending bytes for Improv over USB; a device that
+// only joins the open network and sends captive-portal probes (as phones do by themselves) does
+// not count. Answers Improv like wifiImprovPoll.
 [[noreturn]] void wifiRunSetupPortal(const char* apName, const char* hostname, const char* firmwareVersion);
 
 // Improv Wi-Fi over the serial port: an Improv client such as ESP Web Tools asks for the WiFi

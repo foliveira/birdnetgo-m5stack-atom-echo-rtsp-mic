@@ -12,16 +12,16 @@ This repository is a fork of [stedrow/birdnetgo-m5stack-atom-echo-rtsp-mic](http
 
 ## Features
 
-- Capture and network send run in separate tasks joined by a send queue of up to 3 s of audio, so WiFi stalls shorter than the queue lose nothing. RTP frames are always sent whole.
+- Capture and network send run in separate tasks joined by a send queue that fills the RAM left free after start-up, so WiFi stalls shorter than the queue lose nothing; the boot log's `Frame pool:` line says how much audio it holds. RTP frames are always sent whole.
 - RTP sequence numbers and timestamps advance for every captured frame, so a frame that does get dropped reaches BirdNET-Go as a gap instead of a click.
 - 32 kHz by default, which carries the whole 0 to 15 kHz band BirdNET analyses. A DC blocker, a 2nd-order high-pass filter (300 Hz by default), manual gain applied live with a per-sample ramp, and optional automatic gain control.
-- Web UI: signal level, stream and WiFi diagnostics, settings with validation, the log, and firmware updates. One 11 KB page, English only.
+- Web UI: signal level, stream and WiFi diagnostics, settings with validation, the log, and firmware updates. One 12 KB page, English only.
 - Listen to the microphone in the browser, with a live spectrogram, while BirdNET-Go keeps streaming.
 - Firmware updates over WiFi. A new version that restarts before it has run for a minute with WiFi is rolled back to the previous one.
 - Prometheus metrics at `/metrics`: frames sent and dropped, stalls, WiFi drops, RSSI, temperature, signal level.
 - WiFi setup through a built-in captive portal, or over USB with Improv Wi-Fi; joins the strongest access point for the network name (mesh systems, repeaters).
 - Reports why the device last restarted, including the task and backtrace after a crash, why WiFi last dropped, and a microphone that stopped delivering signal.
-- Recovers by itself: restarts the audio driver if capture stalls, restarts the device after 10 minutes without WiFi.
+- Recovers by itself: restarts the audio driver if capture stalls or the driver did not start, restarts the device after 10 minutes without WiFi.
 - Thermal protection that trips only after 3 consecutive minutes over the limit, and a WiFi power save option.
 - Configurable device name for mDNS (`atomecho.local` by default) and DHCP, so several microphones can share a network.
 - No libraries beyond the Arduino core.
@@ -87,9 +87,9 @@ Hold the front button for 5 s to forget the WiFi network and restart into the se
 ## Updating
 
 ### From 3.0.x or 2.x
-Versions before 4.0.0 cannot install firmware over WiFi, so install 4.0.0 once over USB. WiFi credentials and settings are kept.
+Versions before 4.0.0 cannot install firmware over WiFi, so install the current release once over USB. WiFi credentials and settings are kept.
 
-- Stored settings win over the new defaults. A device that ran 16 kHz keeps it; choose 32 kHz in the Audio card (or press Restore defaults) to get the band above 8 kHz. A stored 8 kHz is replaced by 32 kHz, because 8 kHz clocks the microphone below its specified range.
+- Stored settings win over the new defaults. A device that ran 16 kHz keeps it; choose 32 kHz in the Audio card (or press Restore defaults) to get the band above 8 kHz. A stored 8 kHz is replaced by 32 kHz, because 8 kHz clocks the microphone below its specified range. A stored frame size above 4096 samples is replaced by 1024, because a frame pool of larger frames does not fit in the Atom Echo's memory.
 - The HTTP API changed. The old `/api/*` endpoints are gone; see [the API reference](docs/DETAILS.md#http-api).
 - The auto recovery setting is gone; a capture watchdog replaces it.
 - Yellow LED now also means the WiFi link is down.
@@ -99,7 +99,7 @@ Download `firmware.bin` from the [releases page](https://github.com/foliveira/bi
 ```bash
 curl -F firmware=@firmware.bin http://atomecho.local/api/update
 ```
-The device checks the whole image before switching to it. The new version then has to keep WiFi for a minute; if it restarts before that (a crash, or a WiFi join that fails), the device goes back to the previous version and shows "update rolled back" as its last restart.
+The device checks the whole image before switching to it. The new version then has to keep WiFi for a minute; if it restarts before that (a crash, or a WiFi join that fails), the device goes back to the previous version and shows "update rolled back" as its last restart. Until the new version is confirmed (the log says `Firmware update confirmed`), the device refuses another update with `409`: it would overwrite the previous version, which a rollback needs.
 
 ## Monitoring
 
@@ -110,11 +110,11 @@ scrape_configs:
     static_configs:
       - targets: ['192.168.1.50']   # the device's address
 ```
-Use the device's IP address or `<name>.local` as the target: requests addressed to other names are refused (see Security). The metric list is in [docs/DETAILS.md](docs/DETAILS.md#metrics).
+Use the device's IP address or the `.local` name in the Web UI's Address row as the target: requests addressed to other names are refused (see Security). The metric list is in [docs/DETAILS.md](docs/DETAILS.md#metrics).
 
 ## Security
 
-The Web UI and API have no password. Anyone who can reach the device can change its settings, reboot it, listen to it or install firmware, so keep it on a network you trust. Changes that a browser sends from another site's page are refused, and so is every request addressed to a name other than the device's IP address, its name, `<name>.local`, or its name under a local-only domain (`.lan`, `.home`, `.home.arpa`, `.internal`, `.localdomain`, `.fritz.box`). That stops web pages from changing the device or reading from it, including through DNS rebinding; open the device by one of those names.
+The Web UI and API have no password. Anyone who can reach the device can change its settings, reboot it, listen to it or install firmware, so keep it on a network you trust. Changes that a browser sends from another site's page are refused, and so is every request addressed to a name other than the device's IP address, its name, `<name>.local`, or its name under a local-only domain (`.lan`, `.home`, `.home.arpa`, `.internal`, `.localdomain`, `.fritz.box`). That stops web pages from changing the device or reading from it, including through DNS rebinding; open the device by one of those names. Its name is the configured device name, and also the name mDNS answers to when that differs: if another device on the network already has the configured name, mDNS picks a free one such as `atomecho-2`, which the Web UI's Address row shows.
 
 ## Building
 
@@ -122,7 +122,7 @@ The Web UI and API have no password. Anyone who can reach the device can change 
 pio run                      # Build
 pio run --target upload      # Flash over USB
 pio device monitor -b 115200 # Serial monitor
-sh test/host/run.sh          # Unit tests of the DSP, RTSP parsing, JSON and metrics writers, Host check, Improv (needs a C++ compiler)
+sh test/host/run.sh          # Unit tests of the DSP, RTSP parsing, JSON and metrics writers, Host check, Improv, settings validation (needs a C++ compiler)
 node test/webui/check_keys.mjs  # Checks that the page, the firmware and the mock device use the same API keys
 ```
 
