@@ -126,7 +126,7 @@ sh test/host/run.sh          # Unit tests of the DSP, RTSP parsing, JSON and met
 node test/webui/check_keys.mjs  # Checks that the page, the firmware and the mock device use the same API keys
 ```
 
-The first build installs pioarduino's ESP32 platform (Arduino-ESP32 3.3.12 on ESP-IDF 5.5.5) and rebuilds the core's ESP-IDF libraries with the `custom_sdkconfig` options in `platformio.ini`: about 7 GB of downloads and tools, and about 4 minutes on a 7-core machine. Later builds reuse the libraries as long as `sdkconfig.defaults`, which the build writes, stays in place. PlatformIO shares the libraries between projects, so a project on the same platform version without these options makes them reinstall, and the next build here rebuilds them.
+The first build installs pioarduino's ESP32 platform (Arduino-ESP32 3.3.12 on ESP-IDF 5.5.5) and rebuilds the core's ESP-IDF libraries with the `custom_sdkconfig` options in `platformio.ini`: about 7 GB of downloads and tools, and about 4 minutes on a 7-core machine. Later builds reuse the libraries as long as `sdkconfig.defaults`, which the build writes, stays in place. PlatformIO shares the libraries between projects, so a project on the same platform version without these options makes them reinstall, and the next build here rebuilds them. The platform runs the second half of that build with a PlatformIO core of its own, the `pioarduino` package, which it installs with uv. `uv.toml` holds that package at 6.2.0: the platform refuses 6.2.0.post1, the newest on PyPI, and without the file a first build stops with `IncompatiblePlatform`.
 
 `web/index.html` is the Web UI; the build gzips it into the firmware. To work on it without a device, run `node test/webui/mock_server.mjs` and open `http://localhost:8080/`.
 

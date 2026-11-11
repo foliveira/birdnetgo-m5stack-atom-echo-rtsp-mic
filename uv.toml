@@ -1,0 +1,8 @@
+# Read by uv, which the pioarduino platform runs from this directory on the first build to fill its
+# Python environment (~/.platformio/penv). The platform pinned in platformio.ini (55.03.312-1) asks
+# for "pioarduino>=6.2.0", and its own check for PlatformIO Core ">=6.2.0" then refuses pioarduino
+# 6.2.0.post1 (on PyPI since 2026-10-26), which PlatformIO reads as 6.2.0-post.1, a pre-release of
+# 6.2.0. The build removes the platform and stops after "Starting Arduino compile" with
+# "IncompatiblePlatform" (pioarduino/platform-espressif32 issue 563). The fix is in the platform's
+# develop branch: remove this file when platformio.ini moves to a release that has it.
+constraint-dependencies = ["pioarduino==6.2.0"]
